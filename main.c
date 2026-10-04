@@ -11,7 +11,7 @@
  * 编译（MinGW）:
  *   windres resource.rc -O coff -o resource.o
  *   gcc -O2 -s -mwindows -municode -o LiteTune.exe main.c resource.o \
- *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus
+ *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32
  */
 #ifndef UNICODE
 #define UNICODE
@@ -22,6 +22,8 @@
 #define WINVER       0x0601
 #define _WIN32_WINNT 0x0601
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -146,7 +148,8 @@ enum {
     IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
     IDC_BTN_DIR,
-    IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC
+    IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
+    IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H
 };
 
 /* ================= 全局状态 ================= */
@@ -168,7 +171,8 @@ static HBRUSH   g_whiteBrush = NULL;
 static HWND     g_sldSeek, g_stTime;
 static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
 static HWND     g_sldVol, g_stVol, g_stFormat;
-static HWND     g_listPod, g_listEp, g_editDesc;
+static HWND g_hwnd, g_listPod, g_listEp, g_editDesc;
+static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
 static HWND     g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 
@@ -234,6 +238,15 @@ static int  g_playEp  = -1;         /* 正在播放的剧集下标，独立于�
 static wchar_t *g_playUrl = NULL;   /* 当前请求播放的音频 URL */
 static long long g_dur100ns = 0;
 
+/* 手机播放/遥控 HTTP 服务 */
+#define PHONE_PORT 17532
+static CRITICAL_SECTION g_nowCs;                      /* 保护下面两个“正在播放”字段 */
+static wchar_t g_nowPath[MAX_PATH] = L"";             /* 正在播放的本地 mp3 全路径 */
+static wchar_t g_nowTitle[256]     = L"";             /* 正在播放的剧集标题 */
+static SOCKET  g_httpSock  = INVALID_SOCKET;
+static HANDLE  g_httpThread = NULL;
+static volatile int g_httpStop = 0;
+
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
     TR_READY = 0,
@@ -257,6 +270,8 @@ enum {
     TR_M_OPEN_CACHE, TR_M_CHANGE_CACHE, TR_M_DEFAULT_CACHE,
     TR_M_NIGHT, TR_M_LANGUAGE, TR_LANG_ZH, TR_LANG_EN,
     TR_M_SHUTDOWN, TR_M_SHUT_CANCEL, TR_SHUT_IN_MINS_FMT,
+    TR_M_CUSTOM, TR_CUSTOM_TITLE, TR_CUSTOM_LABEL, TR_CUSTOM_BAD,
+    TR_SHUTTING_DOWN,
     TR_M_FONT_FMT, TR_FONT_S, TR_FONT_M, TR_FONT_L,
     TR_M_ABOUT, TR_ABOUT_TEXT,
     TR_NIGHT_ON, TR_NIGHT_OFF, TR_FONT_SWITCHED,
@@ -267,6 +282,8 @@ enum {
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
     TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_REFRESH, TR_TIP_SETTINGS,
     TR_PM_ORDER, TR_PM_SHUFFLE, TR_PM_REPEAT, TR_PM_ONCE,
+    TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_MSG, TR_PHONE_FAIL,
+    TR_PHONE_ON, TR_PHONE_OFF,
     TR_N
 };
 
@@ -300,6 +317,10 @@ static const wchar_t *tr(int id)
         L"打开缓存目录", L"更改缓存目录...", L"恢复默认目录",
         L"夜间模式", L"语言", L"简体中文", L"English",
         L"定时关机", L"取消定时关机", L"%d 分钟后关机",
+        L"自定义分钟数...", L"自定义定时关机",
+        L"输入多少分钟后关机（1-600）：",
+        L"请输入 1 到 600 之间的整数分钟",
+        L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%s）", L"小", L"中", L"大",
         L"关于 LiteTune",
         L"LiteTune  版本 1.0\r\n\r\n"
@@ -315,7 +336,14 @@ static const wchar_t *tr(int id)
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
         L"添加播客", L"删除播客", L"调整顺序", L"刷新", L"设置",
-        L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放"
+        L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放",
+        L"手机播放/遥控", L"手机播放/遥控",
+        L"手机浏览器打开：\r\n\r\n%s\r\n\r\n"
+            L"• 手机当喇叭：点页面里的播放按钮\r\n"
+            L"• 遥控电脑：用页面下方按钮\r\n\r\n"
+            L"（需在同一 Wi-Fi 下；若系统弹出防火墙提示请允许）",
+        L"手机服务启动失败（端口被占用？）",
+        L"手机服务已开启", L"手机服务已关闭"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -349,6 +377,10 @@ static const wchar_t *tr(int id)
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
         L"Night Mode", L"Language", L"Simplified Chinese", L"English",
         L"Sleep Timer", L"Cancel Sleep Timer", L"Shut down in %d min",
+        L"Custom minutes...", L"Custom Sleep Timer",
+        L"Shut down in how many minutes (1-600)?",
+        L"Please enter a whole number between 1 and 600",
+        L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %s)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
         L"LiteTune  version 1.0\r\n\r\n"
@@ -366,7 +398,14 @@ static const wchar_t *tr(int id)
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
         L"Add podcast", L"Delete podcast", L"Reorder", L"Refresh", L"Settings",
-        L"Sequential", L"Shuffle", L"Repeat one", L"Play once"
+        L"Sequential", L"Shuffle", L"Repeat one", L"Play once",
+        L"Phone Speaker/Remote", L"Phone Speaker/Remote",
+        L"Open this on your phone's browser:\r\n\r\n%s\r\n\r\n"
+            L"• Phone as speaker: press play in the page\r\n"
+            L"• Remote control: use the buttons below\r\n\r\n"
+            L"(Same Wi-Fi required; allow the firewall prompt if shown)",
+        L"Failed to start phone service (port in use?)",
+        L"Phone service on", L"Phone service off"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -521,7 +560,7 @@ static void ApplyTheme(void)
         g_sldSeek, g_sldVol, g_stTime, g_stVol, g_stFormat,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir,
-        g_listPod, g_listEp, g_editDesc
+        g_listPod, g_listEp, g_editDesc, g_vsPod, g_vsEp, g_vsDesc
     };
     int i;
     if (g_hwnd) {
@@ -562,6 +601,7 @@ static void ApplyTheme(void)
             RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE |
             RDW_FRAME | RDW_UPDATENOW);
     }
+
 }
 
 /* 滑块完全自绘（亮/暗两种主题同一种圆角造型，仅配色不同）：
@@ -644,122 +684,333 @@ static void DrawScrollArrow(HDC hdc, const RECT *r, int dir, COLORREF col)
     DeleteObject(b); DeleteObject(p);
 }
 
-/* 夜间模式：把某控件非客户区的一根滚动条重绘为暗色 */
-static void PaintDarkScrollBar(HWND hwnd, int vertical)
+/* ================= 自绘滚动条控件 ================= */
+/* 真正的子窗口，不是事后覆盖。直接画暗色，永不闪白。 */
+#define DSB_CLASS L"LiteTuneScrollBar"
+/* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
+#define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
+
+typedef struct {
+    int kind;          /* 0=listbox 1=listview 2=多行edit */
+    int horizontal;    /* 1=水平（仅 listview 用） */
+    int min, max, page, pos;   /* listview=像素，其余=顶部可见项/行索引 */
+    int thumbLen, thumbPos;    /* 像素，由 UpdateThumb 计算 */
+    int dragging;      /* 正在拖把手 */
+    int dragOffset;    /* 拖动起点在把手内的偏移 */
+    HWND target;       /* 关联的内容控件 */
+} DarkScrollBar;
+
+/* 两种主题同一造型，仅配色不同 */
+static COLORREF ThSbThumb(void) { return g_darkMode ? RGB(104,104,112) : RGB(202,202,208); }
+static COLORREF ThSbArrow(void) { return g_darkMode ? RGB(175,175,183) : RGB(120,120,128); }
+
+/* 用第 0 项的实际矩形测行高（含图标/字体影响，比 LVM_GETITEMSPACING 准） */
+static int DSB_RowH(HWND lv)
 {
-    SCROLLBARINFO sbi;
-    SCROLLINFO si;
-    RECT wr, r;
-    HDC hdc;
-    HBRUSH bg, thb;
-    int bar, btn, track, thumbLen, off, total, page, maxPos, x0, y0;
-    COLORREF thumbCol = RGB(104, 104, 112);
-    COLORREF arrowCol = RGB(175, 175, 183);
-
-    sbi.cbSize = sizeof(sbi);
-    if (!GetScrollBarInfo(hwnd, vertical ? OBJID_VSCROLL : OBJID_HSCROLL, &sbi))
-        return;
-    if (sbi.rgstate[0] & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_UNAVAILABLE))
-        return;
-
-    ZeroMemory(&si, sizeof(si));
-    si.cbSize = sizeof(si);
-    si.fMask = SIF_ALL;
-    if (!GetScrollInfo(hwnd, vertical ? SB_VERT : SB_HORZ, &si))
-        return;
-
-    GetWindowRect(hwnd, &wr);
-    r = sbi.rcScrollBar;
-    OffsetRect(&r, -wr.left, -wr.top);   /* 屏幕坐标 → 窗口 DC 坐标 */
-
-    hdc = GetDCEx(hwnd, NULL, DCX_WINDOW | DCX_CACHE);
-    if (!hdc) return;
-
-    /* 整条滚动条铺面板底色 */
-    bg = CreateSolidBrush(ThPanel());
-    FillRect(hdc, &r, bg);
-    DeleteObject(bg);
-
-    bar   = vertical ? (r.bottom - r.top) : (r.right - r.left);
-    btn   = sbi.dxyLineButton;
-    if (btn <= 0 || btn >= bar) { ReleaseDC(hwnd, hdc); return; }
-    track = bar - 2 * btn;
-
-    /* 两端箭头 */
-    if (vertical) {
-        RECT up = { r.left, r.top, r.right, r.top + btn };
-        RECT dn = { r.left, r.bottom - btn, r.right, r.bottom };
-        DrawScrollArrow(hdc, &up, 0, arrowCol);
-        DrawScrollArrow(hdc, &dn, 1, arrowCol);
-    } else {
-        RECT lf = { r.left, r.top, r.left + btn, r.bottom };
-        RECT rt = { r.right - btn, r.top, r.right, r.bottom };
-        DrawScrollArrow(hdc, &lf, 2, arrowCol);
-        DrawScrollArrow(hdc, &rt, 3, arrowCol);
-    }
-
-    /* 按 SIF_RANGE/PAGE 计算把手长度与位置（标准映射） */
-    total = si.nMax - si.nMin;
-    page  = si.nPage ? (int)si.nPage : 0;
-    if (total <= 0) { ReleaseDC(hwnd, hdc); return; }
-    if (page > 0)
-        thumbLen = (int)((long)track * page / (total + 1));
-    else
-        thumbLen = track;
-    if (thumbLen > track) thumbLen = track;
-    if (thumbLen < 14 && track >= 14) thumbLen = 14;
-
-    maxPos = total + 1 - page;
-    if (maxPos < 1) maxPos = 1;
-    off = (track - thumbLen > 0 && maxPos > 0)
-        ? (int)((long)(si.nPos - si.nMin) * (track - thumbLen) / maxPos)
-        : 0;
-
-    thb = CreateSolidBrush(thumbCol);
+    RECT ri;
+    if (SendMessageW(lv, LVM_GETITEMRECT, 0, (LPARAM)&ri) && ri.bottom > ri.top)
+        return ri.bottom - ri.top;
     {
-        HGDIOBJ ob = SelectObject(hdc, thb);
-        HPEN np = (HPEN)GetStockObject(NULL_PEN);
-        HGDIOBJ op = SelectObject(hdc, np);
-        if (vertical) {
-            x0 = r.left + 2; y0 = r.top + btn + off;
-            RoundRect(hdc, x0, y0, r.right - 2, y0 + thumbLen, 4, 4);
-        } else {
-            x0 = r.left + btn + off; y0 = r.top + 2;
-            RoundRect(hdc, x0, y0, x0 + thumbLen, r.bottom - 2, 4, 4);
-        }
-        SelectObject(hdc, op);
-        SelectObject(hdc, ob);
+        DWORD sp = (DWORD)SendMessageW(lv, LVM_GETITEMSPACING, FALSE, 0);
+        int h = HIWORD(sp);
+        return h > 0 ? h : 18;
     }
-    DeleteObject(thb);
-    ReleaseDC(hwnd, hdc);
 }
 
-/* 给列表/简介框重绘全部可见滚动条（在默认 WM_NCPAINT 之后调用） */
-static void PaintDarkScrollBars(HWND hwnd)
+/* 读取目标控件的滚动状态。listbox/edit 用行单位 API；
+ * listview 纵向自算像素偏移（行高用项矩形实测），横向用 GetScrollInfo。
+ * 返回是否可滚动 */
+static int DSB_QueryState(DarkScrollBar *dsb)
 {
-    HDC hdc;
-    RECT wr;
-    if (!g_darkMode) return;
-    PaintDarkScrollBar(hwnd, 1);
-    PaintDarkScrollBar(hwnd, 0);
-    /* WS_EX_CLIENTEDGE 凹陷边框默认是亮色，统一描一道暗边 */
-    hdc = GetDCEx(hwnd, NULL, DCX_WINDOW | DCX_CACHE);
-    if (hdc) {
-        HPEN pn = CreatePen(PS_SOLID, 1, RGB(72, 72, 80));
-        HGDIOBJ op = SelectObject(hdc, pn);
-        GetWindowRect(hwnd, &wr);
-        {
-            int w = wr.right - wr.left, h = wr.bottom - wr.top;
-            MoveToEx(hdc, 0, 0, NULL);
-            LineTo(hdc, w - 1, 0);
-            LineTo(hdc, w - 1, h - 1);
-            LineTo(hdc, 0, h - 1);
-            LineTo(hdc, 0, 0);
-        }
-        SelectObject(hdc, op);
-        DeleteObject(pn);
-        ReleaseDC(hwnd, hdc);
+    HWND t = dsb->target;
+    RECT rc;
+    int n, ih, vis;
+    if (!t) return 0;
+    GetClientRect(t, &rc);
+    if (dsb->kind == 0) {                 /* ListBox：行单位 */
+        n  = (int)SendMessageW(t, LB_GETCOUNT, 0, 0);
+        ih = (int)SendMessageW(t, LB_GETITEMHEIGHT, 0, 0);
+        if (ih <= 0) ih = 16;
+        vis = (rc.bottom - rc.top) / ih;
+        if (vis < 1) vis = 1;
+        dsb->min = 0;
+        dsb->max = n > vis ? n - vis : 0;
+        dsb->page = vis;
+        dsb->pos = (int)SendMessageW(t, LB_GETTOPINDEX, 0, 0);
+        return n > vis;
     }
+    if (dsb->kind == 2) {                 /* 多行 EDIT：行单位 */
+        int lines = (int)SendMessageW(t, EM_GETLINECOUNT, 0, 0);
+        int lh = 16;
+        HDC dc = GetDC(t);
+        if (dc) {
+            HFONT f = (HFONT)SendMessageW(t, WM_GETFONT, 0, 0);
+            HGDIOBJ of = f ? SelectObject(dc, f) : NULL;
+            TEXTMETRICW tm;
+            if (GetTextMetricsW(dc, &tm) && tm.tmHeight > 0)
+                lh = tm.tmHeight + tm.tmExternalLeading;
+            if (f) SelectObject(dc, of);
+            ReleaseDC(t, dc);
+        }
+        if (lh <= 0) lh = 16;
+        vis = (rc.bottom - rc.top) / lh;
+        if (vis < 1) vis = 1;
+        dsb->min = 0;
+        dsb->max = lines > vis ? lines - vis : 0;
+        dsb->page = vis;
+        dsb->pos = (int)SendMessageW(t, EM_GETFIRSTVISIBLELINE, 0, 0);
+        return lines > vis;
+    }
+    if (!dsb->horizontal) {               /* ListView 纵向：自算像素偏移 */
+        int count = (int)SendMessageW(t, LVM_GETITEMCOUNT, 0, 0);
+        int rowH  = DSB_RowH(t);
+        int visPx = rc.bottom - rc.top;
+        int maxOff = count * rowH - visPx;
+        dsb->min = 0;
+        dsb->max = maxOff > 0 ? maxOff : 0;
+        dsb->page = visPx;
+        dsb->pos = (int)SendMessageW(t, LVM_GETTOPINDEX, 0, 0) * rowH;
+        return maxOff > 0;
+    }
+    /* ListView 横向：控件维护的像素滚动信息 */
+    {
+        SCROLLINFO si;
+        ZeroMemory(&si, sizeof(si));
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        if (!GetScrollInfo(t, SB_HORZ, &si)) {
+            dsb->min = 0; dsb->max = 0; dsb->page = 1; dsb->pos = 0;
+            return 0;
+        }
+        dsb->min = si.nMin;
+        dsb->max = si.nMax;
+        dsb->page = si.nPage ? (int)si.nPage : 1;
+        dsb->pos = si.nPos;
+        return dsb->max > dsb->min;
+    }
+}
+
+/* 箭头单击滚动一步：listbox/edit=1 行；listview 纵向=1 行高像素，横向=16px */
+static int DSB_LineStep(const DarkScrollBar *dsb)
+{
+    if (dsb->kind == 1) {
+        if (dsb->horizontal) return 16;
+        return DSB_RowH(dsb->target);
+    }
+    return 1;
+}
+
+/* 把目标控件滚动 delta（相对增量，单位同 dsb->pos）。
+ * 不回读实际位置——拖动期间由滚动条记账，把手绝对跟手，
+ * 消除回读取整导致的“吸住/延迟/拖不到底” */
+static void DSB_ScrollTarget(DarkScrollBar *dsb, int delta)
+{
+    HWND t = dsb->target;
+    if (!t || !delta) return;
+    if (dsb->kind == 0) {
+        SendMessageW(t, LB_SETTOPINDEX, dsb->pos + delta, 0);
+    } else if (dsb->kind == 2) {
+        SendMessageW(t, EM_LINESCROLL, 0, MAKELONG(0, delta));
+    } else if (dsb->horizontal) {
+        SendMessageW(t, LVM_SCROLL, (WPARAM)delta, 0);
+    } else {
+        SendMessageW(t, LVM_SCROLL, 0, (LPARAM)delta);
+    }
+}
+
+static void DSB_UpdateThumb(DarkScrollBar *dsb, HWND hwnd)
+{
+    RECT rc;
+    int track, virtualSize, range, sc;
+    GetClientRect(hwnd, &rc);
+    track = (dsb->horizontal ? rc.right : rc.bottom) - 2 * DSB_W;
+    virtualSize = (dsb->max - dsb->min) + dsb->page;
+    if (track <= 0 || virtualSize <= dsb->page || dsb->page <= 0) {
+        dsb->thumbLen = 0;
+        return;
+    }
+    dsb->thumbLen = track * dsb->page / virtualSize;
+    if (dsb->thumbLen < 20) dsb->thumbLen = 20;
+    if (dsb->thumbLen > track) dsb->thumbLen = track;
+    range = dsb->max - dsb->min;
+    sc = dsb->pos - dsb->min;
+    if (sc < 0) sc = 0;
+    if (sc > range) sc = range;
+    dsb->thumbPos = (range > 0 && track > dsb->thumbLen)
+        ? sc * (track - dsb->thumbLen) / range : 0;
+}
+
+/* 滚动到 pos（滚动条自己记账，不回读；拖动期间把手绝对跟手） */
+static void DSB_SetPos(DarkScrollBar *dsb, HWND hwnd, int pos)
+{
+    int last = dsb->max;
+    int delta;
+    if (pos < dsb->min) pos = dsb->min;
+    if (pos > last) pos = last;
+    delta = pos - dsb->pos;
+    if (!delta) return;
+    DSB_ScrollTarget(dsb, delta);
+    dsb->pos = pos;
+    DSB_UpdateThumb(dsb, hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void DSB_Draw(HWND hwnd, DarkScrollBar *dsb)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT rc, btn;
+    HBRUSH bg, thumb;
+    HGDIOBJ ob, op;
+    int horiz = dsb ? dsb->horizontal : 0;
+
+    GetClientRect(hwnd, &rc);
+    bg = CreateSolidBrush(ThPanel());
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+
+    /* 两端箭头 */
+    if (horiz) {
+        btn.top = 0; btn.bottom = rc.bottom;
+        btn.left = 0; btn.right = DSB_W;
+        DrawScrollArrow(hdc, &btn, 2, ThSbArrow());
+        btn.left = rc.right - DSB_W; btn.right = rc.right;
+        DrawScrollArrow(hdc, &btn, 3, ThSbArrow());
+    } else {
+        btn.left = 0; btn.right = rc.right;
+        btn.top = 0; btn.bottom = DSB_W;
+        DrawScrollArrow(hdc, &btn, 0, ThSbArrow());
+        btn.top = rc.bottom - DSB_W; btn.bottom = rc.bottom;
+        DrawScrollArrow(hdc, &btn, 1, ThSbArrow());
+    }
+
+    /* 把手（内容不满一屏时只画空轨道） */
+    if (dsb && dsb->thumbLen > 0) {
+        int t0 = DSB_W + dsb->thumbPos;
+        thumb = CreateSolidBrush(ThSbThumb());
+        ob = SelectObject(hdc, thumb);
+        op = SelectObject(hdc, GetStockObject(NULL_PEN));
+        if (horiz)
+            RoundRect(hdc, t0, 2, t0 + dsb->thumbLen, rc.bottom - 2, 4, 4);
+        else
+            RoundRect(hdc, 2, t0, rc.right - 2, t0 + dsb->thumbLen, 4, 4);
+        SelectObject(hdc, op);
+        SelectObject(hdc, ob);
+        DeleteObject(thumb);
+    }
+    EndPaint(hwnd, &ps);
+}
+
+static LRESULT CALLBACK DarkScrollBarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    DarkScrollBar *dsb = (DarkScrollBar*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW *cs = (CREATESTRUCTW*)lp;
+        int prm = (int)(INT_PTR)cs->lpCreateParams;
+        dsb = (DarkScrollBar*)calloc(1, sizeof(DarkScrollBar));
+        if (!dsb) return -1;
+        dsb->kind = prm & 0xFF;
+        dsb->horizontal = (prm & 0x100) ? 1 : 0;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)dsb);
+        return 0;
+    }
+    case WM_DESTROY:
+        free(dsb);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        DSB_Draw(hwnd, dsb);
+        return 0;
+    case WM_SIZE:
+        if (dsb) {
+            DSB_UpdateThumb(dsb, hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT rc;
+        int c, len, t0;
+        if (!dsb) return 0;
+        GetClientRect(hwnd, &rc);
+        len = dsb->horizontal ? rc.right : rc.bottom;
+        c = dsb->horizontal ? pt.x : pt.y;
+        DSB_QueryState(dsb);
+        DSB_UpdateThumb(dsb, hwnd);
+        if (dsb->thumbLen <= 0) return 0;
+        SetCapture(hwnd);
+        t0 = DSB_W + dsb->thumbPos;
+        if (c < DSB_W)                       /* 起端箭头：滚一行 */
+            DSB_SetPos(dsb, hwnd, dsb->pos - DSB_LineStep(dsb));
+        else if (c > len - DSB_W)            /* 末端箭头：滚一行 */
+            DSB_SetPos(dsb, hwnd, dsb->pos + DSB_LineStep(dsb));
+        else if (c >= t0 && c < t0 + dsb->thumbLen) {
+            dsb->dragging = 1;
+            dsb->dragOffset = c - t0;
+        } else if (c < t0)                   /* 上/左滑槽：翻页 */
+            DSB_SetPos(dsb, hwnd, dsb->pos - dsb->page);
+        else                                 /* 下/右滑槽：翻页 */
+            DSB_SetPos(dsb, hwnd, dsb->pos + dsb->page);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (dsb && dsb->dragging) {
+            RECT rc;
+            int track, c;
+            GetClientRect(hwnd, &rc);
+            track = (dsb->horizontal ? rc.right : rc.bottom) - 2 * DSB_W;
+            c = (dsb->horizontal ? GET_X_LPARAM(lp) : GET_Y_LPARAM(lp)) - DSB_W - dsb->dragOffset;
+            if (track > dsb->thumbLen) {
+                int range = dsb->max - dsb->min;
+                if (range > 0)
+                    DSB_SetPos(dsb, hwnd, dsb->min + c * range / (track - dsb->thumbLen));
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (dsb) {
+            dsb->dragging = 0;
+            /* 松手后从控件读回实际位置，修正拖动中累积的夹紧误差 */
+            DSB_QueryState(dsb);
+            DSB_UpdateThumb(dsb, hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        ReleaseCapture();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* 创建自绘滚动条。kind：0=listbox 1=listview 2=edit；horizontal 仅 listview 用 */
+static HWND CreateDarkScrollBar(HWND parent, HWND target, int kind, int horizontal, int id)
+{
+    int prm = (kind & 0xFF) | (horizontal ? 0x100 : 0);
+    HWND h = CreateWindowExW(0, DSB_CLASS, NULL, WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, parent, (HMENU)(INT_PTR)id, NULL, (LPVOID)(INT_PTR)prm);
+    if (h) {
+        DarkScrollBar *dsb = (DarkScrollBar*)GetWindowLongPtrW(h, GWLP_USERDATA);
+        if (dsb) dsb->target = target;
+    }
+    return h;
+}
+
+/* 定期同步：从目标控件读实际滚动位置刷新把手。
+ * 内容不超范围时隐藏滚动条 */
+static void SyncScrollBar(HWND hbar)
+{
+    DarkScrollBar *dsb;
+    int oldLen, oldPos, scrollable;
+    if (!hbar) return;
+    dsb = (DarkScrollBar*)GetWindowLongPtrW(hbar, GWLP_USERDATA);
+    if (!dsb || dsb->dragging) return;
+    oldLen = dsb->thumbLen; oldPos = dsb->thumbPos;
+    scrollable = DSB_QueryState(dsb);
+    DSB_UpdateThumb(dsb, hbar);
+    ShowWindow(hbar, scrollable ? SW_SHOW : SW_HIDE);
+    if (dsb->thumbLen != oldLen || dsb->thumbPos != oldPos)
+        InvalidateRect(hbar, NULL, FALSE);
 }
 
 /* 暗色表头自绘（WM_DRAWITEM/ODT_HEADER 由表头的父窗口 ListView 接收） */
@@ -1469,14 +1720,21 @@ static int ParseFeed(const char *xml, Podcast *pod)
 
 /* ================= 缓存 ================= */
 /* 返回当前缓存目录（末尾带反斜杠）；未设置时默认程序目录下 cache */
+/* 缓存目录：默认 %TEMP%\LiteTune\（系统自动清理）；用户手动选择过则存在 ini 里 */
 static void CacheDir(wchar_t *out, int outMax)
 {
     if (g_cacheDir[0]) {
         wcsncpy(out, g_cacheDir, outMax - 1);
         out[outMax - 1] = 0;
     } else {
-        ExeDir(out, outMax);
-        wcscat_s(out, outMax, L"cache");
+        /* 默认放系统临时文件夹，删除程序后缓存由 Windows 自动清理 */
+        wchar_t tmp[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, tmp) > 0) {
+            swprintf(out, outMax, L"%sLiteTune", tmp);
+        } else {
+            ExeDir(out, outMax);
+            wcscat_s(out, outMax, L"cache");
+        }
     }
     int len = (int)wcslen(out);
     if (len > 0 && out[len - 1] != L'\\' && len < outMax - 1) {
@@ -2154,13 +2412,20 @@ static IMFPMediaPlayerCallbackVtbl g_pcVtbl = {
 static PlayerCallback g_pc = { &g_pcVtbl, 1 };
 
 /* ================= 播放控制 ================= */
-static void PlayerPlayFile(const wchar_t *path)
+static void PlayerPlayFile(const wchar_t *path, const wchar_t *title)
 {
     HRESULT hr;
     if (g_player) {
         g_player->lpVtbl->Release(g_player);
         g_player = NULL;
     }
+    /* 记录当前播放的本地文件，供手机 HTTP 服务流式输出 */
+    EnterCriticalSection(&g_nowCs);
+    wcsncpy(g_nowPath, path ? path : L"", MAX_PATH - 1);
+    g_nowPath[MAX_PATH - 1] = 0;
+    wcsncpy(g_nowTitle, title ? title : L"", 255);
+    g_nowTitle[255] = 0;
+    LeaveCriticalSection(&g_nowCs);
     /* 传 URL + fStartPlayback=TRUE：创建即自动播放，无需 SetMediaItem/Play */
     hr = MFPCreateMediaPlayer(path, TRUE, MFP_OPTION_NONE,
             (IMFPMediaPlayerCallback*)&g_pc, g_hwnd, &g_player);
@@ -2177,6 +2442,10 @@ static void PlayerStop(void)
     g_dur100ns = 0;
     g_playPod = -1;         /* 清空“正在播放”标记，避免和后续列表选中混淆 */
     g_playEp = -1;
+    EnterCriticalSection(&g_nowCs);
+    g_nowPath[0] = 0;
+    g_nowTitle[0] = 0;
+    LeaveCriticalSection(&g_nowCs);
     if (g_btnPlay) InvalidateRect(g_btnPlay, NULL, TRUE);   /* 图标回到“播放” */
     SetWindowTextW(g_stTime, L"00:00 / 00:00");
     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE, 0);
@@ -2207,6 +2476,327 @@ static void PlayerSeekToFrac(int permille)
     pv.vt = VT_I8;
     pv.hVal.QuadPart = g_dur100ns * permille / 1000;
     g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+}
+
+/* ================= 手机播放/遥控 HTTP 服务 ================= */
+/* PC 作为微型 HTTP 服务器：手机浏览器打开首页后，
+ * 页面内 <audio> 直接拉 /audio 流（手机出声，支持 Range 拖动），
+ * 页面按钮调 /cmd 遥控电脑（PostMessage 回主窗口按钮命令）。 */
+
+/* 发送全部数据（send 可能部分发送） */
+static int SendAll(SOCKET s, const char *buf, int len)
+{
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, buf + sent, len - sent, 0);
+        if (n <= 0) return 0;
+        sent += n;
+    }
+    return 1;
+}
+
+static void HttpRespond(SOCKET s, const char *status, const char *ctype,
+                        const char *body, int blen)
+{
+    char hdr[512];
+    int n = _snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status, ctype, blen);
+    if (n > 0) SendAll(s, hdr, n);
+    if (blen > 0 && body) SendAll(s, body, blen);
+}
+
+/* 宽字符 → UTF-8 并做 JSON 转义（" \ 控制字符） */
+static void JsonEscapeU8(const wchar_t *w, char *out, int outMax)
+{
+    int o = 0;
+    while (*w && o < outMax - 8) {
+        unsigned c = (unsigned char)*w;
+        if (*w == L'"' || *w == L'\\') { out[o++] = '\\'; out[o++] = (char)*w; w++; continue; }
+        if (*w < 0x20) { out[o++] = ' '; w++; continue; }
+        if (c < 0x80) { out[o++] = (char)c; w++; continue; }
+        /* 非 ASCII：逐字符 WideCharToMultiByte 太慢，先整串转换更省事——
+         * 但这里逐字符调用也无妨（标题最多 255 字符） */
+        {
+            char tmp[8];
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, 1, tmp, sizeof(tmp), NULL, NULL);
+            int k;
+            if (n <= 0) { w++; continue; }
+            for (k = 0; k < n && o < outMax - 2; k++) out[o++] = tmp[k];
+            w++;
+        }
+    }
+    out[o] = 0;
+}
+
+/* 首页：手机端播放/遥控页面（audio + Media Session 锁屏控制） */
+static void HttpServeHome(SOCKET s)
+{
+    static const char page[] =
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>LiteTune</title><style>"
+        "body{font-family:sans-serif;max-width:560px;margin:16px auto;padding:0 12px;background:#f4f4f6;color:#222}"
+        "#t{font-size:15px;margin:10px 2px;min-height:20px;color:#555;word-break:break-all}"
+        "audio{width:100%;margin:6px 0}"
+        ".row{display:flex;gap:10px;margin-top:10px}"
+        "button{flex:1;font-size:20px;padding:12px 0;border:1px solid #ccc;border-radius:10px;background:#fff}"
+        "button:active{background:#e5e5ea}"
+        ".hint{font-size:12px;color:#999;margin-top:14px;line-height:1.6}"
+        "</style></head><body>"
+        "<h3>LiteTune</h3><div id=\"t\">-</div>"
+        "<audio id=\"a\" src=\"/audio\" controls preload=\"auto\"></audio>"
+        "<div class=\"row\">"
+        "<button onclick=\"cmd('prev')\">&#9198;</button>"
+        "<button id=\"b\" onclick=\"cmd('play')\">&#9208;</button>"
+        "<button onclick=\"cmd('next')\">&#9197;</button>"
+        "</div>"
+        "<div class=\"hint\">&#19978;&#38754;&#25773;&#25918;&#22120;&#65306;&#25163;&#26426;&#24403;&#21895;&#21495;&#12290;"
+        "&#19979;&#38734;&#25353;&#38062;&#65306;&#36965;&#25511;&#30005;&#33041;&#25773;&#25918;&#12290;</div>"
+        "<script>"
+        "var A=document.getElementById('a'),lastT='';"
+        "function cmd(x){var f=new XMLHttpRequest();f.open('GET','/cmd?a='+x);f.send();"
+        "setTimeout(poll,400);}"
+        "function poll(){var f=new XMLHttpRequest();f.open('GET','/status');"
+        "f.onload=function(){try{var s=JSON.parse(f.responseText);"
+        "document.getElementById('t').textContent=s.title||'(无)';"
+        "if('mediaSession' in navigator){"
+        "navigator.mediaSession.metadata=new MediaMetadata({title:s.title||'LiteTune',artist:'LiteTune'});"
+        "navigator.mediaSession.playbackState=s.playing?'playing':'paused';}"
+        "if(s.title&&s.title!==lastT){lastT=s.title;A.load();}"
+        "}catch(e){}};f.send();}"
+        "if('mediaSession' in navigator){"
+        "try{navigator.mediaSession.setActionHandler('play',function(){A.play();});"
+        "navigator.mediaSession.setActionHandler('pause',function(){A.pause();});"
+        "navigator.mediaSession.setActionHandler('previoustrack',function(){cmd('prev');});"
+        "navigator.mediaSession.setActionHandler('nexttrack',function(){cmd('next');});}catch(e){}}"
+        "poll();setInterval(poll,3000);"
+        "</script></body></html>";
+    HttpRespond(s, "200 OK", "text/html; charset=utf-8", page, (int)sizeof(page) - 1);
+}
+
+/* /status：JSON 返回当前标题与播放状态 */
+static void HttpServeStatus(SOCKET s)
+{
+    wchar_t path[MAX_PATH], title[256];
+    char t8[1024], body[1200];
+    int n;
+    EnterCriticalSection(&g_nowCs);
+    wcsncpy(path, g_nowPath, MAX_PATH - 1); path[MAX_PATH - 1] = 0;
+    wcsncpy(title, g_nowTitle, 255);        title[255] = 0;
+    LeaveCriticalSection(&g_nowCs);
+    JsonEscapeU8(title, t8, sizeof(t8));
+    n = _snprintf(body, sizeof(body),
+        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s}",
+        t8, g_playState == 1 ? "true" : "false", path[0] ? "true" : "false");
+    HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, n);
+}
+
+/* /audio：流式输出当前播放的本地 mp3，支持 Range 拖动 */
+static void HttpServeAudio(SOCKET s, const char *req)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE hf;
+    LARGE_INTEGER fsize, start, end;
+    int partial = 0;
+    const char *rp;
+
+    EnterCriticalSection(&g_nowCs);
+    wcsncpy(path, g_nowPath, MAX_PATH - 1); path[MAX_PATH - 1] = 0;
+    LeaveCriticalSection(&g_nowCs);
+    if (!path[0]) { HttpRespond(s, "404 Not Found", "text/plain", "no audio", 8); return; }
+
+    hf = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        HttpRespond(s, "404 Not Found", "text/plain", "no file", 7);
+        return;
+    }
+    fsize.QuadPart = 0;
+    GetFileSizeEx(hf, &fsize);
+    start.QuadPart = 0;
+    end.QuadPart = fsize.QuadPart > 0 ? fsize.QuadPart - 1 : 0;
+
+    rp = strstr(req, "\r\nRange:");
+    if (!rp) rp = strstr(req, "\r\nrange:");
+    if (rp) {
+        const char *bp = strstr(rp, "bytes=");
+        if (bp) {
+            char *ep1;
+            long long a;
+            bp += 6;
+            a = strtoll(bp, &ep1, 10);
+            if (ep1 > bp && a >= 0) {
+                long long b = -1;
+                start.QuadPart = a;
+                if (*ep1 == '-' && ep1[1] >= '0' && ep1[1] <= '9')
+                    b = strtoll(ep1 + 1, NULL, 10);
+                if (b >= 0 && b < fsize.QuadPart) end.QuadPart = b;
+                if (start.QuadPart < fsize.QuadPart) partial = 1;
+            }
+        }
+    }
+    {
+        char hdr[512];
+        long long remain = end.QuadPart - start.QuadPart + 1;
+        int n;
+        if (partial)
+            n = _snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\n"
+                "Accept-Ranges: bytes\r\nContent-Range: bytes %lld-%lld/%lld\r\n"
+                "Content-Length: %lld\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                start.QuadPart, end.QuadPart, fsize.QuadPart, remain);
+        else
+            n = _snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
+                "Accept-Ranges: bytes\r\nContent-Length: %lld\r\n"
+                "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                remain);
+        if (n <= 0 || !SendAll(s, hdr, n)) { CloseHandle(hf); return; }
+        SetFilePointerEx(hf, start, NULL, FILE_BEGIN);
+        {
+            char buf[65536];
+            while (remain > 0) {
+                DWORD want = remain > (long long)sizeof(buf) ? sizeof(buf) : (DWORD)remain;
+                DWORD got = 0;
+                if (!ReadFile(hf, buf, want, &got, NULL) || got == 0) break;
+                if (!SendAll(s, buf, (int)got)) break;
+                remain -= got;
+            }
+        }
+    }
+    CloseHandle(hf);
+}
+
+/* /cmd?a=xxx：遥控电脑（等价于点主窗口按钮） */
+static void HttpServeCmd(SOCKET s, const char *pathq)
+{
+    const char *a = strstr(pathq, "a=");
+    int id = 0;
+    if (a) {
+        a += 2;
+        if      (strncmp(a, "play", 4) == 0) id = IDC_BTN_PLAY;
+        else if (strncmp(a, "prev", 4) == 0) id = IDC_BTN_PREV;
+        else if (strncmp(a, "next", 4) == 0) id = IDC_BTN_NEXT;
+        else if (strncmp(a, "stop", 4) == 0) id = IDC_BTN_STOP;
+    }
+    if (id && g_hwnd)
+        PostMessageW(g_hwnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), 0);
+    HttpRespond(s, "200 OK", "application/json", "{\"ok\":1}", 7);
+}
+
+/* 单个客户端连接：读请求行与头部，路由到对应处理函数，关闭 */
+static DWORD WINAPI PhoneClientThread(LPVOID p)
+{
+    SOCKET c = (SOCKET)(UINT_PTR)p;
+    char req[4096];
+    int total = 0, n;
+    DWORD tv = 8000;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    while (total < (int)sizeof(req) - 1) {
+        n = recv(c, req + total, (int)sizeof(req) - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        req[total] = 0;
+        if (strstr(req, "\r\n\r\n")) break;
+    }
+    if (total > 0) {
+        char *sp = strchr(req, ' ');
+        if (sp) {
+            char *path = sp + 1;
+            char *end = strchr(path, ' ');
+            if (end) *end = 0;
+            if      (strncmp(path, "/audio", 6) == 0) HttpServeAudio(c, req);
+            else if (strncmp(path, "/status", 7) == 0) HttpServeStatus(c);
+            else if (strncmp(path, "/cmd", 4) == 0)   HttpServeCmd(c, path);
+            else HttpServeHome(c);
+        }
+    }
+    closesocket(c);
+    return 0;
+}
+
+static DWORD WINAPI PhoneServerThread(LPVOID p)
+{
+    (void)p;
+    while (!g_httpStop) {
+        SOCKET c = accept(g_httpSock, NULL, NULL);
+        HANDLE th;
+        if (c == INVALID_SOCKET) break;   /* 监听 socket 被关闭 → 退出 */
+        th = CreateThread(NULL, 0, PhoneClientThread, (LPVOID)(UINT_PTR)c, 0, NULL);
+        if (th) CloseHandle(th);
+        else closesocket(c);
+    }
+    return 0;
+}
+
+/* 取本机局域网 IPv4（点分十进制）；失败返回 127.0.0.1 */
+static void GetLocalIP(char *out, int outMax)
+{
+    char host[256] = "";
+    struct addrinfo hints, *res = NULL, *it;
+    out[0] = 0;
+    if (gethostname(host, sizeof(host) - 1) != 0) goto fail;
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) goto fail;
+    for (it = res; it; it = it->ai_next) {
+        struct sockaddr_in *sa = (struct sockaddr_in*)it->ai_addr;
+        unsigned char *b = (unsigned char*)&sa->sin_addr;
+        if (b[0] == 127) continue;
+        _snprintf(out, outMax, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        break;
+    }
+    freeaddrinfo(res);
+    if (out[0]) return;
+fail:
+    _snprintf(out, outMax, "127.0.0.1");
+}
+
+static int PhoneServerStart(void)
+{
+    WSADATA wsa;
+    struct sockaddr_in addr;
+    int one = 1;
+    if (g_httpThread) return 1;   /* 已在运行 */
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+    g_httpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_httpSock == INVALID_SOCKET) { WSACleanup(); return 0; }
+    setsockopt(g_httpSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(PHONE_PORT);
+    if (bind(g_httpSock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR ||
+        listen(g_httpSock, 8) == SOCKET_ERROR) {
+        closesocket(g_httpSock);
+        g_httpSock = INVALID_SOCKET;
+        WSACleanup();
+        return 0;
+    }
+    g_httpStop = 0;
+    g_httpThread = CreateThread(NULL, 0, PhoneServerThread, NULL, 0, NULL);
+    if (!g_httpThread) {
+        closesocket(g_httpSock);
+        g_httpSock = INVALID_SOCKET;
+        WSACleanup();
+        return 0;
+    }
+    return 1;
+}
+
+static void PhoneServerStop(void)
+{
+    if (!g_httpThread) return;
+    g_httpStop = 1;
+    if (g_httpSock != INVALID_SOCKET) {
+        closesocket(g_httpSock);      /* 使 accept 立即失败退出 */
+        g_httpSock = INVALID_SOCKET;
+    }
+    WaitForSingleObject(g_httpThread, 3000);
+    CloseHandle(g_httpThread);
+    g_httpThread = NULL;
+    WSACleanup();
 }
 
 /* ================= UI 逻辑 ================= */
@@ -2412,6 +3002,9 @@ static void SelectPodcast(int idx)
     SortPodcast(&g_pods[idx]);
     FillEpisodeList();
     ShowPodcastDetail(idx);
+    SyncScrollBar(g_vsEp);
+    SyncScrollBar(g_hsEp);
+    SyncScrollBar(g_vsDesc);
 }
 
 static void SelectEpisode(int idx)
@@ -2420,6 +3013,7 @@ static void SelectEpisode(int idx)
     if (!p || idx < 0 || idx >= p->epCount) return;
     g_curEp = idx;
     ShowEpisodeDetail(g_curPod, idx);
+    SyncScrollBar(g_vsDesc);
 }
 
 /* 点击列头：同列切换方向，换列用默认方向（日期/时长降序，标题升序） */
@@ -2501,7 +3095,7 @@ static void PlayLocalEpisode(int ep)
     SetWindowTextW(g_stFormat, info);
     swprintf(st, 512, tr(TR_PLAYING_OFFLINE_FMT), e->title ? e->title : L"");
     SetStatus(st);
-    PlayerPlayFile(e->url);
+    PlayerPlayFile(e->url, e->title);
 }
 
 static void RequestPlayEpisode(int pod, int ep)
@@ -2791,6 +3385,7 @@ static void MovePodcast(int i, int dir)
 
 static wchar_t g_ibBuf[2048];
 static int     g_ibResult = 0;
+static int     g_ibMode = 0;   /* 0=订阅 URL，1=定时关机分钟数 */
 
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -2798,9 +3393,11 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE: {
         HWND e, lab;
         e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
             12, 32, 356, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
-        lab = CreateWindowExW(0, L"STATIC", tr(TR_INPUT_LABEL),
+        lab = CreateWindowExW(0, L"STATIC",
+            g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_INPUT_LABEL),
             WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 10, 356, 18, h, NULL, NULL, NULL);
         CreateWindowExW(0, L"BUTTON", tr(TR_OK),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
@@ -2827,6 +3424,21 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             e = s + wcslen(s);
             while (e > s && (e[-1] == L' ' || e[-1] == L'\t' ||
                              e[-1] == L'\r' || e[-1] == L'\n')) *--e = 0;
+
+            if (g_ibMode == 1) {
+                /* 分钟数：1-600（ES_NUMBER 已挡掉非数字输入） */
+                int mins = _wtoi(s);
+                if (mins < 1 || mins > 600) {
+                    MessageBoxW(h, tr(TR_CUSTOM_BAD), L"LiteTune", MB_ICONWARNING);
+                    return 0;
+                }
+                wcsncpy(g_ibBuf, s, 2047);
+                g_ibBuf[2047] = 0;
+                g_ibResult = 1;
+                DestroyWindow(h);
+                return 0;
+            }
+
             if (!wcsstr(s, L"://")) {
                 MessageBoxW(h, tr(TR_BAD_URL),
                             L"LiteTune", MB_ICONWARNING);
@@ -2859,8 +3471,9 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-/* 弹出输入框；确认后追加订阅并自动刷新 */
-static void AskAddFeed(void)
+/* 模态输入框：title 为窗口标题，mode 0=订阅 URL 1=分钟数。
+ * 确认返回 1（结果在 g_ibBuf），取消返回 0 */
+static int AskInputBox(const wchar_t *title, int mode)
 {
     static const wchar_t *IB_CLASS = L"LpInputBox";
     WNDCLASSW wc;
@@ -2878,13 +3491,14 @@ static void AskAddFeed(void)
         RegisterClassW(&wc);
     }
 
+    g_ibMode = mode;
     g_ibResult = 0;
     g_ibBuf[0] = 0;
     d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, IB_CLASS,
-        tr(TR_INPUT_TITLE),
+        title,
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         0, 0, 384, 138, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
-    if (!d) return;
+    if (!d) return 0;
 
     /* 居中到主窗口 */
     GetWindowRect(g_hwnd, &rp);
@@ -2905,8 +3519,13 @@ static void AskAddFeed(void)
     }
     EnableWindow(g_hwnd, TRUE);
     SetForegroundWindow(g_hwnd);
+    return g_ibResult && g_ibBuf[0];
+}
 
-    if (g_ibResult && g_ibBuf[0]) {
+/* 弹出输入框；确认后追加订阅并自动刷新 */
+static void AskAddFeed(void)
+{
+    if (AskInputBox(tr(TR_INPUT_TITLE), 0)) {
         char *u8 = WToU8(g_ibBuf);
         if (u8) {
             AddFeedUrl(u8);        /* ini 只在退出时统一写，运行中全部走内存 */
@@ -2914,6 +3533,14 @@ static void AskAddFeed(void)
             free(u8);
         }
     }
+}
+
+/* 自定义分钟数定时关机 */
+static void SetShutdownTimer(int minutes);   /* 定义在设置菜单段 */
+static void AskCustomShutdown(void)
+{
+    if (AskInputBox(tr(TR_CUSTOM_TITLE), 1))
+        SetShutdownTimer(_wtoi(g_ibBuf));
 }
 
 /* 切换播客列表模式：0=普通 1=删除 2=排序（互斥） */
@@ -2980,33 +3607,10 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 /* 内容面板与按钮共用：Ctrl+滚轮调字号。
- * 各窗口原始过程存在自己的 GWLP_USERDATA。 */
+ * 滚动条暗色由 33ms 定时器统一兜底，这里不拦截任何消息。 */
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
-    /* 夜间模式：默认绘制后把非客户区滚动条盖成暗色 */
-    if (msg == WM_NCPAINT && g_darkMode) {
-        old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
-        PaintDarkScrollBars(hwnd);
-        return lr;
-    }
-    /* 夜间模式：吞掉滚动条悬停消息。系统进入“热态”的唯一入口就是
-     * WM_NCMOUSEMOVE 的默认处理；不给它，滑块永远不会被画成亮色，
-     * 也无需事后补盖（补盖总有盖不住的时机）。
-     * 滚动条功能不受影响：点击/拖动走 WM_NCLBUTTONDOWN 的内部模态循环 */
-    if (g_darkMode && msg == WM_NCMOUSEMOVE &&
-        (hwnd == g_listPod || hwnd == g_listEp || hwnd == g_editDesc))
-        return 0;
-    /* 拖动滚动条后系统未必重发 WM_NCPAINT，主动补绘；
-     * 激活切换(WM_NCACTIVATE)和缩放(WM_SIZE)也会把滚动条重画回亮色 */
-    if (g_darkMode && (msg == WM_VSCROLL || msg == WM_HSCROLL ||
-                       msg == WM_NCACTIVATE || msg == WM_SIZE)) {
-        old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
-        PaintDarkScrollBars(hwnd);
-        return lr;
-    }
     /* 暗色表头：ODT_HEADER 的 WM_DRAWITEM 发给表头的父窗口 ListView */
     if (g_darkMode && msg == WM_DRAWITEM && hwnd == g_listEp) {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lp;
@@ -3042,12 +3646,47 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     /* 播客列表滚动时，隐藏悬停提示避免显示旧条目 */
     if (hwnd == g_listPod && msg == WM_MOUSEWHEEL)
         ShowWindow(g_hwndPodTip, SW_HIDE);
-    /* 滚轮/客户区重绘后，滚动条可能被系统重新画成亮色，补绘 */
-    if (g_darkMode && (msg == WM_MOUSEWHEEL || msg == WM_PAINT)
-        && (hwnd == g_listEp || hwnd == g_listPod || hwnd == g_editDesc)) {
+    /* 内容控件已无系统滚动条：滚轮由这里手动驱动（ListView 除外，
+     * 它保留默认平滑滚动）。LB_SETTOPINDEX/EM_LINESCROLL 自动夹紧边界 */
+    if (msg == WM_MOUSEWHEEL && hwnd == g_listPod) {
+        int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
+        int top = (int)SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0);
+        if (top + d < 0) d = -top;
+        SendMessageW(hwnd, LB_SETTOPINDEX, top + d, 0);
+        SyncScrollBar(g_vsPod);
+        return 0;
+    }
+    if (msg == WM_MOUSEWHEEL && hwnd == g_editDesc) {
+        int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
+        SendMessageW(hwnd, EM_LINESCROLL, 0, MAKELONG(0, d));
+        SyncScrollBar(g_vsDesc);
+        return 0;
+    }
+    /* ListView 会自动显示自带滚动条：在 WM_NCCALCSIZE 里把条带并回
+     * 客户区（永不显示白条，内容宽度也不抖动） */
+    if (msg == WM_NCCALCSIZE && wp && hwnd == g_listEp) {
+        WNDPROC oldp = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        LRESULT lr = CallWindowProcW(oldp, hwnd, msg, wp, lp);
+        SCROLLBARINFO sb;
+        RECT *rc = &((NCCALCSIZE_PARAMS*)lp)->rgrc[0];
+        sb.cbSize = sizeof(sb);
+        if (GetScrollBarInfo(hwnd, OBJID_VSCROLL, &sb) &&
+            !(sb.rgstate[0] & STATE_SYSTEM_INVISIBLE))
+            rc->right += GetSystemMetrics(SM_CXVSCROLL);
+        sb.cbSize = sizeof(sb);
+        if (GetScrollBarInfo(hwnd, OBJID_HSCROLL, &sb) &&
+            !(sb.rgstate[0] & STATE_SYSTEM_INVISIBLE))
+            rc->bottom += GetSystemMetrics(SM_CYHSCROLL);
+        return lr;
+    }
+    /* 滚动/尺寸变化后立即同步自绘滚动条（不依赖定时器） */
+    if (msg == WM_VSCROLL || msg == WM_HSCROLL ||
+        msg == WM_SIZE || msg == WM_MOUSEWHEEL) {
         old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
-        PaintDarkScrollBars(hwnd);
+        if (hwnd == g_listPod)       SyncScrollBar(g_vsPod);
+        else if (hwnd == g_listEp) { SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp); }
+        else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
         return lr;
     }
     old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -3154,11 +3793,20 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(g_btnSort,    x + 54, by, 24, 24, TRUE);
     MoveWindow(g_btnRefresh, x + 81, by, 24, 24, TRUE);
     MoveWindow(g_btnDir,     x + 108, by, 24, 24, TRUE);
-    MoveWindow(g_listPod, x, by + 28, w1, bh - 28, TRUE);
-    x += w1 + GAP_W;
-    MoveWindow(g_listEp,   x, by, w2, bh, TRUE);
-    x += w2 + GAP_W;
-    MoveWindow(g_editDesc, x, by, w3, bh, TRUE);
+    /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
+     * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
+    {
+        int sbw = DSB_W, sbh = DSB_W;
+        MoveWindow(g_listPod, x, by + 28, w1 - sbw, bh - 28, TRUE);
+        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - sbw, by + 28, sbw, bh - 28, TRUE);
+        x += w1 + GAP_W;
+        MoveWindow(g_listEp, x, by, w2 - sbw, bh - sbh, TRUE);
+        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - sbw, by, sbw, bh - sbh, TRUE);
+        if (g_hsEp) MoveWindow(g_hsEp, x, by + bh - sbh, w2 - sbw, sbh, TRUE);
+        x += w2 + GAP_W;
+        MoveWindow(g_editDesc, x, by, w3 - sbw, bh, TRUE);
+        if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - sbw, by, sbw, bh, TRUE);
+    }
 }
 
 /* ================= 方形图标按钮（owner-draw） ================= */
@@ -3477,21 +4125,39 @@ static void SetShutdownTimer(int minutes)
     UpdateWindowTitle();
 }
 
-/* 到点执行关机：先提权 SE_SHUTDOWN_NAME，失败则仅提示 */
+/* 到点执行关机：先提权 SE_SHUTDOWN_NAME，再走系统关机流程。
+ * 主用 InitiateSystemShutdownExW：15 秒系统倒计时、强制关闭应用，
+ * 期间可用 shutdown /a 取消；失败再退回 ExitWindowsEx。 */
 static void DoSystemShutdown(void)
 {
-    HANDLE tok;
+    HANDLE tok = NULL;
     TOKEN_PRIVILEGES tp;
+    int privileged = 0;
+
     g_shutdownAt = 0;
     KillTimer(g_hwnd, 3);
     UpdateWindowTitle();
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
-        LookupPrivilegeValueW(NULL, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid);
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+
+    ZeroMemory(&tp, sizeof(tp));
+    if (OpenProcessToken(GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+        if (LookupPrivilegeValueW(NULL, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+            /* ERROR_SUCCESS 才表示特权确实拿到（ERROR_NOT_ALL_ASSIGNED 也算失败） */
+            privileged = (GetLastError() == ERROR_SUCCESS);
+        }
         CloseHandle(tok);
     }
+
+    if (privileged &&
+        InitiateSystemShutdownExW(NULL, NULL, 15, TRUE, FALSE,
+            SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER)) {
+        SetStatusTemp(tr(TR_SHUTTING_DOWN));
+        return;
+    }
+    /* 兜底：立即关机（FORCEIFHUNG 只强杀无响应窗口，响应中的程序仍可拦截） */
     if (!ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCEIFHUNG,
                        SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER))
         SetStatus(tr(TR_SHUT_DENIED));
@@ -3622,12 +4288,15 @@ static void OnSettingsButton(void)
         AppendMenuW(sub, MF_STRING, 100 + mins[i], t);
     }
     AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sub, MF_STRING, 8, tr(TR_M_CUSTOM));
+    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
     AppendMenuW(sub, MF_STRING | (g_shutdownAt ? 0 : MF_GRAYED), 5, tr(TR_M_SHUT_CANCEL));
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, tr(TR_M_SHUTDOWN));
     swprintf(fontItem, 32, tr(TR_M_FONT_FMT),
         g_fontLevel == 0 ? tr(TR_FONT_S) : g_fontLevel == 1 ? tr(TR_FONT_M) : tr(TR_FONT_L));
     AppendMenuW(menu, MF_STRING, 6, fontItem);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, 9, tr(TR_M_PHONE));
     AppendMenuW(menu, MF_STRING, 7, tr(TR_M_ABOUT));
 
     GetCursorPos(&pt);
@@ -3648,12 +4317,32 @@ static void OnSettingsButton(void)
         if (nl != g_lang) { g_lang = nl; ApplyLanguage(); }
         return;
     }
+    if (cmd == 9) {
+        if (g_httpThread) {
+            PhoneServerStop();
+            SetStatusTemp(tr(TR_PHONE_OFF));
+        } else {
+            if (PhoneServerStart()) {
+                char ip[64];
+                wchar_t url[128], msg[512];
+                GetLocalIP(ip, sizeof(ip));
+                swprintf(url, 128, L"http://%S:%d/", ip, PHONE_PORT);
+                swprintf(msg, 512, tr(TR_PHONE_MSG), url);
+                MessageBoxW(g_hwnd, msg, tr(TR_PHONE_TITLE), MB_OK | MB_ICONINFORMATION);
+                SetStatusTemp(tr(TR_PHONE_ON));
+            } else {
+                MessageBoxW(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
+            }
+        }
+        return;
+    }
     if (cmd == 7) {
         MessageBoxW(g_hwnd, tr(TR_ABOUT_TEXT), tr(TR_M_ABOUT),
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
     if (cmd == 5) { SetShutdownTimer(0); return; }
+    if (cmd == 8) { AskCustomShutdown(); return; }
     if (cmd >= 100) { SetShutdownTimer(cmd - 100); return; }
     if (cmd == 6) {
         ChangeFontLevel((g_fontLevel + 1) % 3);
@@ -3699,23 +4388,19 @@ static void OnSettingsButton(void)
         }
         if (pidl) CoTaskMemFree(pidl);
     } else if (cmd == 3) {
-        /* 恢复默认目录：与"更改目录"一样，旧目录有文件时询问是否移动 */
+        /* 恢复默认目录：先清空自定义设置，获取真正的默认目录（%TEMP%\LiteTune\）。
+         * 旧目录（恢复前的 curDir）里有文件时询问是否移到新默认目录。 */
         wchar_t defDir[MAX_PATH];
-        wchar_t defCreate[MAX_PATH];
-        ExeDir(defDir, MAX_PATH);
-        wcscat_s(defDir, MAX_PATH, L"cache\\");
+        g_cacheDir[0] = 0;
+        CacheDir(defDir, MAX_PATH);          /* 现在返回真正的默认目录 */
         if (CountMp3InDir(curDir) > 0 && _wcsicmp(curDir, defDir) != 0) {
             wchar_t msg[256];
             swprintf(msg, 256, tr(TR_MOVE_Q_DEF_FMT), CountMp3InDir(curDir));
             if (MessageBoxW(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                wcsncpy(defCreate, defDir, MAX_PATH);
-                defCreate[MAX_PATH - 1] = 0;
-                defCreate[wcslen(defCreate) - 1] = 0;   /* CreateDirectory 不带末尾反斜杠 */
-                CreateDirectoryW(defCreate, NULL);
+                EnsureCacheDir();            /* 确保默认目录已创建 */
                 MoveCacheFiles(curDir, defDir, L"mp3");
             }
         }
-        g_cacheDir[0] = 0;
         EnsureCacheDir();
         SetStatusTemp(tr(TR_CACHE_RESET));
     }
@@ -4027,7 +4712,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     switch (msg) {
     case WM_CREATE: {
-        DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP
+        /* 不带 WS_VSCROLL：系统滚动条彻底不用，滚动条全部自绘 */
+        DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP
                       | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS;
 
         g_font = CreateUiFont(8 + g_fontLevel, FW_NORMAL);
@@ -4106,9 +4792,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         g_editDesc = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
+
+        /* 自绘滚动条（唯一滚动条；剧集列表另有水平条） */
+        g_vsPod  = CreateDarkScrollBar(hwnd, g_listPod,  0, 0, IDC_SB_POD);
+        g_vsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 0, IDC_SB_EP);
+        g_hsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 1, IDC_SB_EP_H);
+        g_vsDesc = CreateDarkScrollBar(hwnd, g_editDesc, 2, 0, IDC_SB_DESC);
 
         ApplyFontsToControls();
 
@@ -4707,6 +5399,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RestoreBaseStatus();
             return 0;
         }
+        /* 滚动条跟随内容/滚动实时刷新（自绘条是唯一滚动条） */
+        SyncScrollBar(g_vsPod);
+        SyncScrollBar(g_vsEp);
+        SyncScrollBar(g_hsEp);
+        SyncScrollBar(g_vsDesc);
         if (g_playState == 1 && !g_seeking && g_player) {
             long long pos = PlayerGet100ns(0);
             long long dur = PlayerGet100ns(1);
@@ -4822,7 +5519,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 swprintf(st, 512, tr(TR_PLAYING_FMT), e->title);
                 SetStatus(st);
-                PlayerPlayFile(cache);
+                PlayerPlayFile(cache, e->title);
             } else {
                 /* 下载失败或条目已消失：撤销绿色播放标记 */
                 g_playPod = -1;
@@ -4910,6 +5607,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
         KillTimer(hwnd, 4);
+        PhoneServerStop();   /* 手机服务随程序退出关闭 */
+        DeleteCriticalSection(&g_nowCs);
         SaveConfig();   /* 退出时统一写盘：排序/列宽/音量/字号/窗口尺寸/订阅顺序 */
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         if (g_taskbar) { g_taskbar->lpVtbl->Release(g_taskbar); g_taskbar = NULL; }
@@ -4964,6 +5663,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    InitializeCriticalSection(&g_nowCs);
     {
         GdiplusStartupInput gsi;
         gsi.GdiplusVersion = 1;
@@ -4982,6 +5682,36 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     LoadConfig();
     EnsureCacheDir();   /* 配置里可能有自定义缓存目录，先确保存在 */
 
+    /* 清理 30 天前的旧缓存（仅默认 %TEMP% 目录；自定义目录由用户自己管理） */
+    if (!g_cacheDir[0]) {
+        wchar_t cdir[MAX_PATH], pat[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE h;
+        FILETIME ftNow;
+        ULARGE_INTEGER ullNow, ullFile;
+        CacheDir(cdir, MAX_PATH);
+        swprintf(pat, MAX_PATH, L"%s*.mp3", cdir);
+        h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            GetSystemTimeAsFileTime(&ftNow);
+            ullNow.LowPart = ftNow.dwLowDateTime;
+            ullNow.HighPart = ftNow.dwHighDateTime;
+            /* 30 天 = 30*24*3600*10^7 个 100ns 间隔 */
+            ullNow.QuadPart -= 30ULL * 24 * 3600 * 10000000ULL;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+                ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+                if (ullFile.QuadPart < ullNow.QuadPart) {
+                    wchar_t fp[MAX_PATH];
+                    swprintf(fp, MAX_PATH, L"%s%s", cdir, fd.cFileName);
+                    DeleteFileW(fp);
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -4997,6 +5727,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     }
     if (!RegisterClassExW(&wc)) return 1;
+
+    /* 注册自绘滚动条窗口类 */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DarkScrollBarProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = DSB_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘背景 */
+    RegisterClassExW(&wc);
 
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
     g_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
