@@ -11,7 +11,7 @@
  * 编译（MinGW）:
  *   windres resource.rc -O coff -o resource.o
  *   gcc -O2 -s -mwindows -municode -o LiteTune.exe main.c resource.o \
- *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32
+ *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32 -liphlpapi
  */
 #ifndef UNICODE
 #define UNICODE
@@ -24,6 +24,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -239,13 +240,17 @@ static wchar_t *g_playUrl = NULL;   /* 当前请求播放的音频 URL */
 static long long g_dur100ns = 0;
 
 /* 手机播放/遥控 HTTP 服务 */
-#define PHONE_PORT 17532
+/* 端口优先用 80（Windows 防火墙常已放行，手机最容易连上），占用再依次降级 */
+static const unsigned short PHONE_PORTS[] = { 80, 8080, 17532 };
 static CRITICAL_SECTION g_nowCs;                      /* 保护下面两个“正在播放”字段 */
 static wchar_t g_nowPath[MAX_PATH] = L"";             /* 正在播放的本地 mp3 全路径 */
 static wchar_t g_nowTitle[256]     = L"";             /* 正在播放的剧集标题 */
 static SOCKET  g_httpSock  = INVALID_SOCKET;
 static HANDLE  g_httpThread = NULL;
 static volatile int g_httpStop = 0;
+static unsigned short g_httpPort = 0;                 /* 实际绑定成功的端口 */
+#define WM_APP_REMOTE_SEEK (WM_APP + 6)   /* wParam: 0=后退15秒 1=前进15秒 */
+#define WM_APP_REMOTE_SHUT (WM_APP + 7)   /* wParam: 定时分钟数，0=取消 */
 
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
@@ -282,8 +287,8 @@ enum {
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
     TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_REFRESH, TR_TIP_SETTINGS,
     TR_PM_ORDER, TR_PM_SHUFFLE, TR_PM_REPEAT, TR_PM_ONCE,
-    TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_MSG, TR_PHONE_FAIL,
-    TR_PHONE_ON, TR_PHONE_OFF,
+    TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_FAIL,
+    TR_PHONE_ON, TR_PHONE_OFF, TR_PHONE_FW,
     TR_N
 };
 
@@ -338,12 +343,14 @@ static const wchar_t *tr(int id)
         L"添加播客", L"删除播客", L"调整顺序", L"刷新", L"设置",
         L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放",
         L"手机播放/遥控", L"手机播放/遥控",
-        L"手机浏览器打开：\r\n\r\n%s\r\n\r\n"
-            L"• 手机当喇叭：点页面里的播放按钮\r\n"
-            L"• 遥控电脑：用页面下方按钮\r\n\r\n"
-            L"（需在同一 Wi-Fi 下；若系统弹出防火墙提示请允许）",
         L"手机服务启动失败（端口被占用？）",
-        L"手机服务已开启", L"手机服务已关闭"
+        L"手机服务已开启", L"手机服务已关闭",
+        L"服务已在本机开启，但防火墙未放行，手机连不上。\r\n\r\n"
+            L"请在弹出的权限窗口点「是」；若已错过，可用管理员身份打开命令行执行：\r\n"
+            L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
+            L"dir=in action=allow program=\"本程序完整路径\" enable=yes profile=any\r\n\r\n"
+            L"另外，手机要连页面上标注 WiFi/以太网 的地址；复制到别的电脑运行时，"
+            L"那台电脑也会重新询问一次防火墙权限。"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -400,12 +407,18 @@ static const wchar_t *tr(int id)
         L"Add podcast", L"Delete podcast", L"Reorder", L"Refresh", L"Settings",
         L"Sequential", L"Shuffle", L"Repeat one", L"Play once",
         L"Phone Speaker/Remote", L"Phone Speaker/Remote",
-        L"Open this on your phone's browser:\r\n\r\n%s\r\n\r\n"
-            L"• Phone as speaker: press play in the page\r\n"
-            L"• Remote control: use the buttons below\r\n\r\n"
-            L"(Same Wi-Fi required; allow the firewall prompt if shown)",
         L"Failed to start phone service (port in use?)",
-        L"Phone service on", L"Phone service off"
+        L"Phone service on", L"Phone service off",
+        L"The service is running on this PC, but the firewall was not opened, "
+            L"so the phone cannot connect.\r\n\r\n"
+            L"Click \"Yes\" on the permission prompt. If you missed it, run as "
+            L"administrator:\r\n"
+            L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
+            L"dir=in action=allow program=\"full-path-to-this-exe\" "
+            L"enable=yes profile=any\r\n\r\n"
+            L"Also: on the phone use the address labelled WiFi/Ethernet. "
+            L"Copying the program to another PC means that PC will ask for "
+            L"firewall permission again."
     };
     return (g_lang ? en : zh)[id];
 }
@@ -697,6 +710,8 @@ typedef struct {
     int thumbLen, thumbPos;    /* 像素，由 UpdateThumb 计算 */
     int dragging;      /* 正在拖把手 */
     int dragOffset;    /* 拖动起点在把手内的偏移 */
+    int repeatDir;     /* 按住箭头/滑槽自动连滚方向：-1 起端 +1 末端 0 无 */
+    int repeatPage;    /* 1=滑槽翻页 0=箭头单行 */
     HWND target;       /* 关联的内容控件 */
 } DarkScrollBar;
 
@@ -704,10 +719,15 @@ typedef struct {
 static COLORREF ThSbThumb(void) { return g_darkMode ? RGB(104,104,112) : RGB(202,202,208); }
 static COLORREF ThSbArrow(void) { return g_darkMode ? RGB(175,175,183) : RGB(120,120,128); }
 
-/* 用第 0 项的实际矩形测行高（含图标/字体影响，比 LVM_GETITEMSPACING 准） */
+/* 用可见项的实际矩形测行高（顶部项一定已布局，比第 0 项可靠；
+ * 绝不在两种取法之间来回摇摆——否则把手长度会忽长忽短） */
 static int DSB_RowH(HWND lv)
 {
     RECT ri;
+    int top = (int)SendMessageW(lv, LVM_GETTOPINDEX, 0, 0);
+    if (top < 0) top = 0;
+    if (SendMessageW(lv, LVM_GETITEMRECT, top, (LPARAM)&ri) && ri.bottom > ri.top)
+        return ri.bottom - ri.top;
     if (SendMessageW(lv, LVM_GETITEMRECT, 0, (LPARAM)&ri) && ri.bottom > ri.top)
         return ri.bottom - ri.top;
     {
@@ -717,8 +737,8 @@ static int DSB_RowH(HWND lv)
     }
 }
 
-/* 读取目标控件的滚动状态。listbox/edit 用行单位 API；
- * listview 纵向自算像素偏移（行高用项矩形实测），横向用 GetScrollInfo。
+/* 读取目标控件的滚动状态。listbox/edit/listview 纵向统一用“行”单位，
+ * listview 横向用 GetScrollInfo 像素。max=最后有效滚动位置。
  * 返回是否可滚动 */
 static int DSB_QueryState(DarkScrollBar *dsb)
 {
@@ -761,20 +781,23 @@ static int DSB_QueryState(DarkScrollBar *dsb)
         dsb->pos = (int)SendMessageW(t, EM_GETFIRSTVISIBLELINE, 0, 0);
         return lines > vis;
     }
-    if (!dsb->horizontal) {               /* ListView 纵向：自算像素偏移 */
+    if (!dsb->horizontal) {               /* ListView 纵向：行单位（用控件自带口径） */
         int count = (int)SendMessageW(t, LVM_GETITEMCOUNT, 0, 0);
-        int rowH  = DSB_RowH(t);
-        int visPx = rc.bottom - rc.top;
-        int maxOff = count * rowH - visPx;
+        int per   = (int)SendMessageW(t, LVM_GETCOUNTPERPAGE, 0, 0);
+        if (per < 1) per = 1;
         dsb->min = 0;
-        dsb->max = maxOff > 0 ? maxOff : 0;
-        dsb->page = visPx;
-        dsb->pos = (int)SendMessageW(t, LVM_GETTOPINDEX, 0, 0) * rowH;
-        return maxOff > 0;
+        dsb->max = count > per ? count - per : 0;
+        dsb->page = per;
+        dsb->pos = (int)SendMessageW(t, LVM_GETTOPINDEX, 0, 0);
+        return count > per;
     }
-    /* ListView 横向：控件维护的像素滚动信息 */
+    /* ListView 横向：控件维护的像素滚动信息。
+     * GetScrollInfo 的 nMax 是内容总宽（不是最后滚动位置），
+     * 要换算成与纵向一致的口径：max=最后有效滚动位置，
+     * 内容不超出一屏时 max==min → SyncScrollBar 自动隐藏 */
     {
         SCROLLINFO si;
+        int m;
         ZeroMemory(&si, sizeof(si));
         si.cbSize = sizeof(si);
         si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
@@ -782,21 +805,20 @@ static int DSB_QueryState(DarkScrollBar *dsb)
             dsb->min = 0; dsb->max = 0; dsb->page = 1; dsb->pos = 0;
             return 0;
         }
+        m = si.nMax - (int)si.nPage + 1;   /* 最后一个有效滚动位置 */
+        if (m < si.nMin) m = si.nMin;
         dsb->min = si.nMin;
-        dsb->max = si.nMax;
+        dsb->max = m;
         dsb->page = si.nPage ? (int)si.nPage : 1;
         dsb->pos = si.nPos;
         return dsb->max > dsb->min;
     }
 }
 
-/* 箭头单击滚动一步：listbox/edit=1 行；listview 纵向=1 行高像素，横向=16px */
+/* 箭头单击滚动一步：纵向统一 1 行；listview 横向 16px */
 static int DSB_LineStep(const DarkScrollBar *dsb)
 {
-    if (dsb->kind == 1) {
-        if (dsb->horizontal) return 16;
-        return DSB_RowH(dsb->target);
-    }
+    if (dsb->kind == 1 && dsb->horizontal) return 16;
     return 1;
 }
 
@@ -810,11 +832,12 @@ static void DSB_ScrollTarget(DarkScrollBar *dsb, int delta)
     if (dsb->kind == 0) {
         SendMessageW(t, LB_SETTOPINDEX, dsb->pos + delta, 0);
     } else if (dsb->kind == 2) {
-        SendMessageW(t, EM_LINESCROLL, 0, MAKELONG(0, delta));
+        SendMessageW(t, EM_LINESCROLL, 0, (LPARAM)delta);
     } else if (dsb->horizontal) {
-        SendMessageW(t, LVM_SCROLL, (WPARAM)delta, 0);
+        SendMessageW(t, LVM_SCROLL, (WPARAM)delta, 0);     /* 横向：像素 */
     } else {
-        SendMessageW(t, LVM_SCROLL, 0, (LPARAM)delta);
+        SendMessageW(t, LVM_SCROLL, 0,
+                     (LPARAM)(delta * DSB_RowH(t)));        /* 纵向：行→像素 */
     }
 }
 
@@ -941,18 +964,55 @@ static LRESULT CALLBACK DarkScrollBarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         DSB_UpdateThumb(dsb, hwnd);
         if (dsb->thumbLen <= 0) return 0;
         SetCapture(hwnd);
+        dsb->repeatDir = 0;
         t0 = DSB_W + dsb->thumbPos;
-        if (c < DSB_W)                       /* 起端箭头：滚一行 */
+        if (c < DSB_W) {                     /* 起端箭头：滚一行 */
             DSB_SetPos(dsb, hwnd, dsb->pos - DSB_LineStep(dsb));
-        else if (c > len - DSB_W)            /* 末端箭头：滚一行 */
+            dsb->repeatDir = -1; dsb->repeatPage = 0;
+        } else if (c > len - DSB_W) {        /* 末端箭头：滚一行 */
             DSB_SetPos(dsb, hwnd, dsb->pos + DSB_LineStep(dsb));
-        else if (c >= t0 && c < t0 + dsb->thumbLen) {
+            dsb->repeatDir = 1; dsb->repeatPage = 0;
+        } else if (c >= t0 && c < t0 + dsb->thumbLen) {
             dsb->dragging = 1;
             dsb->dragOffset = c - t0;
-        } else if (c < t0)                   /* 上/左滑槽：翻页 */
+        } else if (c < t0) {                 /* 上/左滑槽：翻页 */
             DSB_SetPos(dsb, hwnd, dsb->pos - dsb->page);
-        else                                 /* 下/右滑槽：翻页 */
+            dsb->repeatDir = -1; dsb->repeatPage = 1;
+        } else {                             /* 下/右滑槽：翻页 */
             DSB_SetPos(dsb, hwnd, dsb->pos + dsb->page);
+            dsb->repeatDir = 1; dsb->repeatPage = 1;
+        }
+        if (dsb->repeatDir)                  /* 按住箭头/滑槽：先延迟再连滚 */
+            SetTimer(hwnd, 2, 350, NULL);
+        return 0;
+    }
+    case WM_TIMER: {
+        /* 按住箭头/滑槽自动连滚：首次 350ms 延迟后每 50ms 一步；
+         * 每拍重新做命中测试，指针挪开就停 */
+        POINT p;
+        RECT rc;
+        int c, len, t0, dir = 0, page = 0;
+        if (!dsb || wp != 2 || !dsb->repeatDir || dsb->dragging) return 0;
+        if (!(GetKeyState(VK_LBUTTON) & 0x8000)) {
+            KillTimer(hwnd, 2);
+            dsb->repeatDir = 0;
+            return 0;
+        }
+        GetCursorPos(&p);
+        ScreenToClient(hwnd, &p);
+        GetClientRect(hwnd, &rc);
+        len = dsb->horizontal ? rc.right : rc.bottom;
+        c = dsb->horizontal ? p.x : p.y;
+        t0 = DSB_W + dsb->thumbPos;
+        if (c < DSB_W)              { dir = -1; page = 0; }
+        else if (c > len - DSB_W)   { dir = 1;  page = 0; }
+        else if (c < t0)            { dir = -1; page = 1; }
+        else if (c >= t0 + dsb->thumbLen) { dir = 1; page = 1; }
+        if (!dir || dir != dsb->repeatDir || page != dsb->repeatPage)
+            return 0;                        /* 指针离开/跨过把手：原地待命 */
+        DSB_SetPos(dsb, hwnd, dsb->pos +
+                   (page ? dsb->page : DSB_LineStep(dsb)) * dir);
+        SetTimer(hwnd, 2, 50, NULL);         /* 后续连滚间隔 */
         return 0;
     }
     case WM_MOUSEMOVE:
@@ -972,6 +1032,8 @@ static LRESULT CALLBACK DarkScrollBarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
     case WM_LBUTTONUP:
         if (dsb) {
             dsb->dragging = 0;
+            dsb->repeatDir = 0;
+            KillTimer(hwnd, 2);
             /* 松手后从控件读回实际位置，修正拖动中累积的夹紧误差 */
             DSB_QueryState(dsb);
             DSB_UpdateThumb(dsb, hwnd);
@@ -2512,9 +2574,9 @@ static void JsonEscapeU8(const wchar_t *w, char *out, int outMax)
 {
     int o = 0;
     while (*w && o < outMax - 8) {
-        unsigned c = (unsigned char)*w;
+        unsigned c = (unsigned)*w;   /* 注意不能截成 unsigned char，否则中文变低字节乱码 */
         if (*w == L'"' || *w == L'\\') { out[o++] = '\\'; out[o++] = (char)*w; w++; continue; }
-        if (*w < 0x20) { out[o++] = ' '; w++; continue; }
+        if (c < 0x20) { out[o++] = ' '; w++; continue; }
         if (c < 0x80) { out[o++] = (char)c; w++; continue; }
         /* 非 ASCII：逐字符 WideCharToMultiByte 太慢，先整串转换更省事——
          * 但这里逐字符调用也无妨（标题最多 255 字符） */
@@ -2530,66 +2592,282 @@ static void JsonEscapeU8(const wchar_t *w, char *out, int outMax)
     out[o] = 0;
 }
 
+/* 小缓冲拼接：pos 累计写入位置，超界不溢出 */
+static void catf(char *buf, int cap, int *pos, const char *fmt, ...)
+{
+    va_list ap;
+    int left, n;
+    if (*pos >= cap - 1) return;
+    left = cap - 1 - *pos;
+    va_start(ap, fmt);
+    n = vsnprintf(buf + *pos, left, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > left) n = left;
+    *pos += n;
+}
+
+/* 判断虚拟网卡（WSL/VirtualBox/VMware 等手机连不通的适配器）：
+ * 按适配器 Description 里的关键词匹配 */
+static int IsVirtualAdapter(const wchar_t *desc)
+{
+    static const wchar_t *kw[] = {
+        L"virtual", L"vmware", L"hyper-v", L"loopback",
+        L"tailscale", L"wireguard", L"tap-", L"bluetooth"
+    };
+    wchar_t low[160];
+    int i;
+    size_t n, k;
+    if (!desc) return 0;
+    n = wcslen(desc);
+    if (n >= sizeof(low) / sizeof(low[0])) n = sizeof(low) / sizeof(low[0]) - 1;
+    for (i = 0; i < (int)n; i++) {
+        wchar_t ch = desc[i];
+        low[i] = (ch >= L'A' && ch <= L'Z') ? (wchar_t)(ch + 32) : ch;
+    }
+    low[n] = 0;
+    for (k = 0; k < sizeof(kw) / sizeof(kw[0]); k++)
+        if (wcsstr(low, kw[k])) return 1;
+    return 0;
+}
+
+/* 枚举所有活动网卡的 IPv4，附带适配器友好名（UTF-8）。
+ * 物理网卡（WiFi/以太网）排在前面，虚拟网卡排后——手机上只有物理地址才连得通。
+ * 跳过环回和 169.254 链路本地 */
+static int EnumLocalIPv4(char ips[][24], char names[][64], int maxN)
+{
+    ULONG sz = 15000;
+    IP_ADAPTER_ADDRESSES *aa = NULL, *p;
+    int n = 0, k, pass;
+    DWORD r;
+    for (k = 0; k < 4; k++) {
+        aa = (IP_ADAPTER_ADDRESSES*)malloc(sz);
+        if (!aa) return 0;
+        r = GetAdaptersAddresses(AF_INET,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+            GAA_FLAG_SKIP_DNS_SERVER,
+            NULL, aa, &sz);
+        if (r == NO_ERROR) break;
+        free(aa); aa = NULL;
+        if (r != ERROR_BUFFER_OVERFLOW) return 0;
+    }
+    if (!aa) return 0;
+    /* 两遍扫描：pass0=物理网卡，pass1=虚拟网卡 */
+    for (pass = 0; pass < 2; pass++) {
+        for (p = aa; p && n < maxN; p = p->Next) {
+            IP_ADAPTER_UNICAST_ADDRESS *u;
+            int virt;
+            if (p->OperStatus != IfOperStatusUp) continue;
+            if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            virt = IsVirtualAdapter(p->Description);
+            if ((pass == 1) != virt) continue;
+            for (u = p->FirstUnicastAddress; u && n < maxN; u = u->Next) {
+                struct sockaddr_in *sa = (struct sockaddr_in*)u->Address.lpSockaddr;
+                unsigned char *b = (unsigned char*)&sa->sin_addr;
+                char tmp[24];
+                int j, dup = 0;
+                if (sa->sin_family != AF_INET) continue;
+                if (b[0] == 127) continue;
+                if (b[0] == 169 && b[1] == 254) continue;
+                _snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+                for (j = 0; j < n; j++) if (strcmp(ips[j], tmp) == 0) dup = 1;
+                if (dup) continue;
+                snprintf(ips[n], 24, "%s", tmp);
+                names[n][0] = 0;
+                if (p->FriendlyName)
+                    WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1,
+                                        names[n], 64, NULL, NULL);
+                n++;
+            }
+        }
+    }
+    free(aa);
+    return n;
+}
+
 /* 首页：手机端播放/遥控页面（audio + Media Session 锁屏控制） */
 static void HttpServeHome(SOCKET s)
 {
-    static const char page[] =
+    char ips[8][24];
+    char names[8][64];
+    int nip, i;
+    int cap = 16000, pos = 0;
+    char *pg;
+    /* 界面文案（跟随程序语言） */
+    const wchar_t *wAddr, *wLocal, *wSpk, *wRem, *wSd, *wCancel;
+    const wchar_t *wNoShut, *wNoTitle, *wHint, *wMin, *wSd1, *wHint2;
+    char *uAddr="", *uLocal="", *uSpk="", *uRem="", *uSd="", *uCancel="";
+    char *uNoShut="", *uNoTitle="", *uHint="", *uMin="", *uSd1="", *uHint2="";
+
+    nip = EnumLocalIPv4(ips, names, 8);
+    if (g_lang == 1) {
+        wAddr = L"Open on your phone (same Wi-Fi as the PC):";
+        wLocal = L"On this PC:";
+        wSpk = L"Phone speaker";
+        wRem = L"Remote control PC";
+        wSd = L"Auto shutdown";
+        wCancel = L"Cancel";
+        wNoShut = L"Not set";
+        wNoTitle = L"Nothing playing on the PC";
+        wHint = L"Audio bar above: phone as speaker. Buttons below: remote the PC "
+                L"(playback, skip, seek 15s, shutdown).";
+        wHint2 = L"Can't connect? 1) Type the full address with http:// and the port. "
+                 L"2) Allow the firewall prompt when starting the server. "
+                 L"3) Some campus/public Wi-Fi blocks device-to-device traffic; "
+                 L"in that case use a hotspot or Tailscale instead.";
+        wMin = L" min";
+        wSd1 = L"Shutting down in";
+    } else {
+        wAddr = L"手机浏览器打开（手机需与电脑在同一 Wi-Fi），认准 WiFi/以太网 地址：";
+        wLocal = L"本机浏览器：";
+        wSpk = L"手机出声";
+        wRem = L"遥控电脑";
+        wSd = L"定时关机";
+        wCancel = L"取消";
+        wNoShut = L"未设定";
+        wNoTitle = L"电脑上还没有播放内容";
+        wHint = L"上面播放器：手机当喇叭。下面按钮：遥控电脑（播放、上下曲、快进15秒、关机）。";
+        wHint2 = L"连不上时：① 手机要输入完整地址（含 http:// 和端口）；"
+                 L"② 开启服务时若弹出防火墙/权限请求请点允许；"
+                 L"③ 校园网/公共 WiFi 可能禁止设备互连，可改用电脑开热点，"
+                 L"或手机和电脑都装 Tailscale 后用它提供的地址。";
+        wMin = L" 分";
+        wSd1 = L"距离关机";
+    }
+    uAddr = WToU8(wAddr); uLocal = WToU8(wLocal); uSpk = WToU8(wSpk);
+    uRem = WToU8(wRem); uSd = WToU8(wSd); uCancel = WToU8(wCancel);
+    uNoShut = WToU8(wNoShut); uNoTitle = WToU8(wNoTitle); uHint = WToU8(wHint);
+    uMin = WToU8(wMin); uSd1 = WToU8(wSd1); uHint2 = WToU8(wHint2);
+
+    pg = (char*)malloc(cap);
+    if (!pg) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); goto done; }
+
+    catf(pg, cap, &pos,
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>LiteTune</title><style>"
-        "body{font-family:sans-serif;max-width:560px;margin:16px auto;padding:0 12px;background:#f4f4f6;color:#222}"
-        "#t{font-size:15px;margin:10px 2px;min-height:20px;color:#555;word-break:break-all}"
-        "audio{width:100%;margin:6px 0}"
-        ".row{display:flex;gap:10px;margin-top:10px}"
-        "button{flex:1;font-size:20px;padding:12px 0;border:1px solid #ccc;border-radius:10px;background:#fff}"
-        "button:active{background:#e5e5ea}"
-        ".hint{font-size:12px;color:#999;margin-top:14px;line-height:1.6}"
-        "</style></head><body>"
-        "<h3>LiteTune</h3><div id=\"t\">-</div>"
-        "<audio id=\"a\" src=\"/audio\" controls preload=\"auto\"></audio>"
-        "<div class=\"row\">"
+        "body{font-family:sans-serif;max-width:560px;margin:14px auto;padding:0 12px;"
+        "background:#202024;color:#e6e6e6}"
+        "h3{margin:8px 2px;font-weight:600}"
+        ".box{background:#28282e;border:1px solid #3a3a40;border-radius:12px;"
+        "padding:12px;margin:10px 0}"
+        ".lab{font-size:13px;color:#b0b0b8;margin-bottom:8px}"
+        "#t{font-size:16px;margin:4px 2px 8px;min-height:22px;word-break:break-all}"
+        "audio{width:100%%}"
+        ".grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px}"
+        "button{font-size:17px;padding:13px 0;border:1px solid #4a4a52;"
+        "border-radius:10px;background:#34343c;color:#eee}"
+        "button:active{background:#0078d7;border-color:#0078d7}"
+        ".ip{display:block;font-size:18px;color:#62b5ff;text-decoration:none;"
+        "padding:6px 2px;font-family:monospace}"
+        ".muted{font-size:12px;color:#9a9aa2;margin-top:8px;line-height:1.6}"
+        "#sd{font-size:14px;color:#ffb84d;margin-top:10px}"
+        "</style></head><body><h3>LiteTune</h3>");
+
+    /* 地址列表：WiFi/以太网在前并标注网卡名，虚拟网卡在后 */
+    catf(pg, cap, &pos, "<div class=\"box\"><div class=\"lab\">%s</div>", uAddr ? uAddr : "");
+    for (i = 0; i < nip; i++)
+        catf(pg, cap, &pos,
+            "<a class=\"ip\" href=\"http://%s:%u/\">http://%s:%u/</a>"
+            "<span class=\"muted\" style=\"margin:0\">%s</span>",
+            ips[i], g_httpPort, ips[i], g_httpPort, names[i]);
+    catf(pg, cap, &pos,
+        "<div class=\"muted\">%s <a style=\"color:#62b5ff\" href=\"http://localhost:%u/\">"
+        "http://localhost:%u/</a></div></div>",
+        uLocal ? uLocal : "", g_httpPort, g_httpPort);
+
+    /* 手机出声：音频流播放器 */
+    catf(pg, cap, &pos,
+        "<div class=\"box\"><div class=\"lab\">%s</div>"
+        "<div id=\"t\">-</div>"
+        "<audio id=\"a\" src=\"/audio\" controls preload=\"auto\"></audio></div>",
+        uSpk ? uSpk : "");
+
+    /* 遥控电脑：上下曲 / 播放暂停 / 停止 / ±15 秒 */
+    catf(pg, cap, &pos,
+        "<div class=\"box\"><div class=\"lab\">%s</div><div class=\"grid\">"
         "<button onclick=\"cmd('prev')\">&#9198;</button>"
-        "<button id=\"b\" onclick=\"cmd('play')\">&#9208;</button>"
+        "<button id=\"pb\" onclick=\"cmd('play')\">&#9654;</button>"
         "<button onclick=\"cmd('next')\">&#9197;</button>"
-        "</div>"
-        "<div class=\"hint\">&#19978;&#38754;&#25773;&#25918;&#22120;&#65306;&#25163;&#26426;&#24403;&#21895;&#21495;&#12290;"
-        "&#19979;&#38734;&#25353;&#38062;&#65306;&#36965;&#25511;&#30005;&#33041;&#25773;&#25918;&#12290;</div>"
+        "<button onclick=\"cmd('stop')\">&#9632;</button>"
+        "<button onclick=\"cmd('back')\">-15s</button>"
+        "<button onclick=\"cmd('fwd')\">+15s</button>"
+        "</div></div>",
+        uRem ? uRem : "");
+
+    /* 定时关机（15/30/60 分 + 取消，倒计时每秒刷新） */
+    catf(pg, cap, &pos,
+        "<div class=\"box\"><div class=\"lab\">%s</div><div class=\"grid\">"
+        "<button onclick=\"cmd('shut',15)\">15%s</button>"
+        "<button onclick=\"cmd('shut',30)\">30%s</button>"
+        "<button onclick=\"cmd('shut',60)\">60%s</button>"
+        "<button onclick=\"cmd('shutoff')\">%s</button>"
+        "</div><div id=\"sd\"></div></div>",
+        uSd ? uSd : "", uMin ? uMin : "", uMin ? uMin : "", uMin ? uMin : "", uCancel ? uCancel : "");
+
+    catf(pg, cap, &pos, "<div class=\"muted\">%s</div>", uHint ? uHint : "");
+    catf(pg, cap, &pos, "<div class=\"muted\">%s</div>", uHint2 ? uHint2 : "");
+
+    catf(pg, cap, &pos,
         "<script>"
         "var A=document.getElementById('a'),lastT='';"
-        "function cmd(x){var f=new XMLHttpRequest();f.open('GET','/cmd?a='+x);f.send();"
-        "setTimeout(poll,400);}"
-        "function poll(){var f=new XMLHttpRequest();f.open('GET','/status');"
+        "var NOTITLE='%s',NOSHUT='%s',SD1='%s';"
+        "function cmd(x,m){var u='/cmd?a='+x;if(m!==undefined)u+='&m='+m;"
+        "var f=new XMLHttpRequest();f.open('GET',u);f.send();setTimeout(poll,300);}"
+        "function pad(n){return n<10?'0'+n:''+n;}"
+        "function hms(s){var h=Math.floor(s/3600),m=Math.floor(s%%3600/60),r=s%%60;"
+        "return (h?pad(h)+':':'')+pad(m)+':'+pad(r);}"
+        "function poll(){"
+        "var f=new XMLHttpRequest();f.open('GET','/status');"
         "f.onload=function(){try{var s=JSON.parse(f.responseText);"
-        "document.getElementById('t').textContent=s.title||'(无)';"
+        "document.getElementById('t').textContent=s.title||NOTITLE;"
+        "document.getElementById('pb').innerHTML=s.playing?'&#9208;':'&#9654;';"
+        "document.getElementById('sd').textContent=s.shut>0?SD1+' '+hms(s.shut):NOSHUT;"
         "if('mediaSession' in navigator){"
         "navigator.mediaSession.metadata=new MediaMetadata({title:s.title||'LiteTune',artist:'LiteTune'});"
         "navigator.mediaSession.playbackState=s.playing?'playing':'paused';}"
-        "if(s.title&&s.title!==lastT){lastT=s.title;A.load();}"
+        "if(s.title&&s.title!==lastT){lastT=s.title;if(s.has)A.load();}"
         "}catch(e){}};f.send();}"
-        "if('mediaSession' in navigator){"
-        "try{navigator.mediaSession.setActionHandler('play',function(){A.play();});"
+        "if('mediaSession' in navigator){try{"
+        "navigator.mediaSession.setActionHandler('play',function(){A.play();});"
         "navigator.mediaSession.setActionHandler('pause',function(){A.pause();});"
         "navigator.mediaSession.setActionHandler('previoustrack',function(){cmd('prev');});"
-        "navigator.mediaSession.setActionHandler('nexttrack',function(){cmd('next');});}catch(e){}}"
-        "poll();setInterval(poll,3000);"
-        "</script></body></html>";
-    HttpRespond(s, "200 OK", "text/html; charset=utf-8", page, (int)sizeof(page) - 1);
+        "navigator.mediaSession.setActionHandler('nexttrack',function(){cmd('next');});"
+        "navigator.mediaSession.setActionHandler('seekbackward',function(){cmd('back');});"
+        "navigator.mediaSession.setActionHandler('seekforward',function(){cmd('fwd');});"
+        "}catch(e){}}"
+        "poll();setInterval(function(){if(!document.hidden)poll();},1000);"
+        "</script></body></html>",
+        uNoTitle ? uNoTitle : "", uNoShut ? uNoShut : "", uSd1 ? uSd1 : "");
+
+    HttpRespond(s, "200 OK", "text/html; charset=utf-8", pg, pos);
+    free(pg);
+done:
+    free(uAddr); free(uLocal); free(uSpk); free(uRem); free(uSd); free(uCancel);
+    free(uNoShut); free(uNoTitle); free(uHint); free(uMin); free(uSd1);
+    free(uHint2);
 }
 
-/* /status：JSON 返回当前标题与播放状态 */
+/* /status：JSON 返回当前标题、播放状态、关机剩余秒数 */
 static void HttpServeStatus(SOCKET s)
 {
     wchar_t path[MAX_PATH], title[256];
-    char t8[1024], body[1200];
+    char t8[1024], body[1300];
+    long long shutLeft = 0;
     int n;
     EnterCriticalSection(&g_nowCs);
     wcsncpy(path, g_nowPath, MAX_PATH - 1); path[MAX_PATH - 1] = 0;
     wcsncpy(title, g_nowTitle, 255);        title[255] = 0;
     LeaveCriticalSection(&g_nowCs);
+    if (g_shutdownAt > 0) {
+        shutLeft = g_shutdownAt - (long long)time(NULL);
+        if (shutLeft < 0) shutLeft = 0;
+    }
     JsonEscapeU8(title, t8, sizeof(t8));
     n = _snprintf(body, sizeof(body),
-        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s}",
-        t8, g_playState == 1 ? "true" : "false", path[0] ? "true" : "false");
+        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%lld}",
+        t8, g_playState == 1 ? "true" : "false",
+        path[0] ? "true" : "false", shutLeft);
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, n);
 }
 
@@ -2623,16 +2901,36 @@ static void HttpServeAudio(SOCKET s, const char *req)
         const char *bp = strstr(rp, "bytes=");
         if (bp) {
             char *ep1;
-            long long a;
             bp += 6;
-            a = strtoll(bp, &ep1, 10);
-            if (ep1 > bp && a >= 0) {
-                long long b = -1;
-                start.QuadPart = a;
-                if (*ep1 == '-' && ep1[1] >= '0' && ep1[1] <= '9')
-                    b = strtoll(ep1 + 1, NULL, 10);
-                if (b >= 0 && b < fsize.QuadPart) end.QuadPart = b;
-                if (start.QuadPart < fsize.QuadPart) partial = 1;
+            if (*bp == '-') {
+                /* 后缀形式 bytes=-N：最后 N 字节（iOS Safari 探测时长会用） */
+                long long suf = strtoll(bp + 1, NULL, 10);
+                if (suf > 0 && fsize.QuadPart > 0) {
+                    if (suf > fsize.QuadPart) suf = fsize.QuadPart;
+                    start.QuadPart = fsize.QuadPart - suf;
+                    partial = 1;
+                }
+            } else {
+                long long a = strtoll(bp, &ep1, 10);
+                if (ep1 > bp && a >= 0) {
+                    long long b = -1;
+                    if (*ep1 == '-' && ep1[1] >= '0' && ep1[1] <= '9')
+                        b = strtoll(ep1 + 1, NULL, 10);
+                    if (a >= fsize.QuadPart) {
+                        /* 起点超出文件：416，浏览器会自行重新请求 */
+                        char h[200];
+                        int m = _snprintf(h, sizeof(h),
+                            "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                            "Content-Range: bytes */%lld\r\nContent-Length: 0\r\n"
+                            "Connection: close\r\n\r\n", fsize.QuadPart);
+                        if (m > 0) SendAll(s, h, m);
+                        CloseHandle(hf);
+                        return;
+                    }
+                    start.QuadPart = a;
+                    if (b >= 0 && b < fsize.QuadPart) end.QuadPart = b;
+                    partial = 1;
+                }
             }
         }
     }
@@ -2668,17 +2966,30 @@ static void HttpServeAudio(SOCKET s, const char *req)
     CloseHandle(hf);
 }
 
-/* /cmd?a=xxx：遥控电脑（等价于点主窗口按钮） */
+/* /cmd?a=xxx[&m=分钟]：遥控电脑（等价于点主窗口按钮 / 快进15秒 / 定时关机） */
 static void HttpServeCmd(SOCKET s, const char *pathq)
 {
     const char *a = strstr(pathq, "a=");
-    int id = 0;
-    if (a) {
-        a += 2;
-        if      (strncmp(a, "play", 4) == 0) id = IDC_BTN_PLAY;
-        else if (strncmp(a, "prev", 4) == 0) id = IDC_BTN_PREV;
-        else if (strncmp(a, "next", 4) == 0) id = IDC_BTN_NEXT;
-        else if (strncmp(a, "stop", 4) == 0) id = IDC_BTN_STOP;
+    int id = 0, mins = 0;
+    const char *mp;
+    if (!a) { HttpRespond(s, "200 OK", "application/json", "{\"ok\":0}", 7); return; }
+    a += 2;
+    /* shutoff 必须在 shut 之前判断（前缀匹配） */
+    if      (strncmp(a, "play", 4) == 0)    id = IDC_BTN_PLAY;
+    else if (strncmp(a, "prev", 4) == 0)    id = IDC_BTN_PREV;
+    else if (strncmp(a, "next", 4) == 0)    id = IDC_BTN_NEXT;
+    else if (strncmp(a, "stop", 4) == 0)    id = IDC_BTN_STOP;
+    else if (strncmp(a, "back", 4) == 0)    { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 0, 0); }
+    else if (strncmp(a, "fwd", 3) == 0)     { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 1, 0); }
+    else if (strncmp(a, "shutoff", 7) == 0) { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SHUT, 0, 0); }
+    else if (strncmp(a, "shut", 4) == 0) {
+        mp = strstr(pathq, "&m=");
+        if (mp) {
+            mins = atoi(mp + 3);
+            if (mins < 1) mins = 1;
+            if (mins > 600) mins = 600;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SHUT, (WPARAM)mins, 0);
+        }
     }
     if (id && g_hwnd)
         PostMessageW(g_hwnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), 0);
@@ -2693,6 +3004,8 @@ static DWORD WINAPI PhoneClientThread(LPVOID p)
     int total = 0, n;
     DWORD tv = 8000;
     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    tv = 15000;   /* 发送也设超时：手机卡住时线程不会永久挂住 */
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
     while (total < (int)sizeof(req) - 1) {
         n = recv(c, req + total, (int)sizeof(req) - 1 - total, 0);
         if (n <= 0) break;
@@ -2730,27 +3043,71 @@ static DWORD WINAPI PhoneServerThread(LPVOID p)
     return 0;
 }
 
-/* 取本机局域网 IPv4（点分十进制）；失败返回 127.0.0.1 */
-static void GetLocalIP(char *out, int outMax)
+/* 防火墙里是否已有 LiteTune 的入站规则（netsh 输出含规则名即存在；无需管理员） */
+static int FirewallRuleExists(void)
 {
-    char host[256] = "";
-    struct addrinfo hints, *res = NULL, *it;
-    out[0] = 0;
-    if (gethostname(host, sizeof(host) - 1) != 0) goto fail;
-    ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) goto fail;
-    for (it = res; it; it = it->ai_next) {
-        struct sockaddr_in *sa = (struct sockaddr_in*)it->ai_addr;
-        unsigned char *b = (unsigned char*)&sa->sin_addr;
-        if (b[0] == 127) continue;
-        _snprintf(out, outMax, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-        break;
+    char tmp[MAX_PATH], cmd[700], buf[3000];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    HANDLE hf;
+    DWORD got;
+    int found = 0;
+    GetTempPathA(sizeof(tmp), tmp);
+    strncat(tmp, "ltfw.txt", sizeof(tmp) - strlen(tmp) - 1);
+    DeleteFileA(tmp);
+    snprintf(cmd, sizeof(cmd),
+        "cmd /c netsh advfirewall firewall show rule name=\"LiteTune Phone\" "
+        "> \"%s\" 2>&1", tmp);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     }
-    freeaddrinfo(res);
-    if (out[0]) return;
-fail:
-    _snprintf(out, outMax, "127.0.0.1");
+    hf = CreateFileA(tmp, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, 0, NULL);
+    if (hf != INVALID_HANDLE_VALUE) {
+        if (ReadFile(hf, buf, sizeof(buf) - 1, &got, NULL) && got > 0) {
+            buf[got] = 0;
+            if (strstr(buf, "LiteTune Phone")) found = 1;
+        }
+        CloseHandle(hf);
+    }
+    return found;
+}
+
+/* 确保防火墙入站规则存在：不存在就提权添加（弹 UAC），
+ * 等待提权进程结束后再校验一次。
+ * 先删旧规则（防 exe 路径过期），再按当前路径添加；
+ * profile=any 覆盖公用/专用/域网络。返回 1=规则确认存在 */
+static int FirewallRuleEnsure(void)
+{
+    wchar_t exe[MAX_PATH], params[900];
+    SHELLEXECUTEINFOW sei;
+    if (FirewallRuleExists()) return 1;
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    _snwprintf(params, 900,
+        L"/c netsh advfirewall firewall delete rule name=\"LiteTune Phone\" >nul 2>&1 & "
+        L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
+        L"dir=in action=allow program=\"%s\" enable=yes profile=any", exe);
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"cmd.exe";
+    sei.lpParameters = params;
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) return 0;   /* 用户拒绝 UAC 等 */
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 15000);
+        CloseHandle(sei.hProcess);
+    }
+    return FirewallRuleExists();
 }
 
 static int PhoneServerStart(void)
@@ -2758,6 +3115,7 @@ static int PhoneServerStart(void)
     WSADATA wsa;
     struct sockaddr_in addr;
     int one = 1;
+    int i, nPorts = (int)(sizeof(PHONE_PORTS) / sizeof(PHONE_PORTS[0]));
     if (g_httpThread) return 1;   /* 已在运行 */
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
     g_httpSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -2766,9 +3124,16 @@ static int PhoneServerStart(void)
     ZeroMemory(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(PHONE_PORT);
-    if (bind(g_httpSock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR ||
-        listen(g_httpSock, 8) == SOCKET_ERROR) {
+    g_httpPort = 0;
+    for (i = 0; i < nPorts; i++) {
+        addr.sin_port = htons(PHONE_PORTS[i]);
+        if (bind(g_httpSock, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+            listen(g_httpSock, 8) == 0) {
+            g_httpPort = PHONE_PORTS[i];
+            break;
+        }
+    }
+    if (!g_httpPort) {
         closesocket(g_httpSock);
         g_httpSock = INVALID_SOCKET;
         WSACleanup();
@@ -2779,10 +3144,15 @@ static int PhoneServerStart(void)
     if (!g_httpThread) {
         closesocket(g_httpSock);
         g_httpSock = INVALID_SOCKET;
+        g_httpPort = 0;
         WSACleanup();
         return 0;
     }
-    return 1;
+    /* 无论绑到哪个端口，手机都属于“入站连接”，Windows 防火墙默认拦：
+     * 提权加一条入站规则（仅弹一次 UAC）。复制到别的电脑首次运行时
+     * 也会在这里重新询问——这正是“换电脑就连不上”的原因。
+     * 返回 2=服务已启动但规则没建成（用户拒绝 UAC 等） */
+    return FirewallRuleEnsure() ? 1 : 2;
 }
 
 static void PhoneServerStop(void)
@@ -3658,7 +4028,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_MOUSEWHEEL && hwnd == g_editDesc) {
         int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
-        SendMessageW(hwnd, EM_LINESCROLL, 0, MAKELONG(0, d));
+        SendMessageW(hwnd, EM_LINESCROLL, 0, (LPARAM)d);
         SyncScrollBar(g_vsDesc);
         return 0;
     }
@@ -4296,7 +4666,7 @@ static void OnSettingsButton(void)
         g_fontLevel == 0 ? tr(TR_FONT_S) : g_fontLevel == 1 ? tr(TR_FONT_M) : tr(TR_FONT_L));
     AppendMenuW(menu, MF_STRING, 6, fontItem);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, 9, tr(TR_M_PHONE));
+    AppendMenuW(menu, MF_STRING | (g_httpThread ? MF_CHECKED : 0), 9, tr(TR_M_PHONE));
     AppendMenuW(menu, MF_STRING, 7, tr(TR_M_ABOUT));
 
     GetCursorPos(&pt);
@@ -4322,14 +4692,17 @@ static void OnSettingsButton(void)
             PhoneServerStop();
             SetStatusTemp(tr(TR_PHONE_OFF));
         } else {
-            if (PhoneServerStart()) {
-                char ip[64];
-                wchar_t url[128], msg[512];
-                GetLocalIP(ip, sizeof(ip));
-                swprintf(url, 128, L"http://%S:%d/", ip, PHONE_PORT);
-                swprintf(msg, 512, tr(TR_PHONE_MSG), url);
-                MessageBoxW(g_hwnd, msg, tr(TR_PHONE_TITLE), MB_OK | MB_ICONINFORMATION);
+            int r = PhoneServerStart();
+            if (r) {
+                wchar_t url[64];
+                /* 自动在本机浏览器打开，地址列表（WiFi/以太网）在网页里显示 */
+                swprintf(url, 64, L"http://localhost:%u/", g_httpPort);
+                ShellExecuteW(g_hwnd, L"open", url, NULL, NULL, SW_SHOWNORMAL);
                 SetStatusTemp(tr(TR_PHONE_ON));
+                /* 服务开了但防火墙没放行：本机页面正常，手机会一直转圈 */
+                if (r == 2)
+                    MessageBoxW(g_hwnd, tr(TR_PHONE_FW), tr(TR_PHONE_TITLE),
+                                MB_OK | MB_ICONWARNING);
             } else {
                 MessageBoxW(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
             }
@@ -5421,6 +5794,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
         }
+        return 0;
+
+    /* 手机遥控：±15 秒快退/快进 */
+    case WM_APP_REMOTE_SEEK: {
+        long long cur, t;
+        PROPVARIANT pv;
+        if (!g_player || g_dur100ns <= 0) return 0;
+        cur = PlayerGet100ns(0);
+        if (cur < 0) return 0;
+        t = cur + (wParam ? 15LL : -15LL) * 10000000LL;
+        if (t < 0) t = 0;
+        if (t > g_dur100ns) t = g_dur100ns;
+        memset(&pv, 0, sizeof(pv));
+        pv.vt = VT_I8;
+        pv.hVal.QuadPart = t;
+        g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+        return 0;
+    }
+    /* 手机遥控：定时关机（wParam=分钟数，0=取消） */
+    case WM_APP_REMOTE_SHUT:
+        SetShutdownTimer((int)wParam);
         return 0;
 
     case WM_APP_FEED_ADDED: {
