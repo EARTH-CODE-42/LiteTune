@@ -11,7 +11,7 @@
  * 编译（MinGW）:
  *   windres resource.rc -O coff -o resource.o
  *   gcc -O2 -s -mwindows -municode -o LiteTune.exe main.c resource.o \
- *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32 -liphlpapi
+ *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32 -liphlpapi -lshell32
  */
 #ifndef UNICODE
 #define UNICODE
@@ -148,7 +148,7 @@ enum {
     IDC_SLD_SEEK, IDC_SLD_VOL,
     IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
-    IDC_BTN_DIR,
+    IDC_BTN_DIR, IDC_BTN_SPEED,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H
 };
@@ -176,6 +176,13 @@ static HWND g_hwnd, g_listPod, g_listEp, g_editDesc;
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
 static HWND     g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
+static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
+
+/* 倍速：整数存 100 倍，避免浮点；默认 100=1.0x */
+static int      g_speed = 100;
+/* 托盘图标已创建标志 */
+static int      g_trayAdded = 0;
+#define WM_TRAYICON (WM_APP + 100)
 
 /* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
 static wchar_t  g_cacheDir[MAX_PATH] = L"";
@@ -286,9 +293,12 @@ enum {
     TR_TB_PREV, TR_TB_PLAY, TR_TB_PAUSE, TR_TB_NEXT, TR_TB_SHUFFLE,
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
     TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_REFRESH, TR_TIP_SETTINGS,
+    TR_TIP_SPEED,
     TR_PM_ORDER, TR_PM_SHUFFLE, TR_PM_REPEAT, TR_PM_ONCE,
     TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_FAIL,
     TR_PHONE_ON, TR_PHONE_OFF, TR_PHONE_FW,
+    TR_SPEED_SET,
+    TR_TRAY_SHOW, TR_TRAY_EXIT,
     TR_N
 };
 
@@ -340,7 +350,7 @@ static const wchar_t *tr(int id)
         L"移动缓存", L"选择缓存目录",
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
-        L"添加播客", L"删除播客", L"调整顺序", L"刷新", L"设置",
+        L"添加播客", L"删除播客", L"调整顺序", L"刷新", L"设置", L"倍速",
         L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放",
         L"手机播放/遥控", L"手机播放/遥控",
         L"手机服务启动失败（端口被占用？）",
@@ -350,7 +360,9 @@ static const wchar_t *tr(int id)
             L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
             L"dir=in action=allow program=\"本程序完整路径\" enable=yes profile=any\r\n\r\n"
             L"另外，手机要连页面上标注 WiFi/以太网 的地址；复制到别的电脑运行时，"
-            L"那台电脑也会重新询问一次防火墙权限。"
+            L"那台电脑也会重新询问一次防火墙权限。",
+        L"倍速已切换",
+        L"显示主窗口", L"退出"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -404,7 +416,7 @@ static const wchar_t *tr(int id)
         L"Move Cache", L"Select Cache Folder",
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
-        L"Add podcast", L"Delete podcast", L"Reorder", L"Refresh", L"Settings",
+        L"Add podcast", L"Delete podcast", L"Reorder", L"Refresh", L"Settings", L"Speed",
         L"Sequential", L"Shuffle", L"Repeat one", L"Play once",
         L"Phone Speaker/Remote", L"Phone Speaker/Remote",
         L"Failed to start phone service (port in use?)",
@@ -418,7 +430,9 @@ static const wchar_t *tr(int id)
             L"enable=yes profile=any\r\n\r\n"
             L"Also: on the phone use the address labelled WiFi/Ethernet. "
             L"Copying the program to another PC means that PC will ask for "
-            L"firewall permission again."
+            L"firewall permission again.",
+        L"Playback speed changed",
+        L"Show window", L"Exit"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -438,6 +452,8 @@ static void UpdateMarquee(void);                /* 前置声明，字号切换�
 static void UpdatePodTipFromPoint(POINT pt);    /* 前置声明，播客列表悬停提示 */
 static char* WToU8(const wchar_t *w);           /* 前置声明，SaveConfig 保存缓存目录 */
 static void UpdateThumbbarPlayPause(void);      /* 前置声明，播放/暂停状态切换时更新任务栏缩略图按钮 */
+static void ApplySpeed(void);                   /* 前置声明，播放开始时恢复倍速 */
+static void CycleSpeed(void);                   /* 前置声明，倍速按钮点击 */
 
 /* ---- 主题配色（夜间模式） ---- */
 static COLORREF ThWinBg(void)   { return g_darkMode ? RGB(32,32,36)   : GetSysColor(COLOR_BTNFACE); }
@@ -1983,6 +1999,7 @@ static void LoadConfig(void)
     g_fontLevel = 0;
     g_darkMode = 0;
     g_lang = 0;
+    g_speed = 100;
     g_cfgFromTxt = 0;
 
     ExeDir(iniPath, MAX_PATH);
@@ -2029,6 +2046,7 @@ static void LoadConfig(void)
             else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
             else if (strcmp(s, "dark") == 0) g_darkMode = (atoi(val) != 0);
             else if (strcmp(s, "lang") == 0) g_lang = (strcmp(val, "en") == 0) ? 1 : 0;
+            else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
             else if (strcmp(s, "cachedir") == 0) {
                 wchar_t *w = U8ToW(val);
                 if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
@@ -2095,6 +2113,7 @@ static void SaveConfig(void)
     fprintf(f, "font=%d\n", g_fontLevel);
     fprintf(f, "dark=%d\n", g_darkMode);
     fprintf(f, "lang=%s\n", g_lang ? "en" : "zh");
+    fprintf(f, "speed=%d\n", g_speed);
     fprintf(f, "winw=%d\n", g_winW);
     fprintf(f, "winh=%d\n", g_winH);
     if (g_cacheDir[0]) {
@@ -2495,6 +2514,7 @@ static void PlayerPlayFile(const wchar_t *path, const wchar_t *title)
     g_player->lpVtbl->SetVolume(g_player,
         (float)SendMessageW(g_sldVol, TBM_GETPOS, 0, 0) / 100.0f);
     g_player->lpVtbl->SetMute(g_player, g_muted ? TRUE : FALSE);
+    ApplySpeed();   /* 恢复上次的倍速 */
 }
 
 static void PlayerStop(void)
@@ -2538,6 +2558,39 @@ static void PlayerSeekToFrac(int permille)
     pv.vt = VT_I8;
     pv.hVal.QuadPart = g_dur100ns * permille / 1000;
     g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+}
+
+/* 应用当前倍速到播放器；g_speed 单位为百分之一（100=1.0x） */
+static void ApplySpeed(void)
+{
+    if (!g_player) return;
+    g_player->lpVtbl->SetRate(g_player, (float)g_speed / 100.0f);
+}
+
+/* 倍速按钮显示文本，如 "1.0x" */
+static void SpeedText(wchar_t *out, int outMax)
+{
+    int whole = g_speed / 100;
+    int frac  = g_speed % 100;
+    if (frac == 0)
+        _snwprintf(out, outMax, L"%d.0x", whole);
+    else if (frac % 10 == 0)
+        _snwprintf(out, outMax, L"%d.%dx", whole, frac / 10);
+    else
+        _snwprintf(out, outMax, L"%d.%02dx", whole, frac);
+}
+
+/* 循环切换倍速：1.0 → 1.25 → 1.5 → 2.0 → 0.75 → 1.0 */
+static void CycleSpeed(void)
+{
+    static const int table[] = { 100, 125, 150, 200, 75 };
+    int i, n = (int)(sizeof(table) / sizeof(table[0]));
+    for (i = 0; i < n; i++)
+        if (table[i] == g_speed) break;
+    g_speed = table[(i + 1) % n];
+    ApplySpeed();
+    if (g_btnSpeed) InvalidateRect(g_btnSpeed, NULL, TRUE);
+    SetStatusTemp(tr(TR_SPEED_SET));
 }
 
 /* ================= 手机播放/遥控 HTTP 服务 ================= */
@@ -4134,13 +4187,14 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(g_stTime,  gx + gw - 104, gy + 2, 104, 18, TRUE);
     gy += 28;
 
-    /* 第3行：上一曲/播放/下一曲/停止/播放模式/静音（间距统一 26，给格式串留空间） */
+    /* 第3行：上一曲/播放/下一曲/停止/播放模式/倍速/静音（间距统一 26，给格式串留空间） */
     bx = gx;
     MoveWindow(g_btnPrev,     bx, gy, 24, 24, TRUE); bx += 26;
     MoveWindow(g_btnPlay,     bx, gy, 24, 24, TRUE); bx += 26;
     MoveWindow(g_btnNext,     bx, gy, 24, 24, TRUE); bx += 26;
     MoveWindow(g_btnStop,     bx, gy, 24, 24, TRUE); bx += 26;
     MoveWindow(g_btnPlayMode, bx, gy, 24, 24, TRUE); bx += 26;
+    MoveWindow(g_btnSpeed,    bx, gy, 40, 24, TRUE); bx += 42;
     MoveWindow(g_btnMute,     bx, gy, 24, 24, TRUE); bx += 26;
     /* 音量滑块固定宽 + 数字；格式串右靠齐，占满剩余空间 */
     fmtX = bx + sw + 4 + volW + 8;
@@ -5105,16 +5159,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 全部方形图标按钮 */
         {
-            const int ids[11] = {
+            const int ids[12] = {
                 IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
                 IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
-                IDC_BTN_DIR };
-            HWND *p[11] = {
+                IDC_BTN_DIR, IDC_BTN_SPEED };
+            HWND *p[12] = {
                 &g_btnPrev, &g_btnPlay, &g_btnNext, &g_btnStop, &g_btnMute,
                 &g_btnAdd, &g_btnDel, &g_btnSort, &g_btnRefresh, &g_btnPlayMode,
-                &g_btnDir };
+                &g_btnDir, &g_btnSpeed };
             int bi;
-            for (bi = 0; bi < 11; bi++)
+            for (bi = 0; bi < 12; bi++)
                 *p[bi] = CreateWindowExW(0, L"BUTTON", NULL,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
@@ -5198,6 +5252,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         SetTimer(hwnd, 1, 500, NULL);
 
+        /* 媒体键（全局热键）：播放/暂停、停止、上一曲、下一曲。
+         * 失败不影响主功能（可能被其他程序占用） */
+        RegisterHotKey(hwnd, 1, 0, VK_MEDIA_PLAY_PAUSE);
+        RegisterHotKey(hwnd, 2, 0, VK_MEDIA_STOP);
+        RegisterHotKey(hwnd, 3, 0, VK_MEDIA_NEXT_TRACK);
+        RegisterHotKey(hwnd, 4, 0, VK_MEDIA_PREV_TRACK);
+
+        /* 托盘图标：关闭窗口时最小化到这里，双击恢复 */
+        {
+            NOTIFYICONDATAW nid;
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAYICON;
+            nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+            wcscpy_s(nid.szTip, 128, L"LiteTune");
+            g_trayAdded = Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+
         /* 系统工具提示：按钮 */
         g_hwndTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
             WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
@@ -5217,6 +5292,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             AddButtonTip(g_btnRefresh,tr(TR_TIP_REFRESH));
             AddButtonTip(g_btnPlayMode, PlayModeTipText());
             AddButtonTip(g_btnDir,    tr(TR_TIP_SETTINGS));
+            AddButtonTip(g_btnSpeed,  tr(TR_TIP_SPEED));
         }
         /* 剧集列表 tooltip 不用自建：LVS_EX_INFOTIP 让 ListView 在悬停时
          * 自动发 LVN_GETINFOTIPW，由 FillEpisodeTip 回填文本 */
@@ -5247,6 +5323,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lParam;
         if (di->CtlType == ODT_BUTTON) {
+            /* 倍速按钮：文字按钮，显示 "1.0x" 等 */
+            if (di->CtlID == IDC_BTN_SPEED) {
+                RECT rc = di->rcItem;
+                HBRUSH bg = CreateSolidBrush(ThWinBg());
+                HFONT oldf;
+                wchar_t txt[16];
+                FillRect(di->hDC, &rc, bg);
+                DeleteObject(bg);
+                if (di->itemState & ODS_SELECTED)
+                    DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
+                else
+                    DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
+                SpeedText(txt, 16);
+                SetBkMode(di->hDC, TRANSPARENT);
+                SetTextColor(di->hDC, ThAccent());
+                oldf = (HFONT)SelectObject(di->hDC, g_fontSmall);
+                DrawTextW(di->hDC, txt, -1, &rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(di->hDC, oldf);
+                return TRUE;
+            }
             int on, kind = IconKindOf(di->CtlID, &on);
             if (kind >= 0) { DrawIconButton(di, kind, on); return TRUE; }
             break;
@@ -5625,6 +5722,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_REFRESH) ReloadFeeds();
             else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
             else if (id == IDC_BTN_DIR) OnSettingsButton();
+            else if (id == IDC_BTN_SPEED) CycleSpeed();
         }
         return 0;
 
@@ -5996,11 +6094,68 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+    /* 媒体键（全局热键） */
+    case WM_HOTKEY:
+        if (wParam == 1) PauseResume();
+        else if (wParam == 2) { PlayerStop(); SetStatus(tr(TR_STOPPED)); }
+        else if (wParam == 3) PlayAdjacent(+1);
+        else if (wParam == 4) PlayAdjacent(-1);
+        return 0;
+
+    /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件 */
+    case WM_TRAYICON:
+        if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+            ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        } else if (LOWORD(lParam) == WM_RBUTTONUP) {
+            POINT pt;
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, tr(TR_TRAY_SHOW));
+            AppendMenuW(m, MF_STRING, 2, tr(TR_TRAY_EXIT));
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);   /* 让菜单能正常消失 */
+            {
+                int cmd = TrackPopupMenu(m,
+                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, NULL);
+                if (cmd == 1) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+                else if (cmd == 2) DestroyWindow(hwnd);
+            }
+            DestroyMenu(m);
+        }
+        return 0;
+
+    /* 关闭按钮：最小化到托盘而不是退出（右键托盘菜单里的“退出”才真正退出） */
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+
+    /* 系统关机/注销：允许结束，并在结束前保存配置 */
+    case WM_QUERYENDSESSION:
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wParam) SaveConfig();
+        return 0;
+
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
         KillTimer(hwnd, 4);
+        UnregisterHotKey(hwnd, 1);
+        UnregisterHotKey(hwnd, 2);
+        UnregisterHotKey(hwnd, 3);
+        UnregisterHotKey(hwnd, 4);
+        /* 托盘图标 */
+        if (g_trayAdded) {
+            NOTIFYICONDATAW nid;
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            g_trayAdded = 0;
+        }
         PhoneServerStop();   /* 手机服务随程序退出关闭 */
         DeleteCriticalSection(&g_nowCs);
         SaveConfig();   /* 退出时统一写盘：排序/列宽/音量/字号/窗口尺寸/订阅顺序 */
@@ -6175,6 +6330,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
                 SendMessageW(hwnd, WM_COMMAND,
                     MAKEWPARAM(IDC_BTN_PLAY, BN_CLICKED), (LPARAM)g_btnPlay);
                 continue;
+            }
+        }
+        /* 方向键快捷键（仅主窗口自身有焦点时，不抢列表/滑块/编辑框的方向键）：
+         * ←/→ 后退/前进 15 秒，↑/↓ 上一曲/下一曲 */
+        if (msg.message == WM_KEYDOWN) {
+            HWND focus = GetFocus();
+            if (focus == hwnd) {
+                if (msg.wParam == VK_LEFT) {
+                    PostMessageW(hwnd, WM_APP_REMOTE_SEEK, 0, 0); continue;
+                } else if (msg.wParam == VK_RIGHT) {
+                    PostMessageW(hwnd, WM_APP_REMOTE_SEEK, 1, 0); continue;
+                } else if (msg.wParam == VK_UP) {
+                    PlayAdjacent(-1); continue;
+                } else if (msg.wParam == VK_DOWN) {
+                    PlayAdjacent(+1); continue;
+                }
             }
         }
         /* tooltip 采用 TTF_SUBCLASS 自行拦截鼠标消息，无需在此转发 */
