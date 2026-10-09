@@ -182,7 +182,25 @@ static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x 
 static int      g_speed = 100;
 /* 托盘图标已创建标志 */
 static int      g_trayAdded = 0;
+static HICON    g_trayIco = NULL;    /* 托盘小图标（资源加载，退出时销毁） */
 #define WM_TRAYICON (WM_APP + 100)
+
+/* 媒体键：多数键盘发 WM_APPCOMMAND 广播而非 VK_MEDIA_* 虚拟键，
+ * 必须监听 WM_APPCOMMAND 才能像其它播放器一样被键盘/耳机线控控制 */
+#ifndef GET_APPCOMMAND_LPARAM
+#define GET_APPCOMMAND_LPARAM(lParam) ((short)HIWORD(lParam) & FAPPCOMMAND_MASK)
+#endif
+
+/* 托盘左键迷你控制浮窗：4 个按钮（上一曲/播放暂停/下一曲/随机下一曲），
+ * 体验对齐任务栏缩略图工具栏；点击浮窗外自动隐藏 */
+#define FLY_CLASS L"LiteTuneFlyout"
+static HWND     g_fly = NULL;        /* 浮窗（popup，平时隐藏） */
+static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
+#define FLY_PAD   6                  /* 浮窗内边距 */
+#define FLY_BTN   32                 /* 按钮边长 */
+#define FLY_GAP   2                  /* 按钮间距 */
+#define FLY_W   (FLY_PAD * 2 + FLY_BTN * 4 + FLY_GAP * 3)
+#define FLY_H   (FLY_PAD * 2 + FLY_BTN)
 
 /* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
 static wchar_t  g_cacheDir[MAX_PATH] = L"";
@@ -4241,14 +4259,13 @@ enum {
 };
 
 /* 在按钮矩形内绘制单个矢量图标 */
-static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
+static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
 {
     int w = rc->right - rc->left, h = rc->bottom - rc->top;
     int s = (w < h ? w : h) - 8;                 /* 24px 按钮 → 16px 图标 */
     int x0 = rc->left + (w - s) / 2;
     int y0 = rc->top + (h - s) / 2;
     int cy = y0 + s / 2;
-    COLORREF col = ThDim();
     HPEN pen2 = CreatePen(PS_SOLID, 2, col);
     HPEN pen3 = CreatePen(PS_SOLID, 3, col);
     HPEN pen1 = CreatePen(PS_SOLID, 1, col);
@@ -4457,6 +4474,12 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
     DeleteObject(pen2);
     DeleteObject(pen3);
     DeleteObject(br);
+}
+
+/* 默认主题色版本（主窗口按钮用） */
+static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
+{
+    DrawGlyphC(hdc, rc, kind, ThDim());
 }
 
 /* on=1：模式按钮已按下（浅蓝底 + 凹陷边） */
@@ -4846,6 +4869,117 @@ static void OnSettingsButton(void)
     }
 }
 
+/* ---- 托盘左键迷你控制浮窗 ---- */
+/* 4 个按钮命令与任务栏缩略图工具栏完全一致（tid 0..3），
+ * 点击时以 THBN_CLICKED 转发回主窗口同一分支处理 */
+static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
+        int kind;
+        HBRUSH bg;
+        if (di->CtlType != ODT_BUTTON) break;
+        bg = CreateSolidBrush(
+            (int)di->CtlID == g_flyHover ? RGB(64, 64, 74) : RGB(45, 45, 52));
+        FillRect(di->hDC, &di->rcItem, bg);
+        DeleteObject(bg);
+        kind = (di->CtlID == 0) ? ICO_PREV
+             : (di->CtlID == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
+             : (di->CtlID == 2) ? ICO_NEXT : ICO_SHUFFLE;
+        DrawGlyphC(di->hDC, &di->rcItem, kind, RGB(255, 255, 255));
+        return TRUE;
+    }
+    case WM_COMMAND:
+        PostMessageW(g_hwnd, WM_COMMAND,
+            MAKEWPARAM(LOWORD(wp), THBN_CLICKED), 0);
+        return 0;
+    case WM_MOUSEMOVE: {
+        /* 悬停高亮：按固定网格算出按钮下标 */
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int id = -1;
+        if (pt.x >= FLY_PAD && pt.x < FLY_PAD + FLY_BTN * 4 + FLY_GAP * 3 &&
+            pt.y >= FLY_PAD && pt.y < FLY_PAD + FLY_BTN) {
+            id = (pt.x - FLY_PAD) / (FLY_BTN + FLY_GAP);
+            if (id > 3) id = 3;
+        }
+        if (id != g_flyHover) {
+            g_flyHover = id;
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
+        {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            tme.dwHoverTime = 0;
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_flyHover != -1) {
+            g_flyHover = -1;
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
+        return 0;
+    case WM_KILLFOCUS:
+        ShowWindow(hwnd, SW_HIDE);   /* 点击浮窗外自动收起 */
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void CreateFlyout(HINSTANCE hInst)
+{
+    int i;
+    g_fly = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        FLY_CLASS, NULL, WS_POPUP | WS_BORDER,
+        0, 0, FLY_W, FLY_H, NULL, NULL, hInst, NULL);
+    if (!g_fly) return;
+    for (i = 0; i < 4; i++)
+        CreateWindowExW(0, L"BUTTON", NULL,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            FLY_PAD + i * (FLY_BTN + FLY_GAP), FLY_PAD,
+            FLY_BTN, FLY_BTN, g_fly, (HMENU)(INT_PTR)i, hInst, NULL);
+}
+
+/* 在托盘图标正上方弹出浮窗（夹到屏幕工作区内） */
+static void ShowFlyout(void)
+{
+    POINT pt;
+    RECT wr;
+    HMONITOR mon;
+    MONITORINFO mi;
+    if (!g_fly) return;
+    g_flyHover = -1;
+    GetCursorPos(&pt);
+    wr.left = pt.x - FLY_W / 2;
+    wr.top = pt.y - FLY_H - 8;      /* 光标上方 8px */
+    wr.right = wr.left + FLY_W;
+    wr.bottom = wr.top + FLY_H;
+    mi.cbSize = sizeof(mi);
+    mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(mon, &mi)) {
+        if (wr.left < mi.rcWork.left) {
+            wr.right += mi.rcWork.left - wr.left; wr.left = mi.rcWork.left;
+        }
+        if (wr.right > mi.rcWork.right) {
+            wr.left -= wr.right - mi.rcWork.right; wr.right = mi.rcWork.right;
+        }
+        if (wr.top < mi.rcWork.top) {
+            wr.bottom += mi.rcWork.top - wr.top; wr.top = mi.rcWork.top;
+        }
+        if (wr.bottom > mi.rcWork.bottom) {
+            wr.top -= wr.bottom - mi.rcWork.bottom; wr.bottom = mi.rcWork.bottom;
+        }
+    }
+    SetWindowPos(g_fly, HWND_TOPMOST, wr.left, wr.top, 0, 0,
+        SWP_NOSIZE | SWP_SHOWWINDOW);
+    /* 接管前台：点击浮窗外时收到 WM_KILLFOCUS 自动隐藏 */
+    SetForegroundWindow(g_fly);
+}
+
 /* ---- 任务栏缩略图工具栏（ITaskbarList3） ---- */
 /* 在 16x16 画布上画满幅的简洁白色线性图标（图形区约 14x14） */
 static void DrawTbGlyph(HDC hdc, int kind)
@@ -5003,6 +5137,7 @@ static void UpdateThumbbarPlayPause(void)
     tb.hIcon = g_tbIco[g_playState == 1 ? 2 : 1];   /* 播放中显示暂停图标 */
     wcscpy_s(tb.szTip, 260, g_playState == 1 ? tr(TR_TB_PAUSE) : tr(TR_TB_PLAY));
     g_taskbar->lpVtbl->ThumbBarUpdateButtons(g_taskbar, g_hwnd, 1, &tb);
+    if (g_fly) InvalidateRect(g_fly, NULL, TRUE);   /* 浮窗播放/暂停图标同步 */
 }
 
 /* ================= 工具提示 ================= */
@@ -5139,6 +5274,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     switch (msg) {
     case WM_CREATE: {
+        HINSTANCE hInst = ((LPCREATESTRUCTW)lParam)->hInstance;
         /* 不带 WS_VSCROLL：系统滚动条彻底不用，滚动条全部自绘 */
         DWORD lbStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP
                       | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS;
@@ -5259,7 +5395,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RegisterHotKey(hwnd, 3, 0, VK_MEDIA_NEXT_TRACK);
         RegisterHotKey(hwnd, 4, 0, VK_MEDIA_PREV_TRACK);
 
-        /* 托盘图标：关闭窗口时最小化到这里，双击恢复 */
+        /* 托盘图标：点最小化时收进来，左键弹控制浮窗，右键弹菜单 */
         {
             NOTIFYICONDATAW nid;
             ZeroMemory(&nid, sizeof(nid));
@@ -5268,10 +5404,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             nid.uID = 1;
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
-            nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+            nid.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR);
+            g_trayIco = nid.hIcon;
             wcscpy_s(nid.szTip, 128, L"LiteTune");
             g_trayAdded = Shell_NotifyIconW(NIM_ADD, &nid);
         }
+
+        /* 托盘迷你控制浮窗（左键单击托盘图标弹出） */
+        CreateFlyout(hInst);
 
         /* 系统工具提示：按钮 */
         g_hwndTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
@@ -5505,10 +5647,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED) {
-            g_winW = LOWORD(lParam);
-            g_winH = HIWORD(lParam);
+        if (wParam == SIZE_MINIMIZED) {
+            /* 最小化 = 收进托盘（点 × 才是退出） */
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
         }
+        g_winW = LOWORD(lParam);
+        g_winH = HIWORD(lParam);
         ApplyLayout(hwnd, IsWindowVisible(hwnd));
         UpdateMarquee();   /* 可用宽度变化，重算跑马灯 */
         return 0;
@@ -5541,6 +5686,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetCapture(hwnd);
             return 0;
         }
+        SetFocus(hwnd);   /* 点击空白处焦点回主窗口：方向键快捷键生效 */
         break;
     }
 
@@ -6102,10 +6248,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (wParam == 4) PlayAdjacent(-1);
         return 0;
 
-    /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件 */
+    /* 媒体键主通道：键盘/耳机线控大多发 APPCOMMAND 广播（RegisterHotKey
+     * 只能收到直接发 VK_MEDIA_* 的键盘，所以两条通道并存互补） */
+    case WM_APPCOMMAND: {
+        unsigned mcmd = (unsigned)GET_APPCOMMAND_LPARAM(lParam);
+        if (mcmd == APPCOMMAND_MEDIA_PLAY_PAUSE) { PauseResume(); return TRUE; }
+        if (mcmd == APPCOMMAND_MEDIA_STOP) { PlayerStop(); SetStatus(tr(TR_STOPPED)); return TRUE; }
+        if (mcmd == APPCOMMAND_MEDIA_NEXTTRACK) { PlayAdjacent(+1); return TRUE; }
+        if (mcmd == APPCOMMAND_MEDIA_PREVIOUSTRACK) { PlayAdjacent(-1); return TRUE; }
+        break;
+    }
+
+    /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件。
+     * 左键单击：弹出迷你控制浮窗；右键：显示主窗口/退出菜单 */
     case WM_TRAYICON:
-        if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_RESTORE);
+        if (LOWORD(lParam) == WM_LBUTTONUP) {
+            if (g_fly && IsWindowVisible(g_fly)) ShowWindow(g_fly, SW_HIDE);
+            else ShowFlyout();
+        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+            /* 双击：直接恢复主窗口（第二击前单击已弹出的浮窗一并收起） */
+            if (g_fly) ShowWindow(g_fly, SW_HIDE);
+            ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         } else if (LOWORD(lParam) == WM_RBUTTONUP) {
             POINT pt;
@@ -6125,9 +6288,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    /* 关闭按钮：最小化到托盘而不是退出（右键托盘菜单里的“退出”才真正退出） */
+    /* 关闭按钮：直接退出（收进托盘走最小化按钮；托盘右键菜单也可退出） */
     case WM_CLOSE:
-        ShowWindow(hwnd, SW_HIDE);
+        DestroyWindow(hwnd);
         return 0;
 
     /* 系统关机/注销：允许结束，并在结束前保存配置 */
@@ -6156,6 +6319,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             Shell_NotifyIconW(NIM_DELETE, &nid);
             g_trayAdded = 0;
         }
+        if (g_trayIco) { DestroyIcon(g_trayIco); g_trayIco = NULL; }
+        /* 迷你控制浮窗 */
+        if (g_fly) { DestroyWindow(g_fly); g_fly = NULL; }
         PhoneServerStop();   /* 手机服务随程序退出关闭 */
         DeleteCriticalSection(&g_nowCs);
         SaveConfig();   /* 退出时统一写盘：排序/列宽/音量/字号/窗口尺寸/订阅顺序 */
@@ -6181,6 +6347,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* 方向键快捷键是否生效：主窗口自身，或焦点在按钮/静态框等
+ * 无方向键用途的控件上；列表/编辑框/滑块/滚动条保留自己的方向键 */
+static BOOL FocusTakesKeys(HWND f, HWND mainWnd)
+{
+    wchar_t cn[40];
+    if (!f) return FALSE;
+    if (f == mainWnd) return TRUE;
+    if (!IsChild(mainWnd, f)) return FALSE;
+    cn[0] = 0;
+    GetClassNameW(f, cn, 40);
+    if (wcscmp(cn, L"ListBox") == 0 || wcscmp(cn, L"Edit") == 0 ||
+        wcscmp(cn, L"SysListView32") == 0 ||
+        wcscmp(cn, TRACKBAR_CLASSW) == 0 || wcscmp(cn, DSB_CLASS) == 0)
+        return FALSE;
+    return TRUE;
 }
 
 /* ================= 入口 ================= */
@@ -6268,7 +6451,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.hInstance     = hInst;
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    /* 程序图标：资源 1（app.ico 编译进 exe），任务栏/Alt-Tab/标题栏共用 */
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(1));
+    wc.hIconSm       = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                            GetSystemMetrics(SM_CXSMICON),
+                            GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     if (g_darkMode) {
         g_bgBrush = CreateSolidBrush(ThWinBg());
         wc.hbrBackground = g_bgBrush;
@@ -6285,6 +6472,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.lpszClassName = DSB_CLASS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;   /* WM_PAINT 里自绘背景 */
+    RegisterClassExW(&wc);
+
+    /* 注册托盘迷你控制浮窗类 */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = FlyoutProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = FLY_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = CreateSolidBrush(RGB(45, 45, 52));   /* 暗底与按钮一致 */
     RegisterClassExW(&wc);
 
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
@@ -6332,11 +6529,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
                 continue;
             }
         }
-        /* 方向键快捷键（仅主窗口自身有焦点时，不抢列表/滑块/编辑框的方向键）：
+        /* 方向键快捷键（焦点在主窗口或无方向键用途的控件上时生效；
+         * 列表/编辑框/滑块/滚动条保留自己的方向键）：
          * ←/→ 后退/前进 15 秒，↑/↓ 上一曲/下一曲 */
         if (msg.message == WM_KEYDOWN) {
-            HWND focus = GetFocus();
-            if (focus == hwnd) {
+            if (FocusTakesKeys(GetFocus(), hwnd)) {
                 if (msg.wParam == VK_LEFT) {
                     PostMessageW(hwnd, WM_APP_REMOTE_SEEK, 0, 0); continue;
                 } else if (msg.wParam == VK_RIGHT) {
