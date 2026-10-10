@@ -263,6 +263,12 @@ static int  g_playPod = -1;         /* 正在播放的播客下标（哨兵 g_po
 static int  g_playEp  = -1;         /* 正在播放的剧集下标，独立于列表选中行 */
 static wchar_t *g_playUrl = NULL;   /* 当前请求播放的音频 URL */
 static long long g_dur100ns = 0;
+static int  g_posSec = 0, g_durSec = 0;  /* 500ms 定时器缓存的进度（秒），供手机 /status 读 */
+
+/* 续播记忆：退出时把 g_playUrl+位置写进 ini，下次启动 feeds 加载完自动续播 */
+static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径 */
+static long long g_resumeSec = 0;         /* 待续播的位置（秒） */
+static long long g_resumeSeek100ns = 0;   /* 播放开始事件里一次性消费的待定位 */
 
 /* 手机播放/遥控 HTTP 服务 */
 /* 端口优先用 80（Windows 防火墙常已放行，手机最容易连上），占用再依次降级 */
@@ -276,6 +282,9 @@ static volatile int g_httpStop = 0;
 static unsigned short g_httpPort = 0;                 /* 实际绑定成功的端口 */
 #define WM_APP_REMOTE_SEEK (WM_APP + 6)   /* wParam: 0=后退15秒 1=前进15秒 */
 #define WM_APP_REMOTE_SHUT (WM_APP + 7)   /* wParam: 定时分钟数，0=取消 */
+#define WM_APP_REMOTE_POS  (WM_APP + 8)   /* wParam: 定位千分比 0..1000（手机进度条拖动） */
+#define WM_APP_REMOTE_VOL  (WM_APP + 9)   /* wParam: 音量 0..100（手机音量条） */
+#define WM_APP_REMOTE_PLAYEP (WM_APP + 10) /* wParam=pod lParam=ep（手机点选剧集） */
 
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
@@ -469,6 +478,7 @@ static void ApplyLayout(HWND hwnd, int live);   /* 前置声明，字号切换�
 static void UpdateMarquee(void);                /* 前置声明，字号切换后要重测文本宽 */
 static void UpdatePodTipFromPoint(POINT pt);    /* 前置声明，播客列表悬停提示 */
 static char* WToU8(const wchar_t *w);           /* 前置声明，SaveConfig 保存缓存目录 */
+static long long PlayerGet100ns(int wantDur);   /* 前置声明，SaveConfig 保存续播位置 */
 static void UpdateThumbbarPlayPause(void);      /* 前置声明，播放/暂停状态切换时更新任务栏缩略图按钮 */
 static void ApplySpeed(void);                   /* 前置声明，播放开始时恢复倍速 */
 static void CycleSpeed(void);                   /* 前置声明，倍速按钮点击 */
@@ -2019,6 +2029,8 @@ static void LoadConfig(void)
     g_lang = 0;
     g_speed = 100;
     g_cfgFromTxt = 0;
+    free(g_resumeUrl); g_resumeUrl = NULL;
+    g_resumeSec = 0;
 
     ExeDir(iniPath, MAX_PATH);
     wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
@@ -2065,6 +2077,8 @@ static void LoadConfig(void)
             else if (strcmp(s, "dark") == 0) g_darkMode = (atoi(val) != 0);
             else if (strcmp(s, "lang") == 0) g_lang = (strcmp(val, "en") == 0) ? 1 : 0;
             else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
+            else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
+            else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
             else if (strcmp(s, "cachedir") == 0) {
                 wchar_t *w = U8ToW(val);
                 if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
@@ -2134,6 +2148,15 @@ static void SaveConfig(void)
     fprintf(f, "speed=%d\n", g_speed);
     fprintf(f, "winw=%d\n", g_winW);
     fprintf(f, "winh=%d\n", g_winH);
+    /* 续播记忆：正在播放/暂停时记住剧集与位置；已手动停止则不写（下次不续播） */
+    if (g_playUrl && g_playState != 0) {
+        long long pos = PlayerGet100ns(0);
+        char *u8;
+        if (pos < 0) pos = 0;
+        fprintf(f, "resume=%lld\n", pos / 10000000LL);
+        u8 = WToU8(g_playUrl);
+        if (u8) { fprintf(f, "resumeurl=%s\n", u8); free(u8); }
+    }
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
         if (u8) { fprintf(f, "cachedir=%s\n", u8); free(u8); }
@@ -2540,6 +2563,7 @@ static void PlayerStop(void)
     if (g_player) g_player->lpVtbl->Stop(g_player);
     g_playState = 0;
     g_dur100ns = 0;
+    g_posSec = 0; g_durSec = 0;
     g_playPod = -1;         /* 清空“正在播放”标记，避免和后续列表选中混淆 */
     g_playEp = -1;
     EnterCriticalSection(&g_nowCs);
@@ -2762,13 +2786,15 @@ static void HttpServeHome(SOCKET s)
     char ips[8][24];
     char names[8][64];
     int nip, i;
-    int cap = 16000, pos = 0;
+    int cap = 26000, pos = 0;
     char *pg;
     /* 界面文案（跟随程序语言） */
     const wchar_t *wAddr, *wLocal, *wSpk, *wRem, *wSd, *wCancel;
     const wchar_t *wNoShut, *wNoTitle, *wHint, *wMin, *wSd1, *wHint2;
+    const wchar_t *wProg, *wVol, *wEps;
     char *uAddr="", *uLocal="", *uSpk="", *uRem="", *uSd="", *uCancel="";
     char *uNoShut="", *uNoTitle="", *uHint="", *uMin="", *uSd1="", *uHint2="";
+    char *uProg="", *uVol="", *uEps="";
 
     nip = EnumLocalIPv4(ips, names, 8);
     if (g_lang == 1) {
@@ -2788,6 +2814,9 @@ static void HttpServeHome(SOCKET s)
                  L"in that case use a hotspot or Tailscale instead.";
         wMin = L" min";
         wSd1 = L"Shutting down in";
+        wProg = L"Progress";
+        wVol = L"Volume";
+        wEps = L"Episodes";
     } else {
         wAddr = L"手机浏览器打开（手机需与电脑在同一 Wi-Fi），认准 WiFi/以太网 地址：";
         wLocal = L"本机浏览器：";
@@ -2804,11 +2833,15 @@ static void HttpServeHome(SOCKET s)
                  L"或手机和电脑都装 Tailscale 后用它提供的地址。";
         wMin = L" 分";
         wSd1 = L"距离关机";
+        wProg = L"进度";
+        wVol = L"音量";
+        wEps = L"选集播放";
     }
     uAddr = WToU8(wAddr); uLocal = WToU8(wLocal); uSpk = WToU8(wSpk);
     uRem = WToU8(wRem); uSd = WToU8(wSd); uCancel = WToU8(wCancel);
     uNoShut = WToU8(wNoShut); uNoTitle = WToU8(wNoTitle); uHint = WToU8(wHint);
     uMin = WToU8(wMin); uSd1 = WToU8(wSd1); uHint2 = WToU8(wHint2);
+    uProg = WToU8(wProg); uVol = WToU8(wVol); uEps = WToU8(wEps);
 
     pg = (char*)malloc(cap);
     if (!pg) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); goto done; }
@@ -2833,6 +2866,16 @@ static void HttpServeHome(SOCKET s)
         "padding:6px 2px;font-family:monospace}"
         ".muted{font-size:12px;color:#9a9aa2;margin-top:8px;line-height:1.6}"
         "#sd{font-size:14px;color:#ffb84d;margin-top:10px}"
+        "input[type=range]{width:100%%;margin:6px 0;accent-color:#0078d7}"
+        "#pt{font-size:13px;color:#b0b0b8;text-align:center;font-family:monospace}"
+        "select{width:100%%;font-size:15px;padding:8px;border-radius:8px;"
+        "background:#34343c;color:#eee;border:1px solid #4a4a52;margin-bottom:8px}"
+        "#el{max-height:260px;overflow-y:auto}"
+        ".ep{display:block;width:100%%;text-align:left;font-size:14px;"
+        "padding:10px;margin:4px 0;border:1px solid #4a4a52;border-radius:8px;"
+        "background:#2e2e36;color:#ddd;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+        ".ep.cur{border-color:#3fbf6f;color:#3fbf6f}"
+        ".ep .d{color:#8a8a92;font-size:12px;margin-left:6px}"
         "</style></head><body><h3>LiteTune</h3>");
 
     /* 地址列表：WiFi/以太网在前并标注网卡名，虚拟网卡在后 */
@@ -2854,24 +2897,38 @@ static void HttpServeHome(SOCKET s)
         "<audio id=\"a\" src=\"/audio\" controls preload=\"auto\"></audio></div>",
         uSpk ? uSpk : "");
 
-    /* 遥控电脑：上下曲 / 播放暂停 / 停止 / ±15 秒 */
+    /* 遥控电脑：进度条（可拖动定位）+ 上下曲/播放暂停/停止/±15 秒 + 音量 */
     catf(pg, cap, &pos,
-        "<div class=\"box\"><div class=\"lab\">%s</div><div class=\"grid\">"
+        "<div class=\"box\"><div class=\"lab\">%s</div>"
+        "<div class=\"lab\">%s</div>"
+        "<div id=\"pt\">--:-- / --:--</div>"
+        "<input type=\"range\" id=\"sk\" min=\"0\" max=\"1000\" value=\"0\">"
+        "<div class=\"grid\">"
         "<button onclick=\"cmd('prev')\">&#9198;</button>"
         "<button id=\"pb\" onclick=\"cmd('play')\">&#9654;</button>"
         "<button onclick=\"cmd('next')\">&#9197;</button>"
         "<button onclick=\"cmd('stop')\">&#9632;</button>"
         "<button onclick=\"cmd('back')\">-15s</button>"
         "<button onclick=\"cmd('fwd')\">+15s</button>"
-        "</div></div>",
-        uRem ? uRem : "");
+        "</div>"
+        "<div class=\"lab\" style=\"margin-top:10px\">%s</div>"
+        "<input type=\"range\" id=\"vl\" min=\"0\" max=\"100\" value=\"80\">"
+        "</div>",
+        uRem ? uRem : "", uProg ? uProg : "", uVol ? uVol : "");
+
+    /* 选集播放：播客下拉 + 剧集按钮列表（点击任意一集播放） */
+    catf(pg, cap, &pos,
+        "<div class=\"box\"><div class=\"lab\">%s</div>"
+        "<select id=\"pl\" onchange=\"epPicked()\"></select>"
+        "<div id=\"el\"></div></div>",
+        uEps ? uEps : "");
 
     /* 定时关机（15/30/60 分 + 取消，倒计时每秒刷新） */
     catf(pg, cap, &pos,
         "<div class=\"box\"><div class=\"lab\">%s</div><div class=\"grid\">"
-        "<button onclick=\"cmd('shut',15)\">15%s</button>"
-        "<button onclick=\"cmd('shut',30)\">30%s</button>"
-        "<button onclick=\"cmd('shut',60)\">60%s</button>"
+        "<button onclick=\"cmd('shut','m',15)\">15%s</button>"
+        "<button onclick=\"cmd('shut','m',30)\">30%s</button>"
+        "<button onclick=\"cmd('shut','m',60)\">60%s</button>"
         "<button onclick=\"cmd('shutoff')\">%s</button>"
         "</div><div id=\"sd\"></div></div>",
         uSd ? uSd : "", uMin ? uMin : "", uMin ? uMin : "", uMin ? uMin : "", uCancel ? uCancel : "");
@@ -2882,22 +2939,54 @@ static void HttpServeHome(SOCKET s)
     catf(pg, cap, &pos,
         "<script>"
         "var A=document.getElementById('a'),lastT='';"
+        "var SK=document.getElementById('sk'),VL=document.getElementById('vl'),"
+        "PL=document.getElementById('pl'),EL=document.getElementById('el');"
         "var NOTITLE='%s',NOSHUT='%s',SD1='%s';"
-        "function cmd(x,m){var u='/cmd?a='+x;if(m!==undefined)u+='&m='+m;"
+        "var skDrag=false,vlDrag=false,userPicked=false,curEpPod=-1,lastPodList='';"
+        "function cmd(x){var u='/cmd?a='+x;for(var i=1;i<arguments.length;i+=2)"
+        "u+='&'+arguments[i]+'='+arguments[i+1];"
         "var f=new XMLHttpRequest();f.open('GET',u);f.send();setTimeout(poll,300);}"
         "function pad(n){return n<10?'0'+n:''+n;}"
         "function hms(s){var h=Math.floor(s/3600),m=Math.floor(s%%3600/60),r=s%%60;"
         "return (h?pad(h)+':':'')+pad(m)+':'+pad(r);}"
+        "SK.oninput=function(){skDrag=true;};"
+        "SK.onchange=function(){cmd('seek','p',SK.value);skDrag=false;};"
+        "VL.oninput=function(){vlDrag=true;};"
+        "VL.onchange=function(){cmd('vol','v',VL.value);vlDrag=false;};"
+        "function epPicked(){userPicked=true;loadEps(PL.value);}"
+        "function loadPods(cb){"
+        "var f=new XMLHttpRequest();f.open('GET','/pods');"
+        "f.onload=function(){try{var ps=JSON.parse(f.responseText);"
+        "var key=ps.map(function(p){return p.i;}).join(',');"
+        "if(key!==lastPodList){lastPodList=key;PL.innerHTML='';"
+        "ps.forEach(function(p){var o=document.createElement('option');"
+        "o.value=p.i;o.textContent=p.t;PL.appendChild(o);});}"
+        "if(cb)cb();}catch(e){}};f.send();}"
+        "function loadEps(p){"
+        "var f=new XMLHttpRequest();f.open('GET','/eps?p='+p);"
+        "f.onload=function(){try{var d=JSON.parse(f.responseText);"
+        "curEpPod=d.pod;EL.innerHTML='';"
+        "d.eps.forEach(function(e,idx){var b=document.createElement('button');"
+        "b.className='ep'+(e.cur?' cur':'');"
+        "b.textContent=e.t;"
+        "if(e.d>0){var s=document.createElement('span');s.className='d';"
+        "s.textContent=hms(e.d);b.appendChild(s);}"
+        "b.onclick=function(){cmd('playep','p',d.pod,'e',idx);};"
+        "EL.appendChild(b);});}catch(e){}};f.send();}"
         "function poll(){"
         "var f=new XMLHttpRequest();f.open('GET','/status');"
         "f.onload=function(){try{var s=JSON.parse(f.responseText);"
         "document.getElementById('t').textContent=s.title||NOTITLE;"
         "document.getElementById('pb').innerHTML=s.playing?'&#9208;':'&#9654;';"
         "document.getElementById('sd').textContent=s.shut>0?SD1+' '+hms(s.shut):NOSHUT;"
+        "if(!skDrag&&s.dur>0)SK.value=Math.floor(s.pos*1000/s.dur);"
+        "document.getElementById('pt').textContent=hms(s.pos)+' / '+(s.dur>0?hms(s.dur):'--:--');"
+        "if(!vlDrag)VL.value=s.vol;"
+        "if(!userPicked&&s.pod>=0&&PL.options.length&&+PL.value!==s.pod){PL.value=s.pod;loadEps(s.pod);}"
         "if('mediaSession' in navigator){"
         "navigator.mediaSession.metadata=new MediaMetadata({title:s.title||'LiteTune',artist:'LiteTune'});"
         "navigator.mediaSession.playbackState=s.playing?'playing':'paused';}"
-        "if(s.title&&s.title!==lastT){lastT=s.title;if(s.has)A.load();}"
+        "if(s.title&&s.title!==lastT){lastT=s.title;if(s.has)A.load();loadEps(curEpPod<0?s.pod:curEpPod);}"
         "}catch(e){}};f.send();}"
         "if('mediaSession' in navigator){try{"
         "navigator.mediaSession.setActionHandler('play',function(){A.play();});"
@@ -2907,7 +2996,7 @@ static void HttpServeHome(SOCKET s)
         "navigator.mediaSession.setActionHandler('seekbackward',function(){cmd('back');});"
         "navigator.mediaSession.setActionHandler('seekforward',function(){cmd('fwd');});"
         "}catch(e){}}"
-        "poll();setInterval(function(){if(!document.hidden)poll();},1000);"
+        "loadPods(function(){poll();});setInterval(function(){if(!document.hidden)poll();},1000);"
         "</script></body></html>",
         uNoTitle ? uNoTitle : "", uNoShut ? uNoShut : "", uSd1 ? uSd1 : "");
 
@@ -2917,13 +3006,14 @@ done:
     free(uAddr); free(uLocal); free(uSpk); free(uRem); free(uSd); free(uCancel);
     free(uNoShut); free(uNoTitle); free(uHint); free(uMin); free(uSd1);
     free(uHint2);
+    free(uProg); free(uVol); free(uEps);
 }
 
-/* /status：JSON 返回当前标题、播放状态、关机剩余秒数 */
+/* /status：JSON 返回当前标题、播放状态、进度/时长/音量、正在播放下标、关机剩余秒数 */
 static void HttpServeStatus(SOCKET s)
 {
     wchar_t path[MAX_PATH], title[256];
-    char t8[1024], body[1300];
+    char t8[1024], body[1408];
     long long shutLeft = 0;
     int n;
     EnterCriticalSection(&g_nowCs);
@@ -2936,10 +3026,65 @@ static void HttpServeStatus(SOCKET s)
     }
     JsonEscapeU8(title, t8, sizeof(t8));
     n = _snprintf(body, sizeof(body),
-        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%lld}",
+        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%lld,"
+        "\"pos\":%d,\"dur\":%d,\"vol\":%d,\"pod\":%d,\"ep\":%d}",
         t8, g_playState == 1 ? "true" : "false",
-        path[0] ? "true" : "false", shutLeft);
+        path[0] ? "true" : "false", shutLeft,
+        g_posSec, g_durSec, g_volume, g_playPod, g_playEp);
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, n);
+}
+
+/* /pods：JSON 播客列表，供手机选播客；i 为下标（缓存行 = g_podCount） */
+static void HttpServePods(SOCKET s)
+{
+    int cap = 1024 + g_podCount * 768, pos = 0, i;
+    char *body = (char*)malloc(cap);
+    if (!body) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); return; }
+    pos += _snprintf(body + pos, cap - pos, "[");
+    for (i = 0; i < g_podCount; i++) {
+        char t8[640];
+        JsonEscapeU8(g_pods[i].title ? g_pods[i].title : L"", t8, sizeof(t8));
+        pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
+            i ? "," : "", i, t8);
+    }
+    if (g_cachePod.epCount > 0) {
+        char t8[640];
+        JsonEscapeU8(g_cachePod.title ? g_cachePod.title : L"", t8, sizeof(t8));
+        pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
+            g_podCount ? "," : "", g_podCount, t8);
+    }
+    _snprintf(body + pos, cap - pos, "]");
+    HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, (int)strlen(body));
+    free(body);
+}
+
+/* /eps?p=N：JSON 某播客的剧集列表（含时长与正在播放标记），N==g_podCount 为缓存视图 */
+static void HttpServeEps(SOCKET s, const char *pathq)
+{
+    const char *pp = strstr(pathq, "p=");
+    Podcast *pod;
+    int p, j, cap, pos;
+    char *body;
+    if (!pp) { HttpRespond(s, "400 Bad Request", "text/plain", "no p", 4); return; }
+    p = atoi(pp + 2);
+    if (p == g_podCount && g_cachePod.epCount > 0) pod = &g_cachePod;
+    else if (p >= 0 && p < g_podCount)          pod = &g_pods[p];
+    else { HttpRespond(s, "404 Not Found", "text/plain", "no pod", 6); return; }
+
+    cap = 4096 + pod->epCount * 768;
+    body = (char*)malloc(cap);
+    if (!body) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); return; }
+    pos = _snprintf(body, cap, "{\"pod\":%d,\"eps\":[", p);
+    for (j = 0; j < pod->epCount && pos < cap - 800; j++) {
+        char t8[640];
+        JsonEscapeU8(pod->eps[j].title ? pod->eps[j].title : L"", t8, sizeof(t8));
+        pos += _snprintf(body + pos, cap - pos, "%s{\"t\":\"%s\",\"d\":%d,\"cur\":%s}",
+            j ? "," : "", t8, pod->eps[j].durationSec,
+            (g_playPod == p && g_playEp == j) ? "1" : "0");
+    }
+    _snprintf(body + pos, cap - pos, "]}");
+    HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, (int)strlen(body));
+    free(body);
 }
 
 /* /audio：流式输出当前播放的本地 mp3，支持 Range 拖动 */
@@ -3045,11 +3190,30 @@ static void HttpServeCmd(SOCKET s, const char *pathq)
     const char *mp;
     if (!a) { HttpRespond(s, "200 OK", "application/json", "{\"ok\":0}", 7); return; }
     a += 2;
-    /* shutoff 必须在 shut 之前判断（前缀匹配） */
-    if      (strncmp(a, "play", 4) == 0)    id = IDC_BTN_PLAY;
+    /* playep 必须在 play 之前判断（前缀匹配），shutoff 同理在 shut 之前 */
+    if      (strncmp(a, "playep", 6) == 0) {
+        const char *pp = strstr(pathq, "&p="), *ep = strstr(pathq, "&e=");
+        if (pp && ep && g_hwnd)
+            PostMessageW(g_hwnd, WM_APP_REMOTE_PLAYEP, (WPARAM)atoi(pp + 3), (LPARAM)atoi(ep + 3));
+    }
+    else if (strncmp(a, "play", 4) == 0)    id = IDC_BTN_PLAY;
     else if (strncmp(a, "prev", 4) == 0)    id = IDC_BTN_PREV;
     else if (strncmp(a, "next", 4) == 0)    id = IDC_BTN_NEXT;
     else if (strncmp(a, "stop", 4) == 0)    id = IDC_BTN_STOP;
+    else if (strncmp(a, "seek", 4) == 0) {
+        const char *pp = strstr(pathq, "&p=");
+        if (pp && g_hwnd) {
+            int pm = atoi(pp + 3);
+            if (pm < 0) pm = 0;
+            if (pm > 1000) pm = 1000;
+            PostMessageW(g_hwnd, WM_APP_REMOTE_POS, (WPARAM)pm, 0);
+        }
+    }
+    else if (strncmp(a, "vol", 3) == 0) {
+        const char *vp = strstr(pathq, "&v=");
+        if (vp && g_hwnd)
+            PostMessageW(g_hwnd, WM_APP_REMOTE_VOL, (WPARAM)atoi(vp + 3), 0);
+    }
     else if (strncmp(a, "back", 4) == 0)    { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 0, 0); }
     else if (strncmp(a, "fwd", 3) == 0)     { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 1, 0); }
     else if (strncmp(a, "shutoff", 7) == 0) { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SHUT, 0, 0); }
@@ -3092,6 +3256,8 @@ static DWORD WINAPI PhoneClientThread(LPVOID p)
             if (end) *end = 0;
             if      (strncmp(path, "/audio", 6) == 0) HttpServeAudio(c, req);
             else if (strncmp(path, "/status", 7) == 0) HttpServeStatus(c);
+            else if (strncmp(path, "/pods", 5) == 0)  HttpServePods(c);
+            else if (strncmp(path, "/eps", 4) == 0)   HttpServeEps(c, path);
             else if (strncmp(path, "/cmd", 4) == 0)   HttpServeCmd(c, path);
             else HttpServeHome(c);
         }
@@ -3627,6 +3793,38 @@ static void PlayAdjacent(int delta)
         if (target >= n) target = 0;
     }
     RequestPlayEpisode(pod, target);
+}
+
+/* 启动续播：feeds 加载完成后按 g_resumeUrl 定位剧集并自动播放。
+ * 匹配依据是剧集 enclosure URL（离线视图里是本地 mp3 路径），排序/增删不影响。
+ * 找到后置 g_resumeSeek100ns，由 MFP_EVENT_TYPE_PLAY 一次性应用定位。 */
+static void TryResumePlayback(void)
+{
+    int i, j;
+    if (!g_resumeUrl || !g_resumeUrl[0]) return;
+    for (j = 0; j < g_cachePod.epCount; j++) {
+        if (g_cachePod.eps[j].url && wcscmp(g_cachePod.eps[j].url, g_resumeUrl) == 0) {
+            g_resumeSeek100ns = g_resumeSec * 10000000LL;
+            SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
+            SelectPodcast(g_podCount);
+            RequestPlayEpisode(g_podCount, j);
+            goto done;
+        }
+    }
+    for (i = 0; i < g_podCount; i++) {
+        for (j = 0; j < g_pods[i].epCount; j++) {
+            if (g_pods[i].eps[j].url && wcscmp(g_pods[i].eps[j].url, g_resumeUrl) == 0) {
+                g_resumeSeek100ns = g_resumeSec * 10000000LL;
+                SendMessageW(g_listPod, LB_SETCURSEL, i, 0);
+                SelectPodcast(i);
+                RequestPlayEpisode(i, j);
+                goto done;
+            }
+        }
+    }
+done:
+    free(g_resumeUrl); g_resumeUrl = NULL;
+    g_resumeSec = 0;
 }
 
 /* 喇叭按钮：静音切换（滑块位置不动） */
@@ -6027,6 +6225,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (dur > 0) g_dur100ns = dur;
             if (pos >= 0) {
                 wchar_t buf[64], a[16], b[16];
+                g_posSec = (int)(pos / 10000000);              /* 供手机 /status 读 */
+                g_durSec = g_dur100ns > 0 ? (int)(g_dur100ns / 10000000) : 0;
                 FmtTime(pos / 10000000, a, 16);
                 if (g_dur100ns > 0) FmtTime(g_dur100ns / 10000000, b, 16);
                 else wcscpy_s(b, 16, L"--:--");
@@ -6059,6 +6259,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     /* 手机遥控：定时关机（wParam=分钟数，0=取消） */
     case WM_APP_REMOTE_SHUT:
         SetShutdownTimer((int)wParam);
+        return 0;
+
+    /* 手机遥控：进度条拖动定位（wParam=千分比 0..1000） */
+    case WM_APP_REMOTE_POS:
+        PlayerSeekToFrac((int)wParam);
+        return 0;
+
+    /* 手机遥控：音量（wParam=0..100），与音量滑块同一套行为 */
+    case WM_APP_REMOTE_VOL: {
+        int v = (int)wParam;
+        wchar_t buf[16];
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        g_volume = v;
+        SendMessageW(g_sldVol, TBM_SETPOS, TRUE, v);
+        swprintf(buf, 16, L"%d", v);
+        SetWindowTextW(g_stVol, buf);
+        if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
+        if (g_muted) {
+            g_muted = 0;
+            if (g_player) g_player->lpVtbl->SetMute(g_player, FALSE);
+            InvalidateRect(g_btnMute, NULL, TRUE);
+        }
+        return 0;
+    }
+
+    /* 手机遥控：点选剧集播放（wParam=pod，lParam=ep；pod==g_podCount 为缓存视图） */
+    case WM_APP_REMOTE_PLAYEP:
+        if ((int)wParam == g_podCount || ((int)wParam >= 0 && (int)wParam < g_podCount))
+            RequestPlayEpisode((int)wParam, (int)lParam);
         return 0;
 
     case WM_APP_FEED_ADDED: {
@@ -6112,6 +6342,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else {
             SetStatus(tr(TR_NO_FEEDS_HINT));
         }
+        TryResumePlayback();   /* 启动续播：有记忆位置时自动恢复上次播放 */
         g_fullReload = 0;
         return 0;
 
@@ -6190,6 +6421,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 UpdateThumbbarPlayPause();
                 d = PlayerGet100ns(1);
                 if (d > 0) g_dur100ns = d;
+                /* 续播记忆：开播后跳到上次退出的位置（一次性） */
+                if (g_resumeSeek100ns > 0) {
+                    long long t = g_resumeSeek100ns;
+                    g_resumeSeek100ns = 0;
+                    if (g_dur100ns > 0 && t >= g_dur100ns) t = 0;   /* 已到片尾就从头 */
+                    if (t > 0) {
+                        PROPVARIANT pv;
+                        memset(&pv, 0, sizeof(pv));
+                        pv.vt = VT_I8;
+                        pv.hVal.QuadPart = t;
+                        g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+                    }
+                }
                 if (g_listPod) InvalidateRect(g_listPod, NULL, TRUE);   /* 标题变绿 */
                 if (g_listEp) InvalidateRect(g_listEp, NULL, TRUE);    /* 剧集变绿 */
             } else {
