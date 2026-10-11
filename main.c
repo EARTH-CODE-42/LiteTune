@@ -270,6 +270,17 @@ static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径
 static long long g_resumeSec = 0;         /* 待续播的位置（秒） */
 static long long g_resumeSeek100ns = 0;   /* 播放开始事件里一次性消费的待定位 */
 
+/* 每播客续播标记：记住每个订阅“上次听到哪”（剧集 URL + 秒数）。
+ * 键用 feed URL 的 FNV-1a 哈希（列表下标会因增删/排序漂移，URL 不会）；
+ * ini 行 lastep=<hex>,<sec>,<utf8url>，启动时清掉对不上现有订阅的孤儿记录。 */
+typedef struct {
+    unsigned int  hash;
+    wchar_t      *epUrl;
+    long long     sec;
+} LastEp;
+static LastEp  *g_lastEps = NULL;
+static int      g_lastEpCount = 0, g_lastEpCap = 0;
+
 /* 手机播放/遥控 HTTP 服务 */
 /* 端口优先用 80（Windows 防火墙常已放行，手机最容易连上），占用再依次降级 */
 static const unsigned short PHONE_PORTS[] = { 80, 8080, 17532 };
@@ -285,6 +296,8 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_REMOTE_POS  (WM_APP + 8)   /* wParam: 定位千分比 0..1000（手机进度条拖动） */
 #define WM_APP_REMOTE_VOL  (WM_APP + 9)   /* wParam: 音量 0..100（手机音量条） */
 #define WM_APP_REMOTE_PLAYEP (WM_APP + 10) /* wParam=pod lParam=ep（手机点选剧集） */
+#define WM_APP_REMOTE_MODE   (WM_APP + 11) /* 手机切换播放模式（循环切换） */
+#define WM_APP_REMOTE_SPEED  (WM_APP + 12) /* wParam: 倍速 50..300（百分之一） */
 
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
@@ -1995,6 +2008,91 @@ static void AddFeedUrl(const char *s)
     if (g_feedUrls[g_feedUrlCount]) g_feedUrlCount++;
 }
 
+/* ---------- 每播客续播标记（上次听到哪） ---------- */
+
+/* feed URL 的 FNV-1a 32 位哈希（feedUrl 为 UTF-8 char*，按字节逐个算，跨启动稳定） */
+static unsigned int LastEpHash(const char *url)
+{
+    unsigned int h = 2166136261u;
+    if (!url) return 0;
+    while (*url) {
+        h ^= (unsigned int)(unsigned char)*url++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static LastEp* LastEpFind(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_lastEpCount; i++)
+        if (g_lastEps[i].hash == hash) return &g_lastEps[i];
+    return NULL;
+}
+
+/* 记录/更新某播客的上次播放位置（epUrl 为空串仅刷新秒数时不替换 URL） */
+static void LastEpSet(unsigned int hash, const wchar_t *epUrl, long long sec)
+{
+    LastEp *le = LastEpFind(hash);
+    if (!le) {
+        if (g_lastEpCount >= 512) return;   /* 防异常膨胀，播客数远小于此 */
+        if (g_lastEpCount >= g_lastEpCap) {
+            int nc = g_lastEpCap ? g_lastEpCap * 2 : 16;
+            LastEp *nb = (LastEp*)realloc(g_lastEps, nc * sizeof(LastEp));
+            if (!nb) return;
+            g_lastEps = nb; g_lastEpCap = nc;
+        }
+        le = &g_lastEps[g_lastEpCount++];
+        le->hash = hash;
+        le->epUrl = NULL;
+    }
+    if (!le->epUrl || (epUrl && wcscmp(le->epUrl, epUrl) != 0)) {
+        free(le->epUrl);
+        le->epUrl = epUrl ? _wcsdup(epUrl) : NULL;
+        if (!le->epUrl) { le->sec = 0; return; }
+    }
+    le->sec = sec;
+}
+
+/* 删除某播客的记录（删订阅时调用），返回是否删除 */
+static int LastEpDrop(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_lastEpCount; i++) {
+        if (g_lastEps[i].hash == hash) {
+            free(g_lastEps[i].epUrl);
+            memmove(&g_lastEps[i], &g_lastEps[i + 1],
+                    (g_lastEpCount - i - 1) * sizeof(LastEp));
+            g_lastEpCount--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 启动清理：哈希对不上任何现有订阅的记录删除（防 ini 手编/异常残留） */
+static void LastEpPurgeOrphans(void)
+{
+    int i, keep = 0;
+    for (i = 0; i < g_lastEpCount; i++) {
+        unsigned int h = g_lastEps[i].hash;
+        int j, found = 0;
+        for (j = 0; j < g_podCount && !found; j++)
+            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
+        if (found) g_lastEps[keep++] = g_lastEps[i];
+        else free(g_lastEps[i].epUrl);
+    }
+    g_lastEpCount = keep;
+}
+
+static void LastEpFreeAll(void)
+{
+    int i;
+    for (i = 0; i < g_lastEpCount; i++) free(g_lastEps[i].epUrl);
+    free(g_lastEps);
+    g_lastEps = NULL; g_lastEpCount = 0; g_lastEpCap = 0;
+}
+
 static void ParseSortValue(const char *v)
 {
     if (strncmp(v, "title", 5) == 0)         g_sortCol = SORT_TITLE;
@@ -2031,6 +2129,7 @@ static void LoadConfig(void)
     g_cfgFromTxt = 0;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
+    LastEpFreeAll();
 
     ExeDir(iniPath, MAX_PATH);
     wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
@@ -2079,6 +2178,25 @@ static void LoadConfig(void)
             else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
             else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
             else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
+            else if (strcmp(s, "lastep") == 0) {
+                /* 格式 lastep=<hash hex>,<sec>,<utf8url 余下整行> */
+                unsigned int h; long long sec;
+                char *c1 = strchr(val, ',');
+                if (c1) {
+                    char *c2;
+                    *c1 = 0; c2 = strchr(c1 + 1, ',');
+                    if (c2) {
+                        wchar_t *w;
+                        *c2 = 0;
+                        h = (unsigned int)strtoul(val, NULL, 16);
+                        sec = atoll(c1 + 1);
+                        if (h != 0 && sec >= 0 && (w = U8ToW(c2 + 1)) != NULL) {
+                            LastEpSet(h, w, sec);
+                            free(w);
+                        }
+                    }
+                }
+            }
             else if (strcmp(s, "cachedir") == 0) {
                 wchar_t *w = U8ToW(val);
                 if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
@@ -2156,6 +2274,25 @@ static void SaveConfig(void)
         fprintf(f, "resume=%lld\n", pos / 10000000LL);
         u8 = WToU8(g_playUrl);
         if (u8) { fprintf(f, "resumeurl=%s\n", u8); free(u8); }
+        /* 退出时刻把当前剧集精确写入每播客标记（订阅视图才记） */
+        if (g_playPod >= 0 && g_playPod < g_podCount &&
+            g_pods[g_playPod].feedUrl)
+            LastEpSet(LastEpHash(g_pods[g_playPod].feedUrl), g_playUrl,
+                      pos / 10000000LL);
+    }
+    /* 每播客“上次听到哪”：行数=订阅数，体积极小 */
+    {
+        int li;
+        for (li = 0; li < g_lastEpCount; li++) {
+            if (g_lastEps[li].epUrl && g_lastEps[li].hash != 0) {
+                char *u8 = WToU8(g_lastEps[li].epUrl);
+                if (u8) {
+                    fprintf(f, "lastep=%x,%lld,%s\n",
+                            g_lastEps[li].hash, g_lastEps[li].sec, u8);
+                    free(u8);
+                }
+            }
+        }
     }
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
@@ -2502,6 +2639,8 @@ static void ProbeAudioMeta(const wchar_t *path, Episode *e)
     ps->lpVtbl->Release(ps);
 }
 
+static void LoadCachePodcast(void);   /* 前置声明：/eps?p=缓存行 懒加载时用 */
+
 /* ================= MFPlay 回调 ================= */
 typedef struct {
     IMFPMediaPlayerCallbackVtbl *lpVtbl;
@@ -2792,9 +2931,12 @@ static void HttpServeHome(SOCKET s)
     const wchar_t *wAddr, *wLocal, *wSpk, *wRem, *wSd, *wCancel;
     const wchar_t *wNoShut, *wNoTitle, *wHint, *wMin, *wSd1, *wHint2;
     const wchar_t *wProg, *wVol, *wEps;
+    const wchar_t *wM[4];
+    const wchar_t *wMinPH, *wSet;
     char *uAddr="", *uLocal="", *uSpk="", *uRem="", *uSd="", *uCancel="";
     char *uNoShut="", *uNoTitle="", *uHint="", *uMin="", *uSd1="", *uHint2="";
-    char *uProg="", *uVol="", *uEps="";
+    char *uProg="", *uVol="", *uEps="", *uM[4]={0,0,0,0};
+    char *uMinPH="", *uSet="";
 
     nip = EnumLocalIPv4(ips, names, 8);
     if (g_lang == 1) {
@@ -2817,6 +2959,8 @@ static void HttpServeHome(SOCKET s)
         wProg = L"Progress";
         wVol = L"Volume";
         wEps = L"Episodes";
+        wM[0] = L"Order"; wM[1] = L"Shuffle"; wM[2] = L"Repeat"; wM[3] = L"Play once";
+        wMinPH = L"Minutes"; wSet = L"Set";
     } else {
         wAddr = L"手机浏览器打开（手机需与电脑在同一 Wi-Fi），认准 WiFi/以太网 地址：";
         wLocal = L"本机浏览器：";
@@ -2836,12 +2980,16 @@ static void HttpServeHome(SOCKET s)
         wProg = L"进度";
         wVol = L"音量";
         wEps = L"选集播放";
+        wM[0] = L"顺序"; wM[1] = L"随机"; wM[2] = L"循环"; wM[3] = L"播完停";
+        wMinPH = L"分钟"; wSet = L"设置";
     }
     uAddr = WToU8(wAddr); uLocal = WToU8(wLocal); uSpk = WToU8(wSpk);
     uRem = WToU8(wRem); uSd = WToU8(wSd); uCancel = WToU8(wCancel);
     uNoShut = WToU8(wNoShut); uNoTitle = WToU8(wNoTitle); uHint = WToU8(wHint);
     uMin = WToU8(wMin); uSd1 = WToU8(wSd1); uHint2 = WToU8(wHint2);
     uProg = WToU8(wProg); uVol = WToU8(wVol); uEps = WToU8(wEps);
+    for (i = 0; i < 4; i++) uM[i] = WToU8(wM[i]);
+    uMinPH = WToU8(wMinPH); uSet = WToU8(wSet);
 
     pg = (char*)malloc(cap);
     if (!pg) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); goto done; }
@@ -2876,6 +3024,12 @@ static void HttpServeHome(SOCKET s)
         "background:#2e2e36;color:#ddd;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
         ".ep.cur{border-color:#3fbf6f;color:#3fbf6f}"
         ".ep .d{color:#8a8a92;font-size:12px;margin-left:6px}"
+        ".row2{display:flex;gap:6px;margin-top:8px}"
+        ".row2 button{flex:1;padding:9px 2px;font-size:13px}"
+        "#mb{flex:1.6}"
+        ".sp.on{border-color:#3fbf6f;color:#3fbf6f}"
+        "input[type=number]{flex:1.4;font-size:14px;padding:8px;border-radius:8px;"
+        "background:#34343c;color:#eee;border:1px solid #4a4a52}"
         "</style></head><body><h3>LiteTune</h3>");
 
     /* 地址列表：WiFi/以太网在前并标注网卡名，虚拟网卡在后 */
@@ -2911,10 +3065,19 @@ static void HttpServeHome(SOCKET s)
         "<button onclick=\"cmd('back')\">-15s</button>"
         "<button onclick=\"cmd('fwd')\">+15s</button>"
         "</div>"
+        "<div class=\"row2\">"
+        "<button id=\"mb\" onclick=\"cmd('mode')\">%s</button>"
+        "<button class=\"sp\" data-v=\"75\" onclick=\"cmd('speed','v',75)\">0.75x</button>"
+        "<button class=\"sp\" data-v=\"100\" onclick=\"cmd('speed','v',100)\">1x</button>"
+        "<button class=\"sp\" data-v=\"125\" onclick=\"cmd('speed','v',125)\">1.25x</button>"
+        "<button class=\"sp\" data-v=\"150\" onclick=\"cmd('speed','v',150)\">1.5x</button>"
+        "<button class=\"sp\" data-v=\"200\" onclick=\"cmd('speed','v',200)\">2x</button>"
+        "</div>"
         "<div class=\"lab\" style=\"margin-top:10px\">%s</div>"
         "<input type=\"range\" id=\"vl\" min=\"0\" max=\"100\" value=\"80\">"
         "</div>",
-        uRem ? uRem : "", uProg ? uProg : "", uVol ? uVol : "");
+        uRem ? uRem : "", uProg ? uProg : "",
+        uM[0] ? uM[0] : "", uVol ? uVol : "");
 
     /* 选集播放：播客下拉 + 剧集按钮列表（点击任意一集播放） */
     catf(pg, cap, &pos,
@@ -2923,15 +3086,21 @@ static void HttpServeHome(SOCKET s)
         "<div id=\"el\"></div></div>",
         uEps ? uEps : "");
 
-    /* 定时关机（15/30/60 分 + 取消，倒计时每秒刷新） */
+    /* 定时关机（15/30/60 分 + 自定义分钟 + 取消，倒计时每秒刷新） */
     catf(pg, cap, &pos,
         "<div class=\"box\"><div class=\"lab\">%s</div><div class=\"grid\">"
         "<button onclick=\"cmd('shut','m',15)\">15%s</button>"
         "<button onclick=\"cmd('shut','m',30)\">30%s</button>"
         "<button onclick=\"cmd('shut','m',60)\">60%s</button>"
         "<button onclick=\"cmd('shutoff')\">%s</button>"
-        "</div><div id=\"sd\"></div></div>",
-        uSd ? uSd : "", uMin ? uMin : "", uMin ? uMin : "", uMin ? uMin : "", uCancel ? uCancel : "");
+        "</div>"
+        "<div class=\"row2\">"
+        "<input type=\"number\" id=\"sm\" min=\"1\" max=\"720\" placeholder=\"%s\">"
+        "<button style=\"flex:1\" onclick=\"customShut()\">%s</button>"
+        "</div>"
+        "<div id=\"sd\"></div></div>",
+        uSd ? uSd : "", uMin ? uMin : "", uMin ? uMin : "", uMin ? uMin : "",
+        uCancel ? uCancel : "", uMinPH ? uMinPH : "", uSet ? uSet : "");
 
     catf(pg, cap, &pos, "<div class=\"muted\">%s</div>", uHint ? uHint : "");
     catf(pg, cap, &pos, "<div class=\"muted\">%s</div>", uHint2 ? uHint2 : "");
@@ -2942,6 +3111,7 @@ static void HttpServeHome(SOCKET s)
         "var SK=document.getElementById('sk'),VL=document.getElementById('vl'),"
         "PL=document.getElementById('pl'),EL=document.getElementById('el');"
         "var NOTITLE='%s',NOSHUT='%s',SD1='%s';"
+        "var MODES=['%s','%s','%s','%s'];"
         "var skDrag=false,vlDrag=false,userPicked=false,curEpPod=-1,lastPodList='';"
         "function cmd(x){var u='/cmd?a='+x;for(var i=1;i<arguments.length;i+=2)"
         "u+='&'+arguments[i]+'='+arguments[i+1];"
@@ -2954,6 +3124,8 @@ static void HttpServeHome(SOCKET s)
         "VL.oninput=function(){vlDrag=true;};"
         "VL.onchange=function(){cmd('vol','v',VL.value);vlDrag=false;};"
         "function epPicked(){userPicked=true;loadEps(PL.value);}"
+        "function customShut(){var v=parseInt(document.getElementById('sm').value,10);"
+        "if(v>0)cmd('shut','m',v);}"
         "function loadPods(cb){"
         "var f=new XMLHttpRequest();f.open('GET','/pods');"
         "f.onload=function(){try{var ps=JSON.parse(f.responseText);"
@@ -2982,6 +3154,9 @@ static void HttpServeHome(SOCKET s)
         "if(!skDrag&&s.dur>0)SK.value=Math.floor(s.pos*1000/s.dur);"
         "document.getElementById('pt').textContent=hms(s.pos)+' / '+(s.dur>0?hms(s.dur):'--:--');"
         "if(!vlDrag)VL.value=s.vol;"
+        "document.getElementById('mb').textContent=MODES[s.mode]||MODES[0];"
+        "document.querySelectorAll('.sp').forEach(function(b){"
+        "b.className='sp'+(+b.dataset.v===s.speed?' on':'');});"
         "if(!userPicked&&s.pod>=0&&PL.options.length&&+PL.value!==s.pod){PL.value=s.pod;loadEps(s.pod);}"
         "if('mediaSession' in navigator){"
         "navigator.mediaSession.metadata=new MediaMetadata({title:s.title||'LiteTune',artist:'LiteTune'});"
@@ -2998,7 +3173,9 @@ static void HttpServeHome(SOCKET s)
         "}catch(e){}}"
         "loadPods(function(){poll();});setInterval(function(){if(!document.hidden)poll();},1000);"
         "</script></body></html>",
-        uNoTitle ? uNoTitle : "", uNoShut ? uNoShut : "", uSd1 ? uSd1 : "");
+        uNoTitle ? uNoTitle : "", uNoShut ? uNoShut : "", uSd1 ? uSd1 : "",
+        uM[0] ? uM[0] : "", uM[1] ? uM[1] : "",
+        uM[2] ? uM[2] : "", uM[3] ? uM[3] : "");
 
     HttpRespond(s, "200 OK", "text/html; charset=utf-8", pg, pos);
     free(pg);
@@ -3007,6 +3184,8 @@ done:
     free(uNoShut); free(uNoTitle); free(uHint); free(uMin); free(uSd1);
     free(uHint2);
     free(uProg); free(uVol); free(uEps);
+    for (i = 0; i < 4; i++) free(uM[i]);
+    free(uMinPH); free(uSet);
 }
 
 /* /status：JSON 返回当前标题、播放状态、进度/时长/音量、正在播放下标、关机剩余秒数 */
@@ -3027,10 +3206,12 @@ static void HttpServeStatus(SOCKET s)
     JsonEscapeU8(title, t8, sizeof(t8));
     n = _snprintf(body, sizeof(body),
         "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%lld,"
-        "\"pos\":%d,\"dur\":%d,\"vol\":%d,\"pod\":%d,\"ep\":%d}",
+        "\"pos\":%d,\"dur\":%d,\"vol\":%d,\"pod\":%d,\"ep\":%d,"
+        "\"mode\":%d,\"speed\":%d}",
         t8, g_playState == 1 ? "true" : "false",
         path[0] ? "true" : "false", shutLeft,
-        g_posSec, g_durSec, g_volume, g_playPod, g_playEp);
+        g_posSec, g_durSec, g_volume, g_playPod, g_playEp,
+        g_playMode, g_speed);
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, n);
 }
 
@@ -3047,9 +3228,13 @@ static void HttpServePods(SOCKET s)
         pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
             i ? "," : "", i, t8);
     }
-    if (g_cachePod.epCount > 0) {
+    if (g_cacheFileCount > 0) {
+        /* “已缓存”懒加载：未扫描时用标题占位，点选（/eps）时再真正建列表 */
+        wchar_t row[64];
         char t8[640];
-        JsonEscapeU8(g_cachePod.title ? g_cachePod.title : L"", t8, sizeof(t8));
+        swprintf(row, 64, tr(TR_CACHED_FMT), g_cacheFileCount);
+        JsonEscapeU8(g_cachePod.epCount > 0 && g_cachePod.title
+                     ? g_cachePod.title : row, t8, sizeof(t8));
         pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
             g_podCount ? "," : "", g_podCount, t8);
     }
@@ -3067,7 +3252,12 @@ static void HttpServeEps(SOCKET s, const char *pathq)
     char *body;
     if (!pp) { HttpRespond(s, "400 Bad Request", "text/plain", "no p", 4); return; }
     p = atoi(pp + 2);
-    if (p == g_podCount && g_cachePod.epCount > 0) pod = &g_cachePod;
+    if (p == g_podCount) {
+        /* 懒加载：从未打开过“已缓存”视图时这里才真正扫描建列表 */
+        if (g_cachePod.epCount == 0 && g_cacheFileCount > 0)
+            LoadCachePodcast();
+        pod = &g_cachePod;
+    }
     else if (p >= 0 && p < g_podCount)          pod = &g_pods[p];
     else { HttpRespond(s, "404 Not Found", "text/plain", "no pod", 6); return; }
 
@@ -3213,6 +3403,18 @@ static void HttpServeCmd(SOCKET s, const char *pathq)
         const char *vp = strstr(pathq, "&v=");
         if (vp && g_hwnd)
             PostMessageW(g_hwnd, WM_APP_REMOTE_VOL, (WPARAM)atoi(vp + 3), 0);
+    }
+    else if (strncmp(a, "mode", 4) == 0) {
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_MODE, 0, 0);
+    }
+    else if (strncmp(a, "speed", 5) == 0) {
+        const char *vp = strstr(pathq, "&v=");
+        if (vp && g_hwnd) {
+            int v = atoi(vp + 3);
+            if (v < 50) v = 50;
+            if (v > 300) v = 300;
+            PostMessageW(g_hwnd, WM_APP_REMOTE_SPEED, (WPARAM)v, 0);
+        }
     }
     else if (strncmp(a, "back", 4) == 0)    { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 0, 0); }
     else if (strncmp(a, "fwd", 3) == 0)     { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 1, 0); }
@@ -3957,6 +4159,7 @@ static void RemovePodcast(int i)
         }
     }
 
+    if (g_pods[i].feedUrl) LastEpDrop(LastEpHash(g_pods[i].feedUrl));
     FreePodcast(&g_pods[i]);
     memmove(&g_pods[i], &g_pods[i + 1], (g_podCount - i - 1) * sizeof(Podcast));
     g_podCount--;
@@ -6096,6 +6299,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (nm->code == NM_DBLCLK) {
                 int sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                             (WPARAM)-1, LVNI_SELECTED);
+                /* 命中该播客“上次听到”的那集 → 双击即从记录位置续播；
+                 * 点其它集则从头播（清掉待定位，避免继承残留） */
+                if (sel >= 0 && g_curPod >= 0 && g_curPod < g_podCount) {
+                    Podcast *p = &g_pods[g_curPod];
+                    LastEp *le = p->feedUrl ? LastEpFind(LastEpHash(p->feedUrl))
+                                            : NULL;
+                    if (le && le->sec > 0 && sel < p->epCount &&
+                        p->eps[sel].url && le->epUrl &&
+                        wcscmp(p->eps[sel].url, le->epUrl) == 0)
+                        g_resumeSeek100ns = le->sec * 10000000LL;
+                    else
+                        g_resumeSeek100ns = 0;
+                } else if (sel >= 0) {
+                    g_resumeSeek100ns = 0;   /* 缓存聚合视图无单一 feed，从头播 */
+                }
                 if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
             } else if (nm->code == LVN_GETINFOTIPW) {
                 /* ListView 原生悬停提示（LVS_EX_INFOTIP）：控件自己管计时/命中 */
@@ -6119,10 +6337,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             playing = (g_playPod == g_curPod);
                     }
                     int cached = 0;
+                    int lastmark = 0;
                     int sel = (ListView_GetItemState(g_listEp, i, LVIS_SELECTED)
                                & LVIS_SELECTED) != 0;
                     if (p && i >= 0 && i < p->epCount)
                         cached = p->eps[i].localFile || EpisodeIsCached(&p->eps[i]);
+                    /* “上次听到哪”标记：该集 == 此播客记录的最近播放集（橙）。
+                     * 播放中绿色优先；缓存黄次之（标记是更强的“听过”信号） */
+                    if (p && i >= 0 && i < p->epCount && !playing &&
+                        g_curPod >= 0 && g_curPod < g_podCount &&
+                        g_pods[g_curPod].feedUrl) {
+                        LastEp *le = LastEpFind(
+                            LastEpHash(g_pods[g_curPod].feedUrl));
+                        if (le && le->sec > 0 && le->epUrl && p->eps[i].url &&
+                            wcscmp(p->eps[i].url, le->epUrl) == 0)
+                            lastmark = 1;
+                    }
                     if (playing) {
                         /* 播放行同时是选中行（默认蓝底白字会盖住绿字），
                          * 自己铺一层浅绿底再用深绿字 */
@@ -6139,7 +6369,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             FillRect(cd->nmcd.hdc, &rr, bg);
                             DeleteObject(bg);
                         }
-                        cd->clrText = cached ? ThYellow()
+                        cd->clrText = lastmark
+                            ? (g_darkMode ? RGB(235, 165, 80) : RGB(184, 106, 0))
+                            : cached ? ThYellow()
                             : (sel ? (g_darkMode ? RGB(236, 242, 250)
                                                  : RGB(0, 30, 80))
                                    : ThText());
@@ -6227,6 +6459,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 wchar_t buf[64], a[16], b[16];
                 g_posSec = (int)(pos / 10000000);              /* 供手机 /status 读 */
                 g_durSec = g_dur100ns > 0 ? (int)(g_dur100ns / 10000000) : 0;
+                /* 每播客“上次听到哪”：随播放实时刷新内存，退出/崩溃都不丢太多 */
+                if (g_playPod >= 0 && g_playPod < g_podCount &&
+                    g_pods[g_playPod].feedUrl && g_playUrl)
+                    LastEpSet(LastEpHash(g_pods[g_playPod].feedUrl), g_playUrl,
+                              pos / 10000000);
                 FmtTime(pos / 10000000, a, 16);
                 if (g_dur100ns > 0) FmtTime(g_dur100ns / 10000000, b, 16);
                 else wcscpy_s(b, 16, L"--:--");
@@ -6291,6 +6528,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RequestPlayEpisode((int)wParam, (int)lParam);
         return 0;
 
+    /* 手机遥控：播放模式循环切换（复用按钮同款逻辑，含 tooltip 同步） */
+    case WM_APP_REMOTE_MODE:
+        CyclePlayMode();
+        return 0;
+
+    /* 手机遥控：倍速（wParam=百分之一，50..300） */
+    case WM_APP_REMOTE_SPEED: {
+        int v = (int)wParam;
+        if (v < 50) v = 50;
+        if (v > 300) v = 300;
+        g_speed = v;
+        ApplySpeed();
+        if (g_btnSpeed) InvalidateRect(g_btnSpeed, NULL, TRUE);
+        SetStatusTemp(tr(TR_SPEED_SET));
+        return 0;
+    }
+
     case WM_APP_FEED_ADDED: {
         Podcast *pod = (Podcast*)lParam;
         int incremental = (int)wParam;   /* 1=单条添加，0=全量刷新 */
@@ -6343,6 +6597,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetStatus(tr(TR_NO_FEEDS_HINT));
         }
         TryResumePlayback();   /* 启动续播：有记忆位置时自动恢复上次播放 */
+        LastEpPurgeOrphans();  /* 清掉对不上现有订阅的“上次听到”记录 */
         g_fullReload = 0;
         return 0;
 
