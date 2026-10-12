@@ -148,7 +148,7 @@ enum {
     IDC_SLD_SEEK, IDC_SLD_VOL,
     IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
-    IDC_BTN_DIR, IDC_BTN_SPEED,
+    IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H
 };
@@ -177,6 +177,7 @@ static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集�
 static HWND     g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
+static HWND     g_btnCache;        /* 批量缓存：Ctrl+多选剧集后点击下载 */
 
 /* 倍速：整数存 100 倍，避免浮点；默认 100=1.0x */
 static int      g_speed = 100;
@@ -219,6 +220,7 @@ static int      g_mqActive = 0;       /* 文本超长，正在滚动 */
 
 #define TEMP_STATUS_MS 2600           /* 临时提示持续时间 */
 static int      g_statusTempOn = 0;   /* 临时提示正在显示（定时器4在跑） */
+static wchar_t  g_batchSavedBase[512] = L"";  /* 批量缓存前的 base（完成后恢复） */
 
 /* 播客列表模式：0=普通 1=删除 2=排序（互斥） */
 static int      g_podMode = 0;
@@ -299,6 +301,10 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_REMOTE_MODE   (WM_APP + 11) /* 手机切换播放模式（循环切换） */
 #define WM_APP_REMOTE_SPEED  (WM_APP + 12) /* wParam: 倍速 50..300（百分之一） */
 
+/* 批量缓存：Ctrl+多选剧集后点缓存按钮，独立线程逐集下载（不打断播放） */
+#define WM_APP_BATCH_DONE    (WM_APP + 13) /* wParam=ok(0/1) */
+#define WM_APP_BATCH_FINISH  (WM_APP + 14) /* wParam=成功数, lParam=总数 */
+
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
     TR_READY = 0,
@@ -339,6 +345,7 @@ enum {
     TR_PHONE_ON, TR_PHONE_OFF, TR_PHONE_FW,
     TR_SPEED_SET,
     TR_TRAY_SHOW, TR_TRAY_EXIT,
+    TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
     TR_N
 };
 
@@ -402,7 +409,10 @@ static const wchar_t *tr(int id)
             L"另外，手机要连页面上标注 WiFi/以太网 的地址；复制到别的电脑运行时，"
             L"那台电脑也会重新询问一次防火墙权限。",
         L"倍速已切换",
-        L"显示主窗口", L"退出"
+        L"显示主窗口", L"退出",
+        L"批量缓存（Ctrl+点选剧集后点击）",
+        L"批量缓存 %d/%d…", L"批量缓存完成（成功 %d/%d 集）",
+        L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -472,7 +482,10 @@ static const wchar_t *tr(int id)
             L"Copying the program to another PC means that PC will ask for "
             L"firewall permission again.",
         L"Playback speed changed",
-        L"Show window", L"Exit"
+        L"Show window", L"Exit",
+        L"Batch cache (Ctrl+click episodes, then click)",
+        L"Batch caching %d/%d...", L"Batch cache done (%d/%d ok)",
+        L"Select episodes first (Ctrl+click)", L"Batch cache in progress"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -604,7 +617,110 @@ static void SubclassHeader(void)
 /* 主题切换：重建背景刷、更新控件配色、表头/标题栏/非客户区滚动条一起重绘 */
 static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void LayoutControls(HWND hwnd);
+
 static WNDPROC g_oldSeekProc = NULL, g_oldVolProc = NULL;   /* 滑块原过程（重建滑块也用） */
+static WNDPROC g_oldListEpProc = NULL;   /* 剧集列表原过程（拖拽多选） */
+static int g_epDragStart = -1;   /* 拖拽多选起点行，-1=未拖拽 */
+
+/* 剧集列表拖拽多选：按下选中→拖过连续选→松开停止；Ctrl+拖=追加
+ * 不用 SetCapture（ListView 内部自己管 capture 会冲突），
+ * 改用定时器轮询鼠标位置 + GetAsyncKeyState 检测松开 */
+static int g_epDragOn = 0;   /* 1=拖拽多选进行中 */
+
+static LRESULT CALLBACK ListEpDragProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        LVHITTESTINFO ht;
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        /* 让 ListView 选中点击的行 */
+        LRESULT lr = CallWindowProcW(g_oldListEpProc, hwnd, msg, wp, lp);
+        ht.pt = pt;
+        g_epDragStart = (int)SendMessageW(hwnd, LVM_HITTEST, 0, (LPARAM)&ht);
+        g_epDragOn = 1;
+        /* 不调 SetCapture，避免和 ListView 内部冲突 */
+        SetTimer(hwnd, 0x4455, 50, NULL);
+        return lr;
+    }
+    case WM_TIMER:
+        if (wp == 0x4455) {
+            if (g_epDragOn && g_epDragStart >= 0) {
+                /* 左键松开 = 停止 */
+                if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+                    g_epDragOn = 0;
+                    g_epDragStart = -1;
+                    KillTimer(hwnd, 0x4455);
+                    return 0;
+                }
+                /* 获取鼠标在列表中的位置 */
+                {
+                    POINT pt;
+                    RECT rc;
+                    GetCursorPos(&pt);
+                    GetClientRect(hwnd, &rc);
+                    ScreenToClient(hwnd, &pt);
+                    if (PtInRect(&rc, pt)) {
+                        LVHITTESTINFO ht;
+                        int cur, lo, hi, i;
+                        LVITEMW lvi;
+                        ht.pt = pt;
+                        cur = (int)SendMessageW(hwnd, LVM_HITTEST, 0, (LPARAM)&ht);
+                        if (cur >= 0) {
+                            lo = (cur < g_epDragStart) ? cur : g_epDragStart;
+                            hi = (cur > g_epDragStart) ? cur : g_epDragStart;
+                            ZeroMemory(&lvi, sizeof(lvi));
+                            lvi.stateMask = LVIS_SELECTED;
+                            if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+                                lvi.state = 0;
+                                SendMessageW(hwnd, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
+                            }
+                            lvi.state = LVIS_SELECTED;
+                            for (i = lo; i <= hi; i++)
+                                SendMessageW(hwnd, LVM_SETITEMSTATE, i, (LPARAM)&lvi);
+                            InvalidateRect(hwnd, NULL, FALSE);
+                        }
+                    }
+                    /* 边界自动滚 */
+                    if (pt.y < rc.top + 20)       SendMessageW(hwnd, LVM_SCROLL, 0, -30);
+                    else if (pt.y > rc.bottom - 20) SendMessageW(hwnd, LVM_SCROLL, 0, 30);
+                }
+            } else {
+                KillTimer(hwnd, 0x4455);
+            }
+            return 0;
+        }
+        break;
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+        g_epDragOn = 0;
+        g_epDragStart = -1;
+        KillTimer(hwnd, 0x4455);
+        break;
+    }
+    return CallWindowProcW(g_oldListEpProc, hwnd, msg, wp, lp);
+}
+
+/* 播客列表拖拽排序：长按拖动整行到新位置（暂未启用，预留给后续实现） */
+#if 0
+static LRESULT CALLBACK ListPodDragProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_LBUTTONDOWN && g_podMode != 2) {
+        DWORD v = (DWORD)SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp);
+        if (!HIWORD(v)) g_podDragIdx = (int)LOWORD(v);
+        SetCapture(hwnd);
+        return CallWindowProcW(g_oldListPodProc, hwnd, msg, wp, lp);
+    }
+    if (msg == WM_LBUTTONUP) {
+        if (g_podDragIdx >= 0) g_podDragIdx = -1;
+        return CallWindowProcW(g_oldListPodProc, hwnd, msg, wp, lp);
+    }
+    if (msg == WM_RBUTTONUP && g_podMode == 2 && g_podDragIdx >= 0) {
+        /* 拖拽中右键释放 = 放下排序 */
+        return 0;
+    }
+    return CallWindowProcW(g_oldListPodProc, hwnd, msg, wp, lp);
+}
+#endif
 
 /* 销毁重建滑块：实测 trackbar 在主题切换后即使 NM_CUSTOMDRAW 正常触发、
  * 绘制代码执行无误，屏幕上仍保留旧亮色外观（comctl v6 显示缓存行为），
@@ -629,7 +745,7 @@ static void ApplyTheme(void)
     HWND ctrls[] = {
         g_sldSeek, g_sldVol, g_stTime, g_stVol, g_stFormat,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
-        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir,
+        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
         g_listPod, g_listEp, g_editDesc, g_vsPod, g_vsEp, g_vsDesc
     };
     int i;
@@ -1209,7 +1325,7 @@ static void ApplyFontsToControls(void)
         g_sldSeek, g_stTime,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_sldVol, g_stVol, g_stFormat,
-        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir,
+        g_btnAdd, g_btnDel, g_btnSort, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
         g_listPod, g_listEp, g_editDesc
     };
     int i;
@@ -2541,6 +2657,120 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     free(job);
     PostMessageW(g_hwnd, WM_APP_EP_READY, 0, (LPARAM)r);
     return 0;
+}
+
+/* ================= 批量缓存（Ctrl+多选后点缓存按钮） ================= */
+typedef struct {
+    wchar_t **urls;   /* 待下载 URL 列表（副本，线程释放） */
+    int       count;
+    int       curIdx;
+    int       okCount;
+} BatchCache;
+
+static BatchCache *g_batch = NULL;   /* UI 线程读写，同一时刻只有一个批量任务 */
+static HANDLE     g_batchThread = NULL;
+
+static DWORD WINAPI BatchDlThread(LPVOID param)
+{
+    BatchCache *bc = (BatchCache*)param;
+    int i;
+    for (i = 0; i < bc->count; i++) {
+        wchar_t cache[MAX_PATH];
+        DWORD len = 0;
+        char *data;
+        FILE *f;
+        int ok = 0;
+
+        CachePathFor(bc->urls[i], cache, MAX_PATH);
+        EnsureCacheDir();
+        if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+            ok = 1;   /* 已缓存，跳过 */
+        } else {
+            data = HttpFetch(bc->urls[i], &len, 0, NULL, NULL);
+            if (data && len > 0) {
+                f = _wfopen(cache, L"wb");
+                if (f) {
+                    ok = (fwrite(data, 1, len, f) == len);
+                    fclose(f);
+                }
+            }
+            free(data);
+        }
+        bc->curIdx = i;
+        if (ok) bc->okCount++;
+        PostMessageW(g_hwnd, WM_APP_BATCH_DONE, (WPARAM)ok, 0);
+    }
+    PostMessageW(g_hwnd, WM_APP_BATCH_FINISH, (WPARAM)bc->okCount, (LPARAM)bc->count);
+    /* 清理 URL 副本（结构体本身由 UI 线程在 FINISH 里释放） */
+    for (i = 0; i < bc->count; i++) free(bc->urls[i]);
+    free(bc->urls);
+    return 0;
+}
+
+/* 启动批量缓存：收集当前选中剧集的 URL，开线程逐集下载 */
+static void StartBatchCache(void)
+{
+    int sel, total = 0, i;
+    int indices[256];
+    Podcast *p;
+    wchar_t st[128];
+
+    if (g_batch) {   /* 已有批量任务在跑 */
+        SetStatusTemp(tr(TR_BATCH_RUNNING));
+        return;
+    }
+    if (g_viewCached || g_curPod < 0 || g_curPod >= g_podCount) return;
+    p = &g_pods[g_curPod];
+
+    /* 收集所有选中行 */
+    sel = -1;
+    while ((sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                     (WPARAM)sel, LVNI_SELECTED)) >= 0) {
+        if (total < 256 && sel < p->epCount && p->eps[sel].url)
+            indices[total++] = sel;
+        if (sel >= p->epCount - 1) break;
+    }
+
+    if (total == 0) {
+        SetStatusTemp(tr(TR_BATCH_NOSEL));
+        return;
+    }
+
+    /* 构建批量上下文 */
+    g_batch = (BatchCache*)calloc(1, sizeof(BatchCache));
+    if (!g_batch) return;
+    g_batch->urls = (wchar_t**)calloc(total, sizeof(wchar_t*));
+    if (!g_batch->urls) { free(g_batch); g_batch = NULL; return; }
+    g_batch->count = total;
+    for (i = 0; i < total; i++) {
+        g_batch->urls[i] = _wcsdup(p->eps[indices[i]].url);
+        if (!g_batch->urls[i]) g_batch->urls[i] = _wcsdup(L"");
+    }
+
+    /* 清除多选，恢复单选外观（下载过程列表只读） */
+    {
+        LVITEMW lvi;
+        ZeroMemory(&lvi, sizeof(lvi));
+        lvi.stateMask = LVIS_SELECTED;
+        lvi.state = 0;
+        SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
+    }
+
+    /* 保存当前 base（如“正在播放：xxx”），批量完成后恢复 */
+    wcsncpy(g_batchSavedBase, g_statusBase, 511);
+    g_batchSavedBase[511] = 0;
+
+    swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), 0, total);
+    SetStatus(st);
+
+    g_batchThread = CreateThread(NULL, 0, BatchDlThread, g_batch, 0, NULL);
+    if (!g_batchThread) {
+        for (i = 0; i < total; i++) free(g_batch->urls[i]);
+        free(g_batch->urls);
+        free(g_batch);
+        g_batch = NULL;
+        SetStatus(tr(TR_DL_THREAD_FAIL));
+    }
 }
 
 /* ================= 音频信息探测 ================= */
@@ -4642,6 +4872,9 @@ static void LayoutControls(HWND hwnd)
         int sbw = DSB_W, sbh = DSB_W;
         MoveWindow(g_listPod, x, by + 28, w1 - sbw, bh - 28, TRUE);
         if (g_vsPod) MoveWindow(g_vsPod, x + w1 - sbw, by + 28, sbw, bh - 28, TRUE);
+        /* 缓存按钮：放在剧集列表正上方右端（播客工具栏同一行），
+         * 紧贴剧集列右侧，不被 ListView 表头覆盖 */
+        MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by, 24, 24, TRUE);
         x += w1 + GAP_W;
         MoveWindow(g_listEp, x, by, w2 - sbw, bh - sbh, TRUE);
         if (g_vsEp) MoveWindow(g_vsEp, x + w2 - sbw, by, sbw, bh - sbh, TRUE);
@@ -4650,13 +4883,19 @@ static void LayoutControls(HWND hwnd)
         MoveWindow(g_editDesc, x, by, w3 - sbw, bh, TRUE);
         if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - sbw, by, sbw, bh, TRUE);
     }
+    /* 缓存按钮压到剧集列表之上（列表创建晚于按钮，z-order 更高；
+     * 配合列表的 WS_CLIPSIBLINGS，列表重绘不会再盖住按钮） */
+    if (g_btnCache)
+        SetWindowPos(g_btnCache, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 /* ================= 方形图标按钮（owner-draw） ================= */
 enum {
     ICO_PREV, ICO_PLAY, ICO_PAUSE, ICO_NEXT, ICO_STOP,
     ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_CROSS, ICO_SORT, ICO_REFRESH,
-    ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_GEAR
+    ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_GEAR,
+    ICO_DOWNLOAD
 };
 
 /* 在按钮矩形内绘制单个矢量图标 */
@@ -4867,6 +5106,21 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
                      (int)(cx2 + 1.5 + 0.5), (int)(cy2 + 1.5 + 0.5));
         break;
     }
+    case ICO_DOWNLOAD: {
+        /* 下载图标：向下的箭头 + 底线 */
+        int mid = x0 + s / 2;
+        int top = y0 + 3, bot = y0 + s - 5;
+        SelectObject(hdc, pen2);
+        MoveToEx(hdc, mid, top, NULL);
+        LineTo(hdc, mid, bot - 2);
+        MoveToEx(hdc, mid - 4, bot - 6, NULL);
+        LineTo(hdc, mid, bot - 2);
+        LineTo(hdc, mid + 4, bot - 6);
+        SelectObject(hdc, pen1);
+        MoveToEx(hdc, x0 + 3, bot, NULL);
+        LineTo(hdc, x0 + s - 3, bot);
+        break;
+    }
     }
 
     SelectObject(hdc, op);
@@ -4918,6 +5172,7 @@ static int IconKindOf(int id, int *on)
                (g_playMode == 2) ? ICO_REPEATONE :
                (g_playMode == 3) ? ICO_PLAYONCE : ICO_ORDER;
     case IDC_BTN_DIR:   return ICO_GEAR;
+    case IDC_BTN_CACHE: return ICO_DOWNLOAD;
     }
     return -1;
 }
@@ -5087,6 +5342,7 @@ static void ApplyLanguage(void)
     UpdateTipText(g_btnRefresh,  tr(TR_TIP_REFRESH));
     UpdateTipText(g_btnPlayMode, PlayModeTipText());
     UpdateTipText(g_btnDir,      tr(TR_TIP_SETTINGS));
+    UpdateTipText(g_btnCache,    tr(TR_TIP_CACHE));
     UpdateThumbbarLanguage();
     UpdateWindowTitle();
 
@@ -5696,16 +5952,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 全部方形图标按钮 */
         {
-            const int ids[12] = {
+            const int ids[13] = {
                 IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
                 IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_SORT, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
-                IDC_BTN_DIR, IDC_BTN_SPEED };
-            HWND *p[12] = {
+                IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE };
+            HWND *p[13] = {
                 &g_btnPrev, &g_btnPlay, &g_btnNext, &g_btnStop, &g_btnMute,
                 &g_btnAdd, &g_btnDel, &g_btnSort, &g_btnRefresh, &g_btnPlayMode,
-                &g_btnDir, &g_btnSpeed };
+                &g_btnDir, &g_btnSpeed, &g_btnCache };
             int bi;
-            for (bi = 0; bi < 12; bi++)
+            for (bi = 0; bi < 13; bi++)
                 *p[bi] = CreateWindowExW(0, L"BUTTON", NULL,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
@@ -5732,10 +5988,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
         /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
-        /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
+        /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序）
+         * WS_CLIPSIBLINGS：重绘时裁掉缓存按钮区域，否则列表会画到按钮上 */
         g_listEp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
+            LVS_REPORT | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
         {
             const wchar_t *colTitles[3] = { tr(TR_COL_TITLE), tr(TR_COL_DATE), tr(TR_COL_DUR) };
@@ -5774,6 +6031,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         /* 内容面板与按钮子类化：Ctrl+滚轮调字号 */
         SubclassForFontWheel(g_listPod);
         SubclassForFontWheel(g_listEp);
+        /* 在 PanelProc 之上再叠一层拖拽多选（USERDATA 已被 PanelProc 占用，
+         * 所以用独立的 g_oldListEpProc 变量保存） */
+        g_oldListEpProc = (WNDPROC)SetWindowLongPtrW(g_listEp, GWLP_WNDPROC,
+            (LONG_PTR)ListEpDragProc);
         SubclassForFontWheel(g_editDesc);
         SubclassForFontWheel(g_btnPrev);
         SubclassForFontWheel(g_btnPlay);
@@ -5786,6 +6047,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnRefresh);
         SubclassForFontWheel(g_btnPlayMode);
         SubclassForFontWheel(g_btnDir);
+        SubclassForFontWheel(g_btnCache);
 
         SetTimer(hwnd, 1, 500, NULL);
 
@@ -5836,6 +6098,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             AddButtonTip(g_btnPlayMode, PlayModeTipText());
             AddButtonTip(g_btnDir,    tr(TR_TIP_SETTINGS));
             AddButtonTip(g_btnSpeed,  tr(TR_TIP_SPEED));
+            AddButtonTip(g_btnCache,   tr(TR_TIP_CACHE));
         }
         /* 剧集列表 tooltip 不用自建：LVS_EX_INFOTIP 让 ListView 在悬停时
          * 自动发 LVN_GETINFOTIPW，由 FillEpisodeTip 回填文本 */
@@ -6270,6 +6533,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
             else if (id == IDC_BTN_DIR) OnSettingsButton();
             else if (id == IDC_BTN_SPEED) CycleSpeed();
+            else if (id == IDC_BTN_CACHE) StartBatchCache();
         }
         return 0;
 
@@ -6542,6 +6806,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ApplySpeed();
         if (g_btnSpeed) InvalidateRect(g_btnSpeed, NULL, TRUE);
         SetStatusTemp(tr(TR_SPEED_SET));
+        return 0;
+    }
+
+    /* 批量缓存：每集下完通知 UI 刷新列表（黄色标记出现） */
+    case WM_APP_BATCH_DONE: {
+        if (g_batch) {
+            wchar_t st[128];
+            int done = g_batch->curIdx + 1;
+            swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), done, g_batch->count);
+            SetStatus(st);
+            InvalidateRect(g_listEp, NULL, TRUE);   /* 缓存标记变色 */
+        }
+        return 0;
+    }
+
+    /* 批量缓存全部完成：先恢复批量前的 base（如“正在播放：xxx”），
+     * 再临时显示结果，到期自动恢复 base */
+    case WM_APP_BATCH_FINISH: {
+        int ok = (int)wParam, total = (int)lParam;
+        wchar_t st[128];
+        SetStatus(g_batchSavedBase);
+        swprintf(st, 128, tr(TR_BATCH_DONE_FMT), ok, total);
+        SetStatusTemp(st);
+        if (g_batchThread) { CloseHandle(g_batchThread); g_batchThread = NULL; }
+        if (g_batch) { free(g_batch); g_batch = NULL; }
+        InvalidateRect(g_listEp, NULL, TRUE);
         return 0;
     }
 
