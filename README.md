@@ -1,7 +1,7 @@
 # LiteTune
 
 一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单个可执行文件（约 170 KB），无需安装、不依赖任何第三方 DLL，删除 exe 即完全卸载（不写注册表、不留任何系统痕迹）。
-
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 ## 功能
 
 - RSS 播客订阅管理（添加 / 删除 / 调整顺序 / 刷新），单实例运行
