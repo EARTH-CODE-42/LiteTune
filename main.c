@@ -174,6 +174,7 @@ static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
 static HWND     g_sldVol, g_stVol, g_stFormat;
 static HWND     g_listPod, g_listEp, g_editDesc;
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
+static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAINT 统一画边框 */
 static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
@@ -777,15 +778,15 @@ static void ApplyTheme(void)
 
 /* 滑块完全自绘（亮/暗两种主题同一种圆角造型，仅配色不同）：
  * 滑槽/已播放部分/蓝色把手；返回 1 表示已处理 */
-static int DrawSliderTrack(LPNMCUSTOMDRAW cd, int isSeek)
+static int DrawSliderTrack(LPNMCUSTOMDRAW cd)
 {
     HDC hdc = cd->hdc;
     HWND sld = cd->hdr.hwndFrom;
-    RECT rc = cd->rc, ch, th;
+    RECT rc = cd->rc, ch, th, tr, pf;
     HBRUSH bg, tb, acb;
     HPEN edge, oldPen_p;
     HGDIOBJ oldPen, oldBr;
-    int rr;
+    int pos, cy;
 
     bg = CreateSolidBrush(ThWinBg());
     FillRect(hdc, &rc, bg);
@@ -794,28 +795,40 @@ static int DrawSliderTrack(LPNMCUSTOMDRAW cd, int isSeek)
     SendMessageW(sld, TBM_GETCHANNELRECT, 0, (LPARAM)&ch);
     SendMessageW(sld, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
 
+    /* 统一滑槽：以滑道垂直中心固定 4px 高，不依赖控件内部 channel 高度
+     * （channel 过薄时圆角矩形会退化成虚线） */
+    cy = (ch.top + ch.bottom) / 2;
+    tr.left = ch.left; tr.right = ch.right;
+    tr.top = cy - 2; tr.bottom = cy + 2;
+
     oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    /* 滑槽（圆角） */
     tb = CreateSolidBrush(ThTrack());
     oldBr = SelectObject(hdc, tb);
-    rr = (ch.bottom - ch.top) / 2;
-    if (rr < 2) rr = 2;
-    RoundRect(hdc, ch.left, ch.top, ch.right, ch.bottom, rr, rr);
+    RoundRect(hdc, tr.left, tr.top, tr.right, tr.bottom, 4, 4);
 
-    /* 进度滑块：已播放部分填充主色 */
-    if (isSeek) {
-        int pos = (int)SendMessageW(sld, TBM_GETPOS, 0, 0);
-        RECT pf = ch;
-        pf.left += 3; pf.top += 3; pf.bottom -= 3;
-        pf.right = ch.left + 3 +
-            (int)((long)(ch.right - ch.left - 6) * pos / 1000);
-        acb = CreateSolidBrush(ThAccent());
-        SelectObject(hdc, acb);
-        FillRect(hdc, &pf, acb);
-        DeleteObject(acb);
+    /* 已播放部分：主题色圆角填充（进度、音量统一；量程用 TBM_GETRANGE，
+     * 进度条 0-1000、音量条 0-100 都正确） */
+    {
+        int mn = 0, mx = 0, span;
+        pos = (int)SendMessageW(sld, TBM_GETPOS, 0, 0);
+        mn = (int)SendMessageW(sld, TBM_GETRANGEMIN, 0, 0);
+        mx = (int)SendMessageW(sld, TBM_GETRANGEMAX, 0, 0);
+        span = mx - mn;
+        if (span > 0 && pos > mn) {
+            pf = tr;
+            pf.right = tr.left + (int)((long)(tr.right - tr.left) * (pos - mn) / span);
+            if (pf.right > pf.left + 4) {
+                acb = CreateSolidBrush(ThAccent());
+                SelectObject(hdc, acb);
+                RoundRect(hdc, pf.left, pf.top, pf.right, pf.bottom, 4, 4);
+                DeleteObject(acb);
+            }
+        }
     }
+    SelectObject(hdc, oldBr);
+    DeleteObject(tb);
 
-    /* 把手：蓝色圆角块 + 浅边，保证在蓝色进度上也能看清 */
+    /* 把手：主题色圆角块 + 浅边，保证在蓝色进度上也能看清 */
     acb = CreateSolidBrush(ThAccent());
     SelectObject(hdc, acb);
     edge = CreatePen(PS_SOLID, 1, RGB(235, 240, 248));
@@ -825,8 +838,6 @@ static int DrawSliderTrack(LPNMCUSTOMDRAW cd, int isSeek)
     DeleteObject(edge);
     DeleteObject(acb);
 
-    SelectObject(hdc, oldBr);
-    DeleteObject(tb);
     SelectObject(hdc, oldPen);
     return 1;
 }
@@ -4724,6 +4735,20 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MAKEWPARAM(isVol ? TB_THUMBTRACK : TB_ENDTRACK, pos), (LPARAM)hwnd);
         return 0;
     }
+    /* 自绘填充横跨 0..pos，而 trackbar 在位置变化时只重绘把手附近条带，
+     * 会导致填充区残缺（拖快了出现断条）。凡位置可能变化的消息都全量失效：
+     * TBM_SETPOS 覆盖定时器/远程/停止等程序性更新；
+     * 拖动（capture 中）的 mousemove 覆盖用户拖拽。 */
+    if (msg == TBM_SETPOS) {
+        LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return lr;
+    }
+    if (msg == WM_MOUSEMOVE && GetCapture() == hwnd) {
+        LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return lr;
+    }
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
 
@@ -5029,18 +5054,25 @@ static void LayoutControls(HWND hwnd)
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
     {
         int sbw = DSB_W, sbh = DSB_W;
-        MoveWindow(g_listPod, x, by + 28, w1 - sbw, bh - 28, TRUE);
-        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - sbw, by + 28, sbw, bh - 28, TRUE);
-        /* 缓存按钮：放在剧集列表正上方右端（播客工具栏同一行），
-         * 紧贴剧集列右侧，不被 ListView 表头覆盖 */
-        MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by, 24, 24, TRUE);
+        /* 面板边框由父窗口 WM_PAINT 统一绘制，控件一律在面板内缩 2px，
+         * 滚条带收进边框内（亮/暗主题同一套边框，不再依赖控件自身样式） */
+        g_rcPanel[0].left = x;           g_rcPanel[0].top = by + 28;
+        g_rcPanel[0].right = x + w1;     g_rcPanel[0].bottom = by + bh;
+        MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
+        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
+        /* 缓存按钮：剧集面板内右上、竖向滚条带左侧，边框内侧 */
+        MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by + 2, 24, 24, TRUE);
         x += w1 + GAP_W;
-        MoveWindow(g_listEp, x, by, w2 - sbw, bh - sbh, TRUE);
-        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - sbw, by, sbw, bh - sbh, TRUE);
-        if (g_hsEp) MoveWindow(g_hsEp, x, by + bh - sbh, w2 - sbw, sbh, TRUE);
+        g_rcPanel[1].left = x;           g_rcPanel[1].top = by;
+        g_rcPanel[1].right = x + w2;     g_rcPanel[1].bottom = by + bh;
+        MoveWindow(g_listEp, x + 2, by + 2, w2 - sbw - 4, bh - sbh - 4, TRUE);
+        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 2, sbw, bh - sbh - 4, TRUE);
+        if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
         x += w2 + GAP_W;
-        MoveWindow(g_editDesc, x, by, w3 - sbw, bh, TRUE);
-        if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - sbw, by, sbw, bh, TRUE);
+        g_rcPanel[2].left = x;           g_rcPanel[2].top = by;
+        g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
+        MoveWindow(g_editDesc, x + 2, by + 2, w3 - sbw - 4, bh - 4, TRUE);
+        if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, by + 2, sbw, bh - 4, TRUE);
     }
     /* 缓存按钮压到剧集列表之上（列表创建晚于按钮，z-order 更高；
      * 配合列表的 WS_CLIPSIBLINGS，列表重绘不会再盖住按钮） */
@@ -6140,14 +6172,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
             0,0,0,0, hwnd, (HMENU)IDC_ST_FORMAT, NULL, NULL);
 
-        g_listPod = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+        g_listPod = CreateWindowExW(0, L"LISTBOX", NULL,
             lbStyle | LBS_OWNERDRAWFIXED,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
         /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
         /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序）
          * WS_CLIPSIBLINGS：重绘时裁掉缓存按钮区域，否则列表会画到按钮上 */
-        g_listEp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, NULL,
+        g_listEp = CreateWindowExW(0, WC_LISTVIEWW, NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
             LVS_REPORT | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
@@ -6169,7 +6201,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(g_listEp, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
         }
 
-        g_editDesc = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL,
+        g_editDesc = CreateWindowExW(0, L"EDIT", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
@@ -6549,6 +6581,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         /* 顶部播放区：与下方三个区域同款凹陷边框 */
         DrawEdge(hdc, &r, EDGE_SUNKEN, BF_RECT);
 
+        /* 下方三面板边框：与顶部同款（布局几何由 LayoutControls 写入 g_rcPanel） */
+        {
+            int pi;
+            for (pi = 0; pi < 3; pi++) {
+                RECT b = g_rcPanel[pi];
+                if (b.right <= b.left || b.bottom <= b.top) continue;
+                DrawEdge(hdc, &b, EDGE_SUNKEN, BF_RECT);
+            }
+        }
+
         /* 第一行状态文本：超长时跑马灯循环，用双缓冲避免闪烁 */
         {
             RECT sr;
@@ -6693,7 +6735,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             nm->code == NM_CUSTOMDRAW) {
             LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)lParam;
             if (cd->dwDrawStage == CDDS_PREPAINT &&
-                DrawSliderTrack(cd, nm->idFrom == IDC_SLD_SEEK))
+                DrawSliderTrack(cd))
                 return CDRF_SKIPDEFAULT;
             return CDRF_DODEFAULT;
         }
