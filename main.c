@@ -1,4 +1,4 @@
-/*
+﻿/*
  * LiteTune - 纯 C / Win32 播客播放器
  *
  * 功能：
@@ -307,6 +307,7 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 /* 批量缓存：Ctrl+多选剧集后点缓存按钮，独立线程逐集下载（不打断播放） */
 #define WM_APP_BATCH_DONE    (WM_APP + 13) /* wParam=ok(0/1) */
 #define WM_APP_BATCH_FINISH  (WM_APP + 14) /* wParam=成功数, lParam=总数 */
+#define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
 enum {
@@ -350,6 +351,7 @@ enum {
     TR_TRAY_SHOW, TR_TRAY_EXIT,
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
     TR_BATCH_DONE_CAP,
+    TR_LOADING_PROG,
     TR_N
 };
 
@@ -364,7 +366,7 @@ static const wchar_t *tr(int id)
         L"离线播放本地音频",
         L"音频", L"单声", L"立体", L"多声",
         L"无法打开音频文件", L"正在加载订阅...", L"准备音频...", L"下载线程创建失败",
-        L"正在播放（离线）：%s", L"正在播放：%s",
+        L"正在播放（离线）：%ls", L"正在播放：%ls",
         L"已停止", L"播放完毕", L"播放出错",
         L"下载音频中... %d%%", L"音频已失效", L"音频下载失败",
         L"无法开始播放：未找到可用的音频输出设备",
@@ -372,7 +374,7 @@ static const wchar_t *tr(int id)
         L"还没有订阅，点左下角「+」按钮添加 RSS 播客",
         L"标题", L"描述", L"作者", L"语言", L"主页",
         L"版权", L"订阅地址", L"发布", L"本地文件", L"链接",
-        L"\r\n播客：%s", L"\r\n发布：%s", L"\r\n时长：%s",
+        L"\r\n播客：%ls", L"\r\n发布：%ls", L"\r\n时长：%ls",
         L"【已缓存】\r\n本地缓存音频共 %d 个，无需联网即可播放。\r\n\r\n"
             L"缓存内容来自各播客已播放（自动下载）的音频；更改缓存目录请用右上角设置按钮。",
         L"添加播客订阅",
@@ -387,7 +389,7 @@ static const wchar_t *tr(int id)
         L"输入多少分钟后关机（1-600）：",
         L"请输入 1 到 600 之间的整数分钟",
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
-        L"切换字号（当前：%s）", L"小", L"中", L"大",
+        L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
         L"LiteTune  版本 1.0\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
@@ -417,7 +419,8 @@ static const wchar_t *tr(int id)
         L"批量缓存（Ctrl+点选剧集后点击）",
         L"批量缓存 %d/%d…", L"批量缓存完成（成功 %d/%d 集）",
         L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中",
-        L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）"
+        L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）",
+        L"正在加载订阅 %d/%d ..."
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -430,7 +433,7 @@ static const wchar_t *tr(int id)
         L"Audio", L"Mono", L"Stereo", L"Multi",
         L"Cannot open audio file", L"Loading feeds...", L"Preparing audio...",
         L"Failed to start download thread",
-        L"Playing (offline): %s", L"Playing: %s",
+        L"Playing (offline): %ls", L"Playing: %ls",
         L"Stopped", L"Playback finished", L"Playback error",
         L"Downloading audio... %d%%", L"Audio is no longer available",
         L"Audio download failed",
@@ -439,7 +442,7 @@ static const wchar_t *tr(int id)
         L"No subscriptions yet. Click the \"+\" button at bottom-left to add an RSS feed",
         L"Title", L"Description", L"Author", L"Language", L"Homepage",
         L"Copyright", L"Feed URL", L"Published", L"Local file", L"URL",
-        L"\r\nPodcast: %s", L"\r\nPublished: %s", L"\r\nDuration: %s",
+        L"\r\nPodcast: %ls", L"\r\nPublished: %ls", L"\r\nDuration: %ls",
         L"[Cached]\r\n%d local audio file(s), playable without a network.\r\n\r\n"
             L"Audio is cached automatically when played. Use the Settings button "
             L"at the top-right to change the cache folder.",
@@ -455,7 +458,7 @@ static const wchar_t *tr(int id)
         L"Shut down in how many minutes (1-600)?",
         L"Please enter a whole number between 1 and 600",
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
-        L"Font Size (Current: %s)", L"Small", L"Medium", L"Large",
+        L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
         L"LiteTune  version 1.0\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
@@ -491,7 +494,8 @@ static const wchar_t *tr(int id)
         L"Batch cache (Ctrl+click episodes, then click)",
         L"Batch caching %d/%d...", L"Batch cache done (%d/%d ok)",
         L"Select episodes first (Ctrl+click)", L"Batch cache in progress",
-        L"Batch cache done (%d/%d ok, rest over limit skipped)"
+        L"Batch cache done (%d/%d ok, rest over limit skipped)",
+        L"Loading feeds %d/%d ..."
     };
     return (g_lang ? en : zh)[id];
 }
@@ -537,7 +541,7 @@ static void UpdateWindowTitle(void)
         if (left < 0) left = 0;
         swprintf(t, 160, tr(TR_SHUTDOWN_TITLE), left / 60, left % 60);
     } else if (g_playState != 0 && g_nowTitle[0]) {
-        swprintf(t, 160, L"LiteTune - %s", g_nowTitle);
+        swprintf(t, 160, L"LiteTune - %ls", g_nowTitle);
     } else {
         wcscpy_s(t, 160, L"LiteTune");
     }
@@ -1981,7 +1985,7 @@ static void CacheDir(wchar_t *out, int outMax)
         /* 默认放系统临时文件夹，删除程序后缓存由 Windows 自动清理 */
         wchar_t tmp[MAX_PATH];
         if (GetTempPathW(MAX_PATH, tmp) > 0) {
-            swprintf(out, outMax, L"%sLiteTune", tmp);
+            swprintf(out, outMax, L"%lsLiteTune", tmp);
         } else {
             ExeDir(out, outMax);
             wcscat_s(out, outMax, L"cache");
@@ -2000,7 +2004,7 @@ static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
     wchar_t dir[MAX_PATH];
     while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
     CacheDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%s%08lx.mp3", dir, h);
+    swprintf(out, outMax, L"%ls%08lx.mp3", dir, h);
 }
 
 static void EnsureCacheDir(void)
@@ -2044,7 +2048,7 @@ static void LoadCachePodcast(void)
     g_cachePod.author = _wcsdup(tr(TR_CACHE_SUBTITLE));
 
     CacheDir(dir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
+    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
     hFind = FindFirstFileW(pat, &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
@@ -2066,7 +2070,7 @@ static void LoadCachePodcast(void)
         e->localFile = 1;
         e->origIdx = g_cachePod.epCount;
 
-        swprintf(mp, MAX_PATH, L"%s%s", dir, fd.cFileName);
+        swprintf(mp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
         e->url = _wcsdup(mp);
 
         /* 默认标题：去掉扩展名的文件名（哈希名），再从 mp3 元数据覆盖 */
@@ -2223,6 +2227,57 @@ static void LastEpFreeAll(void)
     for (i = 0; i < g_lastEpCount; i++) free(g_lastEps[i].epUrl);
     free(g_lastEps);
     g_lastEps = NULL; g_lastEpCount = 0; g_lastEpCap = 0;
+}
+
+/* ================= 订阅 XML / 封面缓存（cache\feed_*.xml、cover_*.img） ================= */
+
+/* 文件名 = 前缀 + URL 哈希 + 扩展名，跨启动稳定 */
+static void UrlCachePath(const char *url, const wchar_t *prefix,
+                         const wchar_t *ext, wchar_t *out, int outMax)
+{
+    wchar_t dir[MAX_PATH];
+    CacheDir(dir, MAX_PATH);
+    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, LastEpHash(url), ext);
+}
+
+/* 读取缓存文件到 malloc 缓冲（附带结尾 0），失败返回 NULL */
+static char* ReadUrlCache(const char *url, const wchar_t *prefix,
+                          const wchar_t *ext, DWORD *outLen)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    long sz;
+    char *buf;
+
+    UrlCachePath(url, prefix, ext, path, MAX_PATH);
+    f = _wfopen(path, L"rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 16 * 1024 * 1024) { fclose(f); return NULL; }
+    buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    buf[sz] = 0;
+    *outLen = (DWORD)sz;
+    return buf;
+}
+
+static void WriteUrlCache(const char *url, const wchar_t *prefix,
+                          const wchar_t *ext, const char *data, DWORD len)
+{
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    if (!data || len == 0) return;
+    UrlCachePath(url, prefix, ext, path, MAX_PATH);
+    f = _wfopen(path, L"wb");
+    if (!f) return;
+    fwrite(data, 1, len, f);
+    fclose(f);
 }
 
 static void ParseSortValue(const char *v)
@@ -2403,7 +2458,7 @@ static void SaveConfig(void)
         long long pos = PlayerGet100ns(0);
         char *u8;
         if (pos < 0) pos = 0;
-        fprintf(f, "resume=%lld\n", pos / 10000000LL);
+        fprintf(f, "resume=%d\n", (int)(pos / 10000000LL));
         u8 = WToU8(g_playUrl);
         if (u8) { fprintf(f, "resumeurl=%s\n", u8); free(u8); }
         /* 退出时刻把当前剧集精确写入每播客标记（订阅视图才记） */
@@ -2419,8 +2474,8 @@ static void SaveConfig(void)
             if (g_lastEps[li].epUrl && g_lastEps[li].hash != 0) {
                 char *u8 = WToU8(g_lastEps[li].epUrl);
                 if (u8) {
-                    fprintf(f, "lastep=%x,%lld,%s\n",
-                            g_lastEps[li].hash, g_lastEps[li].sec, u8);
+                    fprintf(f, "lastep=%x,%d,%s\n",
+                            g_lastEps[li].hash, (int)g_lastEps[li].sec, u8);
                     free(u8);
                 }
             }
@@ -2468,29 +2523,18 @@ static void SortPodcast(Podcast *p)
     qsort(p->eps, p->epCount, sizeof(Episode), EpCmp);
 }
 
-/* 下载封面图并解码为 HBITMAP（保留原始分辨率，列表/提示窗按需缩放，不写磁盘） */
-static void FreePodcast(Podcast *p);   /* 定义在 UI 段，加载线程失败时也要用 */
-
-static HBITMAP LoadCoverImage(const char *url)
+/* 内存图像数据解码为 HBITMAP（保留原始分辨率，列表/提示窗按需缩放） */
+static HBITMAP DecodeImageMem(const char *data, DWORD len)
 {
-    wchar_t *wurl = U8ToW(url);
-    DWORD len = 0;
-    char *data;
-    HBITMAP hbmp = NULL;
     HGLOBAL hMem;
     IStream *stm;
     GpBitmap *bmp = NULL;
-
-    if (!wurl) return NULL;
-    data = HttpFetch(wurl, &len, 0, NULL, NULL);
-    free(wurl);
-    if (!data || len == 0) { free(data); return NULL; }
+    HBITMAP hbmp = NULL;
 
     hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-    if (!hMem) { free(data); return NULL; }
+    if (!hMem) return NULL;
     memcpy(GlobalLock(hMem), data, len);
     GlobalUnlock(hMem);
-    free(data);
 
     if (CreateStreamOnHGlobal(hMem, TRUE, &stm) != S_OK) { GlobalFree(hMem); return NULL; }
     if (GdipCreateBitmapFromStream(stm, &bmp) == 0 && bmp) {
@@ -2502,23 +2546,63 @@ static HBITMAP LoadCoverImage(const char *url)
     return hbmp;
 }
 
+static void FreePodcast(Podcast *p);   /* 定义在 UI 段，加载线程失败时也要用 */
+
+/* 加载封面图并解码为 HBITMAP；按封面 URL 缓存到 cache\cover_*.img，
+ * 二次启动零网络直接从文件解码 */
+static HBITMAP LoadCoverImage(const char *url)
+{
+    DWORD len = 0;
+    char *data;
+    HBITMAP hbmp = NULL;
+
+    if (!url) return NULL;
+    data = ReadUrlCache(url, L"cover_", L"img", &len);
+    if (!data) {
+        wchar_t *wurl = U8ToW(url);
+        if (!wurl) return NULL;
+        data = HttpFetch(wurl, &len, 0, NULL, NULL);
+        free(wurl);
+        if (data && len > 0) WriteUrlCache(url, L"cover_", L"img", data, len);
+    }
+    if (data && len > 0) hbmp = DecodeImageMem(data, len);
+    free(data);
+    return hbmp;
+}
+
 /* ================= 后台线程：加载 feeds ================= */
-/* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设），失败返回 NULL */
-static Podcast* LoadOneFeed(const char *url)
+/* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设），失败返回 NULL。
+ * netFirst=0 启动模式：缓存命中就不联网，秒开且断网可用；
+ * netFirst=1 刷新模式：强制联网取最新，成功后更新缓存，
+ *            联网失败时回退缓存（断网刷新列表不清空） */
+static Podcast* LoadOneFeed(const char *url, int netFirst)
 {
     wchar_t *wurl;
     DWORD xmlLen = 0;
     char *xml;
+    int fromNet = 0;
     Podcast *pod;
 
-    wurl = U8ToW(url);
-    if (!wurl) return NULL;
-    xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
-    free(wurl);
-    if (!xml) return NULL;
+    xml = netFirst ? NULL : ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
+    if (!xml) {
+        wurl = U8ToW(url);
+        if (wurl) {
+            xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
+            free(wurl);
+        }
+        if (xml) {
+            fromNet = 1;
+        } else if (netFirst) {
+            xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
+            if (!xml) return NULL;
+        } else {
+            return NULL;
+        }
+    }
 
     pod = (Podcast*)calloc(1, sizeof(Podcast));
     if (pod && ParseFeed(xml, pod)) {
+        if (fromNet) WriteUrlCache(url, L"feed_", L"xml", xml, xmlLen);
         SortPodcast(pod);
         pod->feedUrl = _strdup(url);
         if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
@@ -2532,7 +2616,7 @@ static Podcast* LoadOneFeed(const char *url)
 
 /* 加载线程参数：订阅 URL 快照。线程不再读 g_feedUrls，
  * 避免 UI 线程增删订阅（realloc/free）与加载线程竞争 */
-typedef struct { char **urls; int count; } FeedLoadArg;
+typedef struct { char **urls; int count; int netFirst; } FeedLoadArg;
 
 static void FreeFeedLoadArg(FeedLoadArg *a)
 {
@@ -2551,11 +2635,13 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
     int i, loaded = 0;
 
     for (i = 0; i < a->count; i++) {
-        Podcast *pod = LoadOneFeed(a->urls[i]);
+        Podcast *pod = LoadOneFeed(a->urls[i], a->netFirst);
         if (pod) {
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
             loaded++;
         }
+        /* 每条完成（成败都算）上报进度，状态栏显示 已加载/总数 */
+        PostMessageW(g_hwnd, WM_APP_FEED_PROGRESS, i + 1, a->count);
     }
     FreeFeedLoadArg(a);
     PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
@@ -2568,7 +2654,7 @@ typedef struct { char *url; } SingleFeedArg;
 static DWORD WINAPI SingleFeedLoaderThread(LPVOID param)
 {
     SingleFeedArg *a = (SingleFeedArg*)param;
-    Podcast *pod = LoadOneFeed(a->url);
+    Podcast *pod = LoadOneFeed(a->url, 1);   /* 新添加的订阅强制联网取最新 */
     free(a->url);
     free(a);
     if (pod) {
@@ -2842,9 +2928,9 @@ static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax, long long 
         int kbps = avgBps > 0 ? (int)(avgBps * 8 / 1000) : 0;
         const wchar_t *chName = ch == 1 ? tr(TR_MONO) : (ch == 2 ? tr(TR_STEREO) : tr(TR_MULTICH));
         if (kbps > 0)
-            swprintf(out, outMax, L"%s|%dkbps|%uHz|%s", fmtName, kbps, rate, chName);
+            swprintf(out, outMax, L"%ls|%dkbps|%uHz|%ls", fmtName, kbps, rate, chName);
         else
-            swprintf(out, outMax, L"%s|%uHz|%s", fmtName, rate, chName);
+            swprintf(out, outMax, L"%ls|%uHz|%ls", fmtName, rate, chName);
     } else {
         wcscpy_s(out, outMax, fmtName);
     }
@@ -3459,11 +3545,11 @@ static void HttpServeStatus(SOCKET s)
     }
     JsonEscapeU8(title, t8, sizeof(t8));
     n = _snprintf(body, sizeof(body),
-        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%lld,"
+        "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%d,"
         "\"pos\":%d,\"dur\":%d,\"vol\":%d,\"pod\":%d,\"ep\":%d,"
         "\"mode\":%d,\"speed\":%d}",
         t8, g_playState == 1 ? "true" : "false",
-        path[0] ? "true" : "false", shutLeft,
+        path[0] ? "true" : "false", (int)shutLeft,
         g_posSec, g_durSec, g_volume, g_playPod, g_playEp,
         g_playMode, g_speed);
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, n);
@@ -3581,8 +3667,8 @@ static void HttpServeAudio(SOCKET s, const char *req)
                         char h[200];
                         int m = _snprintf(h, sizeof(h),
                             "HTTP/1.1 416 Range Not Satisfiable\r\n"
-                            "Content-Range: bytes */%lld\r\nContent-Length: 0\r\n"
-                            "Connection: close\r\n\r\n", fsize.QuadPart);
+                            "Content-Range: bytes */%d\r\nContent-Length: 0\r\n"
+                            "Connection: close\r\n\r\n", (int)fsize.QuadPart);
                         if (m > 0) SendAll(s, h, m);
                         CloseHandle(hf);
                         return;
@@ -3601,15 +3687,15 @@ static void HttpServeAudio(SOCKET s, const char *req)
         if (partial)
             n = _snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\n"
-                "Accept-Ranges: bytes\r\nContent-Range: bytes %lld-%lld/%lld\r\n"
-                "Content-Length: %lld\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                start.QuadPart, end.QuadPart, fsize.QuadPart, remain);
+                "Accept-Ranges: bytes\r\nContent-Range: bytes %d-%d/%d\r\n"
+                "Content-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                (int)start.QuadPart, (int)end.QuadPart, (int)fsize.QuadPart, (int)remain);
         else
             n = _snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
-                "Accept-Ranges: bytes\r\nContent-Length: %lld\r\n"
+                "Accept-Ranges: bytes\r\nContent-Length: %d\r\n"
                 "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                remain);
+                (int)remain);
         if (n <= 0 || !SendAll(s, hdr, n)) { CloseHandle(hf); return; }
         SetFilePointerEx(hf, start, NULL, FILE_BEGIN);
         {
@@ -3787,7 +3873,7 @@ static int FirewallRuleEnsure(void)
     _snwprintf(params, 900,
         L"/c netsh advfirewall firewall delete rule name=\"LiteTune Phone\" >nul 2>&1 & "
         L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
-        L"dir=in action=allow program=\"%s\" enable=yes profile=any", exe);
+        L"dir=in action=allow program=\"%ls\" enable=yes profile=any", exe);
     ZeroMemory(&sei, sizeof(sei));
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -3945,7 +4031,7 @@ static void BuildEpisodeTipText(wchar_t *buf, int bufMax, int i)
     if (!p || i < 0 || i >= p->epCount) return;
     e = &p->eps[i];
     if (e->title && *e->title)
-        pos += swprintf(buf + pos, bufMax - pos, L"%s", e->title);
+        pos += swprintf(buf + pos, bufMax - pos, L"%ls", e->title);
     if (g_viewCached) {
         if (e->author && *e->author)
             pos += swprintf(buf + pos, bufMax - pos,
@@ -3985,7 +4071,7 @@ static void ShowDetailField(wchar_t *buf, size_t bufSize, size_t *pos,
 {
     if (!value || !*value) return;
     *pos += swprintf(buf + *pos, bufSize - *pos,
-        L"【%s】\r\n%s\r\n\r\n", label, value);
+        L"【%ls】\r\n%ls\r\n\r\n", label, value);
 }
 
 static void ShowPodcastDetail(int idx)
@@ -4329,7 +4415,8 @@ static void FreePodcasts(void)
     g_curPod = g_curEp = -1;
 }
 
-static void ReloadFeeds(void)
+/* netFirst=0 启动加载（缓存优先、秒开）；=1 手动刷新（强制联网取最新） */
+static void ReloadFeeds(int netFirst)
 {
     if (g_feedsLoading) return;
     if (g_downloading) CancelCurrentDownload();   /* 刷新时中止正在进行的下载 */
@@ -4357,6 +4444,7 @@ static void ReloadFeeds(void)
         FeedLoadArg *a = (FeedLoadArg*)calloc(1, sizeof(FeedLoadArg));
         HANDLE th = NULL;
         int i, ok = (a != NULL);
+        if (ok) a->netFirst = netFirst;
         if (ok && g_feedUrlCount > 0) {
             a->urls = (char**)calloc(g_feedUrlCount, sizeof(char*));
             a->count = g_feedUrlCount;
@@ -4421,7 +4509,17 @@ static void RemovePodcast(int i)
         }
     }
 
-    if (g_pods[i].feedUrl) LastEpDrop(LastEpHash(g_pods[i].feedUrl));
+    if (g_pods[i].feedUrl) {
+        /* 顺带清掉该订阅的 RSS/封面缓存（已缓存音频 mp3 保留） */
+        wchar_t cp[MAX_PATH];
+        UrlCachePath(g_pods[i].feedUrl, L"feed_", L"xml", cp, MAX_PATH);
+        DeleteFileW(cp);
+        if (g_pods[i].imageUrl) {
+            UrlCachePath(g_pods[i].imageUrl, L"cover_", L"img", cp, MAX_PATH);
+            DeleteFileW(cp);
+        }
+        LastEpDrop(LastEpHash(g_pods[i].feedUrl));
+    }
     FreePodcast(&g_pods[i]);
     memmove(&g_pods[i], &g_pods[i + 1], (g_podCount - i - 1) * sizeof(Podcast));
     g_podCount--;
@@ -5375,7 +5473,7 @@ static int CountMp3InDir(const wchar_t *dir)
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int n = 0;
-    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
+    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
@@ -5391,13 +5489,13 @@ static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir,
     wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
-    swprintf(pat, MAX_PATH, L"%s*.%s", oldDir, ext);
+    swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, ext);
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        swprintf(src, MAX_PATH, L"%s%s", oldDir, fd.cFileName);
-        swprintf(dst, MAX_PATH, L"%s%s", newDir, fd.cFileName);
+        swprintf(src, MAX_PATH, L"%ls%ls", oldDir, fd.cFileName);
+        swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
         MoveFileW(src, dst);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -5666,7 +5764,7 @@ static void OnSettingsButton(void)
         if (pidl && SHGetPathFromIDListW(pidl, newPath)) {
             int oldHasFiles = CountMp3InDir(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
-            swprintf(newDir, MAX_PATH, L"%s\\", newPath);
+            swprintf(newDir, MAX_PATH, L"%ls\\", newPath);
             /* 新旧相同就不必移动 */
             if (oldHasFiles > 0 &&
                 _wcsicmp(curDir, newDir) != 0) {
@@ -6719,7 +6817,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_MUTE) ToggleMute();
             else if (id == IDC_BTN_ADD) AskAddFeed();
             else if (id == IDC_BTN_DEL) SetPodMode(1);
-            else if (id == IDC_BTN_REFRESH) ReloadFeeds();
+            else if (id == IDC_BTN_REFRESH) ReloadFeeds(1);
             else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
             else if (id == IDC_BTN_DIR) OnSettingsButton();
             else if (id == IDC_BTN_SPEED) CycleSpeed();
@@ -6861,7 +6959,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     int pm = (int)SendMessageW(g_sldSeek, TBM_GETPOS, 0, 0);
                     FmtTime(g_dur100ns / 10000000 * pm / 1000, a, 16);
                     FmtTime(g_dur100ns / 10000000, b, 16);
-                    swprintf(buf, 64, L"%s / %s", a, b);
+                    swprintf(buf, 64, L"%ls / %ls", a, b);
                     SetWindowTextW(g_stTime, buf);
                 }
             } else if (code == TB_ENDTRACK) {
@@ -6921,7 +7019,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 FmtTime(pos / 10000000, a, 16);
                 if (g_dur100ns > 0) FmtTime(g_dur100ns / 10000000, b, 16);
                 else wcscpy_s(b, 16, L"--:--");
-                swprintf(buf, 64, L"%s / %s", a, b);
+                swprintf(buf, 64, L"%ls / %ls", a, b);
                 SetWindowTextW(g_stTime, buf);
                 if (g_dur100ns > 0) {
                     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
@@ -7026,6 +7124,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else     swprintf(st, 128, tr(TR_BATCH_DONE_FMT), ok, total);
         SetStatusTemp(st);
         InvalidateRect(g_listEp, NULL, TRUE);
+        return 0;
+    }
+
+    case WM_APP_FEED_PROGRESS: {
+        /* 订阅加载进度：状态栏显示 已加载/总数，让用户能区分网速慢和卡死 */
+        wchar_t st[128];
+        swprintf(st, 128, tr(TR_LOADING_PROG), (int)wParam, (int)lParam);
+        SetStatus(st);
         return 0;
     }
 
@@ -7407,7 +7513,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         FILETIME ftNow;
         ULARGE_INTEGER ullNow, ullFile;
         CacheDir(cdir, MAX_PATH);
-        swprintf(pat, MAX_PATH, L"%s*.mp3", cdir);
+        swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
         h = FindFirstFileW(pat, &fd);
         if (h != INVALID_HANDLE_VALUE) {
             GetSystemTimeAsFileTime(&ftNow);
@@ -7421,7 +7527,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
                 ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
                 if (ullFile.QuadPart < ullNow.QuadPart) {
                     wchar_t fp[MAX_PATH];
-                    swprintf(fp, MAX_PATH, L"%s%s", cdir, fd.cFileName);
+                    swprintf(fp, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
                     DeleteFileW(fp);
                 }
             } while (FindNextFileW(h, &fd));
@@ -7489,7 +7595,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     UpdateWindow(hwnd);
     SetStatus(tr(TR_READY));   /* 初始状态文本跟随语言（静态初值固定为中文） */
     ApplyTheme();    /* 若 ini 里 dark=1：暗色标题栏/表头/滚动条一次到位 */
-    ReloadFeeds();
+    ReloadFeeds(0);   /* 启动：订阅缓存优先，已下载过就无需重新联网 */
     /* 离线启动时订阅可能加载很慢/失败：先立即挂上“已缓存”行，不等订阅 */
     RefreshCachedEntry();
     if (g_podCount == 0 && g_cacheRowHere) {

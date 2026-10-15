@@ -1,6 +1,6 @@
 # LiteTune
 
-一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单个可执行文件（约 170 KB），无需安装、不依赖任何第三方 DLL，删除 exe 即完全卸载（不写注册表、不留任何系统痕迹）。
+一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），32/64 位 Windows 通用，无需安装、不依赖任何第三方 DLL，删除 exe 即完全卸载（不写注册表、不留任何系统痕迹）。
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 ## 功能
 
@@ -90,18 +90,22 @@ https://example.com/feed2.xml
 
 ## 编译
 
-需要 MinGW-w64（gcc 14 验证通过）：
+主力构建为 **32 位**（Win7–Win11 32/64 位通用）。项目自带便携工具链 `mingw32\`（winlibs i686-msvcrt gcc 15.2.0，msvcrt 运行时为 Win7 原生自带，无需额外 DLL）：
 
-```bash
-windres resource.rc -O coff -o resource.o
-gcc -O2 -s -mwindows -municode -Wall -Wextra -o LiteTune.exe main.c resource.o \
-    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite \
+```powershell
+.\mingw32\bin\windres.exe resource.rc -O coff -o resource32.o
+.\mingw32\bin\gcc.exe -Os -s -mwindows -municode -std=gnu17 -Wall -Wextra `
+    '-D_WIN32_WINNT=0x0601' '-Wl,--subsystem,windows:6.01' `
+    -o LiteTune.exe main.c resource32.o `
+    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite `
     -lole32 -lgdiplus -lws2_32 -liphlpapi -lshell32
 ```
 
+若用其它 MinGW-w64 32 位工具链，同样参数即可（注意选 msvcrt 而非 ucrt 运行时，否则 Win7 上缺 ucrtbase.dll 无法启动）。
+
 ## 系统要求
 
-- Windows 7 及以上
+- Windows 7 及以上（32/64 位通用，单 exe 免安装）
 - 最小窗口尺寸 480×360（客户区）
 - 手机遥控需同一局域网
 
