@@ -1,7 +1,17 @@
 # LiteTune
 
-一个极简、绿色便携的 RSS 播客播放器。纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），32/64 位 Windows 通用，无需安装、不依赖任何第三方 DLL，删除 exe 即完全卸载（不写注册表、不留任何系统痕迹）。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+
+![Platform](https://img.shields.io/badge/platform-Windows%207%20~%2011-0078D6?logo=windows)
+![Size](https://img.shields.io/badge/size-240%20KB-brightgreen)
+![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![License](https://img.shields.io/badge/license-MIT-green)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
+
+![LiteTune 界面：桌面端（暗色主题）与手机遥控网页](screenshot.png)
+
+> 左：桌面端（暗色主题）· 右：手机浏览器打开的「手机出声 / 遥控」网页
+
 ## 功能
 
 - RSS 播客订阅管理（添加 / 删除 / 调整顺序 / 刷新），单实例运行
@@ -49,6 +59,8 @@
 | `feeds.ini` | 配置与订阅源（首次运行自动生成） |
 | 缓存目录 | 已下载音频（文件名 = URL 哈希）、订阅与封面缓存（`feed_*.xml` / `cover_*.img`）。默认存 `%TEMP%\LiteTune\`，Windows 自动清理；手动选择过其它目录则存在 ini 里。删除订阅时自动清理对应的订阅/封面缓存（音频保留） |
 | `resource.rc` / `app.manifest` / `app.ico` | 编译资源（DPI 感知清单、图标） |
+| `screenshot.png` | README 展示用界面截图（桌面端 + 手机网页） |
+| `LICENSE` | MIT 许可证 |
 | `tools\make_ico.ps1` | 图标生成脚本（改图标后运行，再重新编译） |
 
 ## 配置（feeds.ini）
@@ -120,3 +132,7 @@ https://example.com/feed2.xml
 - **代码整理**：多语言字符串表抽取、冗余代码清理、注释与文档更新
 
 程序的整体设计、功能取舍（如 ESC 直接退出、单文件无依赖、默认中文、绿色无痕不写注册表）由作者决定；所有代码均经作者确认。源代码不包含任何遥测、统计或网络数据上报行为（手机遥控仅在本机局域网监听，不连接外部服务器）。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 Lincos
