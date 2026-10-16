@@ -1,4 +1,4 @@
-﻿/*
+/*
  * LiteTune - 纯 C / Win32 播客播放器
  *
  * 功能：
@@ -5516,42 +5516,31 @@ static void SetShutdownTimer(int minutes)
     UpdateWindowTitle();
 }
 
-/* 到点执行关机：先提权 SE_SHUTDOWN_NAME，再走系统关机流程。
- * 主用 InitiateSystemShutdownExW：15 秒系统倒计时、强制关闭应用，
- * 期间可用 shutdown /a 取消；失败再退回 ExitWindowsEx。 */
+/* 到点执行关机：调用系统自带 shutdown.exe（/s 关机 /t 15 倒计时 /f 强制关闭应用）。
+ * 不直接调用 AdjustTokenPrivileges/InitiateSystemShutdownExW/ExitWindowsEx 等
+ * 提权关机 API——这些符号在导入表里与木马特征重合，容易被杀毒软件启发式误报。
+ * shutdown.exe 是系统组件、自带倒计时 UI，15 秒内可运行 shutdown /a 取消。 */
 static void DoSystemShutdown(void)
 {
-    HANDLE tok = NULL;
-    TOKEN_PRIVILEGES tp;
-    int privileged = 0;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[] = L"shutdown.exe /s /t 15 /f /c \"LiteTune 定时关机\"";
 
     g_shutdownAt = 0;
     KillTimer(g_hwnd, 3);
     UpdateWindowTitle();
 
-    ZeroMemory(&tp, sizeof(tp));
-    if (OpenProcessToken(GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
-        if (LookupPrivilegeValueW(NULL, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)) {
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
-            /* ERROR_SUCCESS 才表示特权确实拿到（ERROR_NOT_ALL_ASSIGNED 也算失败） */
-            privileged = (GetLastError() == ERROR_SUCCESS);
-        }
-        CloseHandle(tok);
-    }
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
 
-    if (privileged &&
-        InitiateSystemShutdownExW(NULL, NULL, 15, TRUE, FALSE,
-            SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER)) {
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
         SetStatusTemp(tr(TR_SHUTTING_DOWN));
-        return;
-    }
-    /* 兜底：立即关机（FORCEIFHUNG 只强杀无响应窗口，响应中的程序仍可拦截） */
-    if (!ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCEIFHUNG,
-                       SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER))
+    } else {
         SetStatus(tr(TR_SHUT_DENIED));
+    }
 }
 
 /* 设置按钮（原目录按钮）：缓存目录 3 项 + 夜间模式 + 语言 + 定时关机 + 字号 + 关于 */
