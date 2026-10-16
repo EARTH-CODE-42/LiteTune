@@ -2,10 +2,24 @@
 
 **极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![Platform](https://img.shields.io/badge/platform-Windows%207%20~%2011-0078D6?logo=windows)
-![Size](https://img.shields.io/badge/size-240%20KB-brightgreen)
-![Dependencies](https://img.shields.io/badge/dependencies-none-success)
-![License](https://img.shields.io/badge/license-MIT-green)
+![size](https://img.shields.io/badge/size-240%20KB-brightgreen?style=for-the-badge)
+![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
+![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
+![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![license](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+
+![language](https://img.shields.io/badge/language-pure%20C-00599C?style=for-the-badge&logo=c&logoColor=white)
+![ui](https://img.shields.io/badge/ui-native%20win32-0078D6?style=for-the-badge)
+![audio](https://img.shields.io/badge/audio-media%20foundation-7B2FBE?style=for-the-badge)
+![http](https://img.shields.io/badge/http-winhttp-0F7B6C?style=for-the-badge)
+![compiler](https://img.shields.io/badge/compiler-gcc%2015.2-FA7343?style=for-the-badge)
+
+![feed](https://img.shields.io/badge/feed-rss%20subscribe-E34F26?style=for-the-badge)
+![play](https://img.shields.io/badge/play-offline%20cache-009688?style=for-the-badge)
+![resume](https://img.shields.io/badge/playback-resume-blueviolet?style=for-the-badge)
+![cache](https://img.shields.io/badge/cache-batch%20download-purple?style=for-the-badge)
+![remote](https://img.shields.io/badge/control-phone%20web-red?style=for-the-badge)
+
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 
 ![LiteTune 界面：桌面端（暗色主题）与手机遥控网页](screenshot.png)
