@@ -350,7 +350,7 @@ enum {
     TR_SPEED_SET,
     TR_TRAY_SHOW, TR_TRAY_EXIT,
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
-    TR_BATCH_DONE_CAP,
+    TR_BATCH_DONE_CAP, TR_BATCH_CANCELLED, TR_BATCH_STOPPING,
     TR_LOADING_PROG,
     TR_N
 };
@@ -420,6 +420,7 @@ static const wchar_t *tr(int id)
         L"批量缓存 %d/%d…", L"批量缓存完成（成功 %d/%d 集）",
         L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中",
         L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）",
+        L"已取消批量下载", L"正在停止批量下载…",
         L"正在加载订阅 %d/%d ..."
     };
     static const wchar_t *const en[TR_N] = {
@@ -495,6 +496,7 @@ static const wchar_t *tr(int id)
         L"Batch caching %d/%d...", L"Batch cache done (%d/%d ok)",
         L"Select episodes first (Ctrl+click)", L"Batch cache in progress",
         L"Batch cache done (%d/%d ok, rest over limit skipped)",
+        L"Batch cache cancelled", L"Stopping batch cache…",
         L"Loading feeds %d/%d ..."
     };
     return (g_lang ? en : zh)[id];
@@ -528,6 +530,7 @@ static COLORREF ThDim(void)     { return g_darkMode ? RGB(160,160,168): RGB(120,
 static COLORREF ThGreen(void)   { return g_darkMode ? RGB(90,210,130) : RGB(0,130,60); }
 static COLORREF ThGreenBg(void) { return g_darkMode ? RGB(28,56,38)   : RGB(222,244,228); }
 static COLORREF ThYellow(void)  { return g_darkMode ? RGB(226,186,70) : RGB(190,155,0); }
+static COLORREF ThBlue(void)    { return g_darkMode ? RGB(96,175,255)  : RGB(0,95,190);  }  /* 批量下载队列 */
 static COLORREF ThTrack(void)   { return g_darkMode ? RGB(58,58,64)   : RGB(229,229,232); }  /* 滑块滑槽 */
 static COLORREF ThAccent(void)  { return RGB(0,120,215);  }                                 /* 进度/滑块把手主色 */
 
@@ -1974,8 +1977,9 @@ static int ParseFeed(const char *xml, Podcast *pod)
 }
 
 /* ================= 缓存 ================= */
-/* 返回当前缓存目录（末尾带反斜杠）；未设置时默认程序目录下 cache */
-/* 缓存目录：默认 %TEMP%\LiteTune\（系统自动清理）；用户手动选择过则存在 ini 里 */
+/* 返回当前缓存目录（末尾带反斜杠）。
+ * 默认 %TEMP%\LiteTune\（系统可自动清理，删除程序不留垃圾）；
+ * 用户手动选择过则存在 ini 里的 g_cacheDir；GetTempPath 失败才退回 exe\cache */
 static void CacheDir(wchar_t *out, int outMax)
 {
     if (g_cacheDir[0]) {
@@ -2688,6 +2692,48 @@ static void AddSingleFeed(const char *url)
     }
 }
 
+/* ============ 下载目标互斥锁（单集播放下载 × 批量下载） ============ */
+/* 两个下载通道互相独立，但可能指向同一个缓存文件；同一文件同一时刻只许一个
+ * 线程写，后来者等待并在拿到锁后双检文件（对方可能已写完）。 */
+static CRITICAL_SECTION g_dlCs;
+#define DL_PATH_SLOTS 4   /* 实际并发最多 2（1 个播放下载 + 1 个批量线程） */
+static wchar_t *g_dlPaths[DL_PATH_SLOTS];
+
+/* 1=获得该路径的写权（用完必须 DlPathRelease）；0=已有线程在写（应等待） */
+static int DlPathTryAcquire(const wchar_t *path)
+{
+    int i, busy = 0, got = 0;
+    EnterCriticalSection(&g_dlCs);
+    for (i = 0; i < DL_PATH_SLOTS; i++) {
+        if (g_dlPaths[i] && wcscmp(g_dlPaths[i], path) == 0) { busy = 1; break; }
+    }
+    if (!busy) {
+        for (i = 0; i < DL_PATH_SLOTS; i++) {
+            if (!g_dlPaths[i]) {
+                g_dlPaths[i] = _wcsdup(path);
+                if (g_dlPaths[i]) got = 1;
+                break;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_dlCs);
+    return got;
+}
+
+static void DlPathRelease(const wchar_t *path)
+{
+    int i;
+    EnterCriticalSection(&g_dlCs);
+    for (i = 0; i < DL_PATH_SLOTS; i++) {
+        if (g_dlPaths[i] && wcscmp(g_dlPaths[i], path) == 0) {
+            free(g_dlPaths[i]);
+            g_dlPaths[i] = NULL;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_dlCs);
+}
+
 /* ================= 后台线程：下载音频 ================= */
 typedef struct {
     int pod;
@@ -2745,15 +2791,34 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
         if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
             r->ok = 1;  /* 已缓存 */
         } else {
-            data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS, &job->reqSlot, &job->gen);
-            if (data && len > 0) {
-                f = _wfopen(cache, L"wb");
-                if (f) {
-                    r->ok = (fwrite(data, 1, len, f) == len);
-                    fclose(f);
-                }
+            /* 批量线程可能正在写同一文件：等锁；等待期间被切歌/停止（gen 作废）
+             * 就直接放弃，不做无意义下载。gotLock 与 gen 分开判定，保证
+             * 拿到的锁一定释放，即使 gen 在拿到锁的瞬间作废 */
+            int gotLock = 0;
+            while (!gotLock) {
+                if (InterlockedCompareExchange(&g_dlGen, 0, 0) != job->gen) break;
+                if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
+                Sleep(300);
             }
-            free(data);
+            if (gotLock) {
+                if (InterlockedCompareExchange(&g_dlGen, 0, 0) == job->gen) {
+                    if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+                        r->ok = 1;  /* 对方刚写完，直接可用 */
+                    } else {
+                        data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS,
+                                         &job->reqSlot, &job->gen);
+                        if (data && len > 0) {
+                            f = _wfopen(cache, L"wb");
+                            if (f) {
+                                r->ok = (fwrite(data, 1, len, f) == len);
+                                fclose(f);
+                            }
+                        }
+                        free(data);
+                    }
+                }
+                DlPathRelease(cache);
+            }
         }
     }
     free(job);
@@ -2762,66 +2827,131 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
 }
 
 /* ================= 批量缓存（Ctrl+多选后点缓存按钮） ================= */
+/* 一个常驻工作线程 + 条件变量队列：队列空了线程休眠，UI 追加 URL 即唤醒；
+ * 点停止则 cancel + 关闭当前 HTTP 请求，线程退出，UI 在 FINISH 里回收。
+ * 自然下完时结构保留（线程休眠），可继续追加新批次。 */
 typedef struct {
-    wchar_t **urls;   /* 待下载 URL 列表（副本，线程释放） */
-    int       count;
-    int       curIdx;
-    int       okCount;
-    int       truncated;   /* 选中数超过 256 上限时置 1，完成时提示 */
+    CRITICAL_SECTION    cs;
+    CONDITION_VARIABLE  cv;
+    HANDLE              thread;      /* NULL=线程未启动/已回收 */
+    wchar_t           **urls;        /* 动态数组，UI 线程 realloc 追加 */
+    int                 cap, count, head;   /* head=已取出数，只增不减 */
+    int                 okCount;
+    int                 truncated;   /* 选中数超过 256 上限时置 1 */
+    volatile LONG       cancel;      /* 1=停止：中断当前下载并丢弃剩余队列 */
+    void * volatile     reqSlot;     /* 当前 HttpFetch 请求句柄，关闭即中止 */
 } BatchCache;
 
-static BatchCache *g_batch = NULL;   /* UI 线程读写，同一时刻只有一个批量任务 */
-static HANDLE     g_batchThread = NULL;
+static BatchCache *g_batch = NULL;   /* 生命周期由 UI 线程管理 */
 
 static DWORD WINAPI BatchDlThread(LPVOID param)
 {
     BatchCache *bc = (BatchCache*)param;
-    int i;
-    for (i = 0; i < bc->count; i++) {
+    for (;;) {
+        wchar_t *url;
         wchar_t cache[MAX_PATH];
         DWORD len = 0;
-        char *data;
+        char *data = NULL;
         FILE *f;
         int ok = 0;
 
-        CachePathFor(bc->urls[i], cache, MAX_PATH);
-        EnsureCacheDir();
-        if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
-            ok = 1;   /* 已缓存，跳过 */
-        } else {
-            data = HttpFetch(bc->urls[i], &len, 0, NULL, NULL);
-            if (data && len > 0) {
-                f = _wfopen(cache, L"wb");
-                if (f) {
-                    ok = (fwrite(data, 1, len, f) == len);
-                    fclose(f);
+        EnterCriticalSection(&bc->cs);
+        while (bc->head >= bc->count && !bc->cancel)
+            SleepConditionVariableCS(&bc->cv, &bc->cs, INFINITE);
+        if (bc->cancel) {
+            LeaveCriticalSection(&bc->cs);
+            break;
+        }
+        url = bc->urls[bc->head++];
+        LeaveCriticalSection(&bc->cs);
+
+        if (url && url[0]) {
+            CachePathFor(url, cache, MAX_PATH);
+            EnsureCacheDir();
+            if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+                ok = 1;   /* 已缓存，跳过 */
+            } else {
+                /* 与单集播放下载互斥同一文件；等待锁期间响应取消。
+                 * gotLock 与 cancel 分开判定：拿到的锁必须释放，
+                 * 即使取消信号在拿锁成功的瞬间到达 */
+                {
+                    int gotLock = 0;
+                    while (!gotLock) {
+                        if (bc->cancel) break;
+                        if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
+                        Sleep(300);
+                    }
+                    if (gotLock) {
+                        if (!bc->cancel) {
+                            if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+                                ok = 1;   /* 播放下载刚写完，直接算成功 */
+                            } else {
+                                data = HttpFetch(url, &len, 0, &bc->reqSlot, NULL);
+                                if (data && len > 0) {
+                                    f = _wfopen(cache, L"wb");
+                                    if (f) {
+                                        ok = (fwrite(data, 1, len, f) == len);
+                                        fclose(f);
+                                    }
+                                }
+                                free(data);
+                            }
+                        }
+                        DlPathRelease(cache);
+                    }
                 }
             }
-            free(data);
         }
-        bc->curIdx = i;
+        EnterCriticalSection(&bc->cs);
         if (ok) bc->okCount++;
+        LeaveCriticalSection(&bc->cs);
         PostMessageW(g_hwnd, WM_APP_BATCH_DONE, (WPARAM)ok, 0);
     }
-    PostMessageW(g_hwnd, WM_APP_BATCH_FINISH, (WPARAM)bc->okCount, (LPARAM)bc->count);
-    /* 清理 URL 副本（结构体本身由 UI 线程在 FINISH 里释放） */
-    for (i = 0; i < bc->count; i++) free(bc->urls[i]);
-    free(bc->urls);
+    /* 仅取消时到达；结构体由 UI 线程在 FINISH 中等待本线程后释放 */
+    PostMessageW(g_hwnd, WM_APP_BATCH_FINISH, 0, 0);
     return 0;
 }
 
-/* 启动批量缓存：收集当前选中剧集的 URL，开线程逐集下载 */
+/* 停止整个批量队列：立即中断当前 HTTP，剩余 URL 全部丢弃 */
+static void CancelBatchCache(void)
+{
+    BatchCache *bc = g_batch;
+    HINTERNET h;
+    if (!bc || InterlockedCompareExchange(&bc->cancel, 0, 0)) return;
+    InterlockedExchange(&bc->cancel, 1);
+    h = (HINTERNET)InterlockedExchangePointer((PVOID volatile*)&bc->reqSlot, NULL);
+    if (h) WinHttpCloseHandle(h);
+    WakeAllConditionVariable(&bc->cv);
+}
+
+/* UI 线程回收：cancel 后工作线程很快退出，等它结束再释放全部资源。
+ * FINISH 消息处理和程序退出（消息泵已停、FINISH 不会到达）共用。 */
+static void BatchReleaseAfterFinish(void)
+{
+    BatchCache *bc = g_batch;
+    int bi;
+    if (!bc) return;
+    if (bc->thread) {
+        WaitForSingleObject(bc->thread, 10000);
+        CloseHandle(bc->thread);
+    }
+    for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
+    free(bc->urls);
+    DeleteCriticalSection(&bc->cs);
+    free(bc);
+    g_batch = NULL;
+}
+
+/* 启动或追加批量缓存：收集当前选中剧集的 URL，去重去已缓存后入队 */
 static void StartBatchCache(void)
 {
-    int sel, total = 0, i, truncated = 0;
+    int sel, total = 0, i, truncated = 0, addN = 0;
     int indices[256];
     Podcast *p;
+    BatchCache *bc;
     wchar_t st[128];
+    int needStart;
 
-    if (g_batch) {   /* 已有批量任务在跑 */
-        SetStatusTemp(tr(TR_BATCH_RUNNING));
-        return;
-    }
     if (g_viewCached || g_curPod < 0 || g_curPod >= g_podCount) return;
     p = &g_pods[g_curPod];
 
@@ -2841,16 +2971,77 @@ static void StartBatchCache(void)
         return;
     }
 
-    /* 构建批量上下文 */
-    g_batch = (BatchCache*)calloc(1, sizeof(BatchCache));
-    if (!g_batch) return;
-    g_batch->urls = (wchar_t**)calloc(total, sizeof(wchar_t*));
-    if (!g_batch->urls) { free(g_batch); g_batch = NULL; return; }
-    g_batch->count = total;
-    g_batch->truncated = truncated;
+    bc = g_batch;
+    if (bc && InterlockedCompareExchange(&bc->cancel, 0, 0)) {
+        /* 停止信号已发、FINISH 尚未处理的毫秒级窗口：稍候再试 */
+        SetStatusTemp(tr(TR_BATCH_STOPPING));
+        return;
+    }
+    if (!bc) {
+        /* 首次：创建队列结构（线程在入队完成后再启动） */
+        bc = (BatchCache*)calloc(1, sizeof(BatchCache));
+        if (!bc) return;
+        InitializeCriticalSection(&bc->cs);
+        InitializeConditionVariable(&bc->cv);
+        bc->cap = total + 8;
+        bc->urls = (wchar_t**)calloc((size_t)bc->cap, sizeof(wchar_t*));
+        if (!bc->urls) {
+            DeleteCriticalSection(&bc->cs);
+            free(bc);
+            return;
+        }
+        g_batch = bc;
+    }
+
+    /* 入队：跳过队列已有（去重）和本地已存在的缓存文件 */
+    EnterCriticalSection(&bc->cs);
+    /* 上一批已自然下完、线程睡在 CV 上：清空旧 URL、计数归零，
+     * 使本批进度只统计新选剧集（旧文件仍在盘上，下面双检会跳过）。
+     * 重置后条件 head>=count 仍成立，线程不会因伪唤醒提前行动 */
+    if (bc->thread && bc->head >= bc->count) {
+        for (int j = 0; j < bc->count; j++) free(bc->urls[j]);
+        bc->count = bc->head = bc->okCount = 0;
+        bc->truncated = 0;
+    }
     for (i = 0; i < total; i++) {
-        g_batch->urls[i] = _wcsdup(p->eps[indices[i]].url);
-        if (!g_batch->urls[i]) g_batch->urls[i] = _wcsdup(L"");
+        Episode *e = &p->eps[indices[i]];
+        wchar_t cache[MAX_PATH];
+        int j, dup = 0;
+        if (!e->url) continue;
+        for (j = 0; j < bc->count; j++)
+            if (bc->urls[j] && wcscmp(bc->urls[j], e->url) == 0) { dup = 1; break; }
+        if (dup) continue;
+        CachePathFor(e->url, cache, MAX_PATH);
+        if (e->localFile || EpisodeIsCached(e) ||
+            GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES)
+            continue;
+        if (bc->count >= bc->cap) {
+            int ncap = bc->cap * 2;
+            wchar_t **nb = (wchar_t**)realloc(bc->urls,
+                                               (size_t)ncap * sizeof(wchar_t*));
+            if (!nb) break;
+            bc->urls = nb;
+            bc->cap = ncap;
+        }
+        bc->urls[bc->count] = _wcsdup(e->url);
+        if (!bc->urls[bc->count]) bc->urls[bc->count] = _wcsdup(L"");
+        bc->count++;
+        addN++;
+    }
+    if (truncated) bc->truncated = 1;
+    LeaveCriticalSection(&bc->cs);
+
+    if (addN == 0) {
+        /* 空队列是刚为本次创建的：回收；否则只是没有新东西可加 */
+        if (!bc->thread && bc->count == 0) {
+            g_batch = NULL;
+            free(bc->urls);
+            DeleteCriticalSection(&bc->cs);
+            free(bc);
+        } else {
+            SetStatusTemp(tr(TR_BATCH_RUNNING));
+        }
+        return;
     }
 
     /* 清除多选，恢复单选外观（下载过程列表只读） */
@@ -2862,23 +3053,66 @@ static void StartBatchCache(void)
         SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
     }
 
-    /* 保存当前 base（如“正在播放：xxx”），批量完成后恢复 */
-    wcsncpy(g_batchSavedBase, g_statusBase, 511);
-    g_batchSavedBase[511] = 0;
-    g_batchActive = 1;
-
-    swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), 0, total);
-    SetBatchProgress(st);
-
-    g_batchThread = CreateThread(NULL, 0, BatchDlThread, g_batch, 0, NULL);
-    if (!g_batchThread) {
-        for (i = 0; i < total; i++) free(g_batch->urls[i]);
-        free(g_batch->urls);
-        free(g_batch);
-        g_batch = NULL;
-        g_batchActive = 0;
-        SetStatus(tr(TR_DL_THREAD_FAIL));
+    /* 状态栏：首次/上批已自然结束时重新保存 base；批次进行中保持现有 base */
+    if (!g_batchActive) {
+        wcsncpy(g_batchSavedBase, g_statusBase, 511);
+        g_batchSavedBase[511] = 0;
+        g_batchActive = 1;
     }
+
+    needStart = (bc->thread == NULL);
+    if (needStart) {
+        bc->thread = CreateThread(NULL, 0, BatchDlThread, bc, 0, NULL);
+        if (!bc->thread) {
+            int bi;
+            for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
+            free(bc->urls);
+            DeleteCriticalSection(&bc->cs);
+            free(bc);
+            g_batch = NULL;
+            g_batchActive = 0;
+            SetStatus(tr(TR_DL_THREAD_FAIL));
+            return;
+        }
+        /* 入队先于建线程：线程进入时 count>head，不会空睡，故无需唤醒 */
+    } else {
+        /* 线程上批下完后睡在 CV 上：唤醒它处理新追加的 URL */
+        WakeAllConditionVariable(&bc->cv);
+    }
+
+    {
+        int head, cnt;
+        EnterCriticalSection(&bc->cs);
+        head = bc->head; cnt = bc->count;
+        LeaveCriticalSection(&bc->cs);
+        swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), head, cnt);
+        SetBatchProgress(st);
+    }
+    InvalidateRect(g_listEp, NULL, TRUE);   /* 新增队列剧集立即标蓝 */
+}
+
+/* 该集是否在批量下载队列中（尚未完成的保持蓝色；已完成的 cached=1 由黄色优先）。
+ * 按 URL 匹配：批量期间列表可能被刷新/重排，URL 不受影响。遍历在队列 CS 内，
+ * 与 UI 线程的 realloc 追加互斥。 */
+static int EpisodeBatchQueued(int ep)
+{
+    int j, found = 0;
+    Podcast *p;
+    BatchCache *bc = g_batch;
+    if (!bc || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
+        return 0;
+    p = &g_pods[g_curPod];
+    if (ep < 0 || ep >= p->epCount || !p->eps[ep].url) return 0;
+    EnterCriticalSection(&bc->cs);
+    for (j = 0; j < bc->count; j++) {
+        if (bc->urls[j] && bc->urls[j][0] &&
+            wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&bc->cs);
+    return found;
 }
 
 /* ================= 音频信息探测 ================= */
@@ -6799,7 +7033,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_PREV) PlayAdjacent(-1);
             else if (id == IDC_BTN_NEXT) PlayAdjacent(+1);
             else if (id == IDC_BTN_STOP) {
-                if (g_downloading) CancelCurrentDownload();   /* 下载中点停止：中止下载 */
+                if (g_downloading) CancelCurrentDownload();   /* 播放下载：中止 */
+                CancelBatchCache();                            /* 批量队列：全部取消 */
                 PlayerStop();
                 SetStatus(tr(TR_STOPPED));
             }
@@ -6878,11 +7113,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             playing = (g_playPod == g_curPod);
                     }
                     int cached = 0;
+                    int queued = 0;
                     int lastmark = 0;
                     int sel = (ListView_GetItemState(g_listEp, i, LVIS_SELECTED)
                                & LVIS_SELECTED) != 0;
-                    if (p && i >= 0 && i < p->epCount)
+                    if (p && i >= 0 && i < p->epCount) {
                         cached = p->eps[i].localFile || EpisodeIsCached(&p->eps[i]);
+                        /* 批量下载队列中尚未完成的剧集标蓝，下完即转黄 */
+                        if (!cached && !playing) queued = EpisodeBatchQueued(i);
+                    }
                     /* “上次听到哪”标记：该集 == 此播客记录的最近播放集（橙）。
                      * 播放中绿色优先；缓存黄次之（标记是更强的“听过”信号） */
                     if (p && i >= 0 && i < p->epCount && !playing &&
@@ -6910,7 +7149,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             FillRect(cd->nmcd.hdc, &rr, bg);
                             DeleteObject(bg);
                         }
-                        cd->clrText = lastmark
+                        /* 优先级：批量队列蓝 > 上次听到橙 > 已缓存黄 */
+                        cd->clrText = queued
+                            ? ThBlue()
+                            : lastmark
                             ? (g_darkMode ? RGB(235, 165, 80) : RGB(184, 106, 0))
                             : cached ? ThYellow()
                             : (sel ? (g_darkMode ? RGB(236, 242, 250)
@@ -7086,32 +7328,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    /* 批量缓存：每集下完通知 UI 刷新列表（黄色标记出现） */
+    /* 批量缓存：每集下完通知 UI。队列自然耗尽时线程转休眠（结构保留供追加），
+     * 此时像旧版 FINISH 一样恢复 base 并显示完成统计 */
     case WM_APP_BATCH_DONE: {
-        if (g_batch) {
+        BatchCache *bc = g_batch;
+        if (bc) {
             wchar_t st[128];
-            int done = g_batch->curIdx + 1;
-            swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), done, g_batch->count);
-            SetBatchProgress(st);
-            InvalidateRect(g_listEp, NULL, TRUE);   /* 缓存标记变色 */
+            int head, cnt, okc, cap;
+            EnterCriticalSection(&bc->cs);
+            head = bc->head; cnt = bc->count;
+            okc = bc->okCount; cap = bc->truncated;
+            LeaveCriticalSection(&bc->cs);
+            InvalidateRect(g_listEp, NULL, TRUE);   /* 完成项变黄/队列项保持蓝 */
+            if (head >= cnt) {
+                g_batchActive = 0;
+                SetStatus(g_batchSavedBase);
+                if (cap) swprintf(st, 128, tr(TR_BATCH_DONE_CAP), okc, cnt);
+                else     swprintf(st, 128, tr(TR_BATCH_DONE_FMT), okc, cnt);
+                SetStatusTemp(st);
+            } else {
+                swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), head, cnt);
+                SetBatchProgress(st);
+            }
         }
         return 0;
     }
 
-    /* 批量缓存全部完成：先恢复批量前的 base（如“正在播放：xxx”），
-     * 再临时显示结果，到期自动恢复 base */
+    /* 批量缓存被取消：工作线程退出后发来此消息，同步回收并提示。
+     * 自然下完不会到这里（线程转休眠，完成统计在 BATCH_DONE 里处理） */
     case WM_APP_BATCH_FINISH: {
-        int ok = (int)wParam, total = (int)lParam;
-        int cap = (g_batch && g_batch->truncated);
-        wchar_t st[128];
-        /* 先释放 g_batch+清标志，使 SetStatus 不再重定向到 saved base */
-        if (g_batchThread) { CloseHandle(g_batchThread); g_batchThread = NULL; }
-        if (g_batch) { free(g_batch); g_batch = NULL; }
+        (void)wParam; (void)lParam;
+        BatchReleaseAfterFinish();
         g_batchActive = 0;
         SetStatus(g_batchSavedBase);
-        if (cap) swprintf(st, 128, tr(TR_BATCH_DONE_CAP), ok, total);
-        else     swprintf(st, 128, tr(TR_BATCH_DONE_FMT), ok, total);
-        SetStatusTemp(st);
+        SetStatusTemp(tr(TR_BATCH_CANCELLED));
         InvalidateRect(g_listEp, NULL, TRUE);
         return 0;
     }
@@ -7403,7 +7653,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         /* 迷你控制浮窗 */
         if (g_fly) { DestroyWindow(g_fly); g_fly = NULL; }
         PhoneServerStop();   /* 手机服务随程序退出关闭 */
+        /* 批量工作线程会读 urls 并 PostMessage：先取消并同步等它退出回收；
+         * 播放下载线程无法等待（句柄已关闭，随进程终止），仅关闭其 HTTP */
+        CancelBatchCache();
+        BatchReleaseAfterFinish();
+        CancelCurrentDownload();
         DeleteCriticalSection(&g_nowCs);
+        /* g_dlCs 不显式删除：播放下载线程可能仍在其等待循环中，
+         * 进程终止即回收，删除反而有进入已释放 CS 的崩溃风险 */
         SaveConfig();   /* 退出时统一写盘：排序/列宽/音量/字号/窗口尺寸/订阅顺序 */
         if (g_player) { g_player->lpVtbl->Release(g_player); g_player = NULL; }
         if (g_taskbar) { g_taskbar->lpVtbl->Release(g_taskbar); g_taskbar = NULL; }
@@ -7476,6 +7733,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
     InitializeCriticalSection(&g_nowCs);
+    InitializeCriticalSection(&g_dlCs);
     {
         GdiplusStartupInput gsi;
         gsi.GdiplusVersion = 1;
