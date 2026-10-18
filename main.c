@@ -3,7 +3,8 @@
  *
  * 功能：
  *   - 配置内嵌 exe 尾部（PE overlay）：单文件便携，复制 exe 即带走全部配置；
- *     旧版同目录 feeds.ini / feeds.txt 首次保存时自动迁移并删除
+ *     首启发现同目录带标记头的 feeds.ini 时弹窗询问迁移；设置菜单支持
+ *     导入/导出 OPML 订阅列表与配置 ini
  *   - 后台线程下载并解析 RSS 2.0（含 itunes 扩展）
  *   - 音频先下载到 cache\ 缓存，再用 Media Foundation 播放，支持离线收听
  *   - 显示码率 / 采样率 / 声道 / 格式 / 进度，支持 seek、暂停、音量
@@ -244,10 +245,10 @@ static int      g_volume = 80;           /* 音量 0-100 */
 static int      g_winW = 480, g_winH = 360;  /* 窗口尺寸（默认=最小 4:3） */
 static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
 static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
-static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
-static int      g_cfgFromIni = 0;        /* 配置来自旧 feeds.ini（exe 尾部无配置时），保存成功后删除 */
-static int      g_darkMode = 0;          /* 夜间模式（存 ini：dark=1） */
-static int      g_lang = 0;              /* 界面语言：0=简体中文 1=English（存 ini：lang） */
+static int      g_cfgFromIni = 0;        /* 配置来自旧 feeds.ini（exe 尾部无配置且用户确认迁移），保存成功后删除 */
+static int      g_skipSave = 0;          /* 导入配置后退出：不能让旧内存状态覆盖刚导入的尾部 */
+static int      g_darkMode = 1;          /* 夜间模式（存 ini：dark=1，默认开） */
+static int      g_lang = 1;              /* 界面语言：0=简体中文 1=English（存 ini：lang，默认英文） */
 static HBRUSH   g_bgBrush = NULL;        /* 主窗口背景刷，随主题重建 */
 
 /* 定时关机：g_shutdownAt=UTC 秒（0=未启用），倒计时显示在标题栏 */
@@ -331,7 +332,7 @@ enum {
     TR_F_COPYRIGHT, TR_F_FEEDURL, TR_F_PUBDATE, TR_F_LOCALFILE, TR_F_LINK,
     TR_TIP_PODCAST_FMT, TR_TIP_PUBDATE_FMT, TR_TIP_DUR_FMT,
     TR_CACHE_VIEW_DESC,
-    TR_INPUT_TITLE, TR_INPUT_LABEL, TR_OK, TR_CANCEL,
+    TR_INPUT_TITLE, TR_INPUT_LABEL, TR_OK, TR_CANCEL, TR_IB_OPML,
     TR_BAD_URL, TR_DUP_FEED, TR_MAX_FEEDS,
     TR_M_OPEN_CACHE, TR_M_CHANGE_CACHE, TR_M_DEFAULT_CACHE,
     TR_M_NIGHT, TR_M_LANGUAGE, TR_LANG_ZH, TR_LANG_EN,
@@ -357,6 +358,11 @@ enum {
     TR_BATCH_DONE_CAP, TR_BATCH_CANCELLED, TR_BATCH_STOPPING,
     TR_LOADING_PROG,
     TR_FEED_FAIL_TITLE, TR_FEED_FAIL_SUB,
+    TR_M_IMPORT, TR_M_EXPORT, TR_M_EXP_OPML, TR_M_EXP_INI,
+    TR_IMP_TITLE, TR_EXP_OPML_CAP, TR_EXP_INI_CAP, TR_EXP_DONE, TR_EXP_FAIL,
+    TR_IMP_INI_Q, TR_IMP_INI_DONE, TR_IMP_WRITE_FAIL,
+    TR_IMP_OPML_OK_FMT, TR_IMP_OPML_NONE, TR_IMP_UNKNOWN, TR_IMP_FAIL,
+    TR_MIGRATE_Q, TR_MIGRATE_CAP,
     TR_N
 };
 
@@ -384,7 +390,7 @@ static const wchar_t *tr(int id)
             L"缓存内容来自各播客已播放（自动下载）的音频；更改缓存目录请用右上角设置按钮。",
         L"添加播客订阅",
         L"输入 RSS 订阅地址（http:// 或 https://）：",
-        L"确定", L"取消",
+        L"确定", L"取消", L"从 OPML 文件导入...",
         L"地址无效，请输入以 http:// 或 https:// 开头的链接",
         L"该订阅地址已存在", L"订阅数量已达上限",
         L"打开缓存目录", L"更改缓存目录...", L"恢复默认目录",
@@ -396,7 +402,7 @@ static const wchar_t *tr(int id)
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
-        L"LiteTune  版本 1.0\r\n\r\n"
+        L"LiteTune  版本 1.2\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
             L"纯 C + Win32 API 编写，单文件绿色便携，\r\n不依赖任何第三方 DLL。",
         L"夜间模式已开启", L"夜间模式已关闭", L"字号已切换",
@@ -428,7 +434,19 @@ static const wchar_t *tr(int id)
         L"已取消批量下载", L"正在停止批量下载…",
         L"正在加载订阅 %d/%d ...",
         L"加载失败的订阅",
-        L"无法获取或解析，点「-」按钮可删除；刷新可重试"
+        L"无法获取或解析，点「-」按钮可删除；刷新可重试",
+        L"导入...", L"导出", L"OPML 订阅列表", L"配置文件 (feeds.ini)",
+        L"导入", L"导出 OPML", L"导出配置",
+        L"已导出", L"无法写入文件",
+        L"导入配置将覆盖当前的订阅与全部设置，重启 LiteTune 后生效。\r\n是否继续？",
+        L"配置导入成功，重新打开 LiteTune 后生效。\r\n程序现在将退出。",
+        L"写入配置失败（exe 被占用或只读？）",
+        L"已从 OPML 导入 %d 个新订阅",
+        L"OPML 中没有发现新订阅（可能都已存在）",
+        L"无法识别的文件格式", L"无法读取文件",
+        L"发现旧版配置文件 feeds.ini，是否迁移到 LiteTune？\r\n"
+            L"（确认后原文件将删除，订阅与设置保存在程序内部）",
+        L"迁移配置"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -456,7 +474,7 @@ static const wchar_t *tr(int id)
             L"at the top-right to change the cache folder.",
         L"Add Podcast Feed",
         L"Enter an RSS feed URL (http:// or https://):",
-        L"OK", L"Cancel",
+        L"OK", L"Cancel", L"Import from OPML file...",
         L"Invalid URL. Please enter a link starting with http:// or https://",
         L"This feed already exists", L"Maximum number of feeds reached",
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
@@ -468,7 +486,7 @@ static const wchar_t *tr(int id)
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
-        L"LiteTune  version 1.0\r\n\r\n"
+        L"LiteTune  version 1.2\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
             L"auto-cache episodes and listen offline.\r\n\r\n"
             L"Written in pure C with Win32 API. One portable executable,\r\n"
@@ -506,7 +524,21 @@ static const wchar_t *tr(int id)
         L"Batch cache cancelled", L"Stopping batch cache…",
         L"Loading feeds %d/%d ...",
         L"Failed to load feed",
-        L"Cannot fetch or parse. Press \"-\" to remove, Refresh to retry"
+        L"Cannot fetch or parse. Press \"-\" to remove, Refresh to retry",
+        L"Import...", L"Export", L"OPML feed list", L"Configuration (feeds.ini)",
+        L"Import", L"Export OPML", L"Export Configuration",
+        L"Exported", L"Cannot write the file",
+        L"Importing a configuration replaces ALL feeds and settings. "
+            L"It takes effect after restarting LiteTune.\r\nContinue?",
+        L"Configuration imported. It takes effect the next time you start "
+            L"LiteTune.\r\nThe program will now exit.",
+        L"Failed to write the configuration (exe in use or read-only?)",
+        L"Imported %d new feed(s) from OPML",
+        L"No new feeds found in the OPML (all may already exist)",
+        L"Unrecognized file format", L"Cannot read the file",
+        L"Found feeds.ini from an older version. Import it into LiteTune?\r\n"
+            L"(The original file will be deleted after a successful import)",
+        L"Migrate Configuration"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -542,6 +574,134 @@ static COLORREF ThYellow(void)  { return g_darkMode ? RGB(226,186,70) : RGB(190,
 static COLORREF ThBlue(void)    { return g_darkMode ? RGB(96,175,255)  : RGB(0,95,190);  }  /* 批量下载队列 */
 static COLORREF ThTrack(void)   { return g_darkMode ? RGB(58,58,64)   : RGB(229,229,232); }  /* 滑块滑槽 */
 static COLORREF ThAccent(void)  { return RGB(0,120,215);  }                                 /* 进度/滑块把手主色 */
+
+/* ---- 暗色弹窗（MessageBox / InputBox 共用） ----
+ * 亮色模式不接管任何消息，全部走系统原样 */
+static HBRUSH g_dlgBgBrush = NULL;      /* 弹窗背景刷，随主题重建 */
+static HBRUSH g_dlgPanelBrush = NULL;   /* 弹窗输入框底刷 */
+
+static HBRUSH DlgBgBrush(void)
+{
+    if (!g_dlgBgBrush) g_dlgBgBrush = CreateSolidBrush(ThWinBg());
+    return g_dlgBgBrush;
+}
+static HBRUSH DlgPanelBrush(void)
+{
+    if (!g_dlgPanelBrush) g_dlgPanelBrush = CreateSolidBrush(ThPanel());
+    return g_dlgPanelBrush;
+}
+/* 主题切换后让缓存刷失效（下次取时按新配色重建） */
+static void DlgBrushesReset(void)
+{
+    if (g_dlgBgBrush) { DeleteObject(g_dlgBgBrush); g_dlgBgBrush = NULL; }
+    if (g_dlgPanelBrush) { DeleteObject(g_dlgPanelBrush); g_dlgPanelBrush = NULL; }
+}
+
+/* 暗色下压按钮绘制：底色、边框（默认键描主色）、焦点框、文字 */
+static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
+{
+    wchar_t txt[128];
+    HFONT f, of;
+    RECT rc = di->rcItem, fr;
+    HBRUSH b = CreateSolidBrush((di->itemState & ODS_SELECTED)
+        ? RGB(24,24,28) : RGB(50,50,58));
+    HBRUSH bo = CreateSolidBrush((di->itemState & ODS_DEFAULT)
+        ? ThAccent() : RGB(86,86,96));
+    FillRect(di->hDC, &rc, b);
+    FrameRect(di->hDC, &rc, bo);
+    DeleteObject(b);
+    DeleteObject(bo);
+    if (di->itemState & ODS_FOCUS) {
+        fr = rc;
+        InflateRect(&fr, -3, -3);
+        DrawFocusRect(di->hDC, &fr);
+    }
+    txt[0] = 0;
+    GetWindowTextW(di->hwndItem, txt, 128);
+    f = (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0);
+    if (!f) f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    of = (HFONT)SelectObject(di->hDC, f);
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, ThText());
+    DrawTextW(di->hDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(di->hDC, of);
+}
+
+/* MessageBox 暗色：WH_CBT 挂钩在激活时用 SetWindowSubclass 挂上暗色处理，
+ * 只处理背景/文字颜色与按钮自绘，图标和布局仍由系统完成。
+ * 注意：绝不能用 SetWindowLongPtr(GWLP_USERDATA) 手工链——系统消息框的
+ * 对话框窗口自己占用 GWLP_USERDATA 存内部状态，踩掉后 USER32 内部
+ * 固定偏移访问违例（点按钮即崩）。SetWindowSubclass 有独立存储，安全 */
+static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                      UINT_PTR id, DWORD_PTR ref);
+
+static BOOL CALLBACK MsgBoxBtnEnum(HWND btn, LPARAM lp)
+{
+    wchar_t cls[16];
+    (void)lp;
+    if (GetClassNameW(btn, cls, 16) && _wcsicmp(cls, L"Button") == 0) {
+        /* 去掉按钮类型低 4 位改自绘；默认键身份由对话框模板的 defID 保留，
+         * 绘制时用 ODS_DEFAULT 补主色描边 */
+        SetWindowLongPtrW(btn, GWL_STYLE,
+            (GetWindowLongPtrW(btn, GWL_STYLE) & ~0xF) | BS_OWNERDRAW);
+        InvalidateRect(btn, NULL, TRUE);
+    }
+    return TRUE;
+}
+
+static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                      UINT_PTR id, DWORD_PTR ref)
+{
+    (void)id; (void)ref;
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wp;
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, DlgBgBrush());
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, ThWinBg());
+        SetTextColor(dc, ThText());
+        return (LRESULT)DlgBgBrush();
+    }
+    case WM_CTLCOLORBTN:
+        return (LRESULT)DlgBgBrush();
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lp;
+        if (di->CtlType != ODT_BUTTON) break;
+        DrawDarkBtn(di);
+        return TRUE;
+    }
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+static LRESULT CALLBACK MsgBoxHookProc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HCBT_ACTIVATE) {
+        HWND h = (HWND)wp;
+        SetWindowSubclass(h, MsgBoxSubProc, 1, 0);   /* 同 id 重装即更新 */
+        EnumChildWindows(h, MsgBoxBtnEnum, 0);
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* 统一的消息框入口（全项目都用它）；亮色直接透传系统 */
+static int MessageBoxTh(HWND owner, const wchar_t *text,
+                        const wchar_t *title, UINT type)
+{
+    int r;
+    HHOOK hook;
+    if (!g_darkMode) return MessageBoxW(owner, text, title, type);
+    hook = SetWindowsHookExW(WH_CBT, MsgBoxHookProc, NULL, GetCurrentThreadId());
+    r = MessageBoxW(owner, text, title, type);
+    if (hook) UnhookWindowsHookEx(hook);
+    return r;
+}
+
 
 /* 标题栏：定时关机时附倒计时，播放中附剧集标题，否则固定 LiteTune */
 static void UpdateWindowTitle(void)
@@ -759,6 +919,7 @@ static void ApplyTheme(void)
     }
     if (g_whiteBrush) DeleteObject(g_whiteBrush);
     g_whiteBrush = CreateSolidBrush(ThPanel());
+    DlgBrushesReset();   /* 弹窗缓存刷随新配色重建 */
     if (g_listEp) {
         SendMessageW(g_listEp, LVM_SETBKCOLOR, 0, (LPARAM)ThPanel());
         SendMessageW(g_listEp, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
@@ -909,17 +1070,19 @@ static COLORREF ThSbArrow(void) { return g_darkMode ? RGB(175,175,183) : RGB(120
 static int DSB_RowH(HWND lv)
 {
     RECT ri;
-    int top = (int)SendMessageW(lv, LVM_GETTOPINDEX, 0, 0);
+    DWORD sp;
+    int h, top = (int)SendMessageW(lv, LVM_GETTOPINDEX, 0, 0);
     if (top < 0) top = 0;
-    if (SendMessageW(lv, LVM_GETITEMRECT, top, (LPARAM)&ri) && ri.bottom > ri.top)
+    /* LVM_GETITEMRECT 的入参 RECT 与 LVITEM 头部重叠：left 字段即 mask，
+     * 必须先填 LVIR_BOUNDS（裸栈垃圾会被当 mask → 调用失败且 rect 未填充，
+     * 读出栈垃圾行高，拖动滚动条一步滚出几百行） */
+    ri.left = LVIR_BOUNDS;
+    if (SendMessageW(lv, LVM_GETITEMRECT, top, (LPARAM)&ri) &&
+        ri.bottom > ri.top)
         return ri.bottom - ri.top;
-    if (SendMessageW(lv, LVM_GETITEMRECT, 0, (LPARAM)&ri) && ri.bottom > ri.top)
-        return ri.bottom - ri.top;
-    {
-        DWORD sp = (DWORD)SendMessageW(lv, LVM_GETITEMSPACING, FALSE, 0);
-        int h = HIWORD(sp);
-        return h > 0 ? h : 18;
-    }
+    sp = (DWORD)SendMessageW(lv, LVM_GETITEMSPACING, FALSE, 0);
+    h = HIWORD(sp);
+    return h > 0 ? h : 18;
 }
 
 /* 读取目标控件的滚动状态。listbox/edit/listview 纵向统一用“行”单位，
@@ -1504,7 +1667,7 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
     uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
     if (!WinHttpCrackUrl(url, 0, 0, &uc)) return NULL;
 
-    hSes = WinHttpOpen(L"LiteTune/1.0",
+    hSes = WinHttpOpen(L"LiteTune/1.2",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSes) return NULL;
@@ -2494,12 +2657,36 @@ static void ParseConfigMem(char *buf)
     }
 }
 
+/* 检查配置文本开头是否为 "; LiteTune config" 标记（本程序导出/保存的 ini）。
+ * 仅凭标记识别，不认识的文件一律不碰 */
+static int MemHasCfgMarker(const char *buf)
+{
+    const char *s = buf;
+    if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB
+        && (unsigned char)s[2] == 0xBF) s += 3;   /* UTF-8 BOM */
+    return strncmp(s, "; LiteTune config", 17) == 0;
+}
+
+/* 检查文件开头是否带 LiteTune 配置标记（只读前 64 字节） */
+static int FileHasCfgMarker(const wchar_t *path)
+{
+    FILE *f = _wfsopen(path, L"rb", _SH_DENYNO);
+    char buf[64];
+    if (!f) return 0;
+    {
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+    }
+    fclose(f);
+    return MemHasCfgMarker(buf);
+}
+
 /* 只在程序启动时调用一次（读取订阅与全部界面设置）；
  * 运行期间的增删/排序/刷新都在内存里进行，退出时由 SaveConfig 统一写回。
- * 配置来源：exe 尾部内嵌 > 同目录 feeds.ini > 旧版 feeds.txt */
+ * 配置来源：exe 尾部内嵌 > 首启时同目录带标记头的 feeds.ini（弹窗确认迁移） */
 static void LoadConfig(void)
 {
-    wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH], usePath[MAX_PATH];
+    wchar_t iniPath[MAX_PATH];
     FILE *f;
     char line[MAX_FEED_LINE];
     int i;
@@ -2513,10 +2700,9 @@ static void LoadConfig(void)
     g_volume = 80; g_winW = 480; g_winH = 360;
     g_colW[0] = 110; g_colW[1] = 88; g_colW[2] = 44;
     g_fontLevel = 0;
-    g_darkMode = 0;
-    g_lang = 0;
+    g_darkMode = 1;
+    g_lang = 1;
     g_speed = 100;
-    g_cfgFromTxt = 0;
     g_cfgFromIni = 0;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
@@ -2537,25 +2723,20 @@ static void LoadConfig(void)
         ParseConfigMem(tailCfg);
         free(tailCfg);
     } else {
-        /* 2) 回退同目录 feeds.ini / 旧版 feeds.txt（保存成功后迁移删除） */
+        /* 2) 首启（尾部无配置）：同目录发现带标记头的 feeds.ini 时询问迁移。
+         *    不认识的文件绝不碰；feeds.txt 不再自动迁移（需要时用「导入」） */
         ExeDir(iniPath, MAX_PATH);
         wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-        ExeDir(txtPath, MAX_PATH);
-        wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
-
-        if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES) {
-            wcscpy_s(usePath, MAX_PATH, iniPath);
-            g_cfgFromIni = 1;
-        } else if (GetFileAttributesW(txtPath) != INVALID_FILE_ATTRIBUTES) {
-            wcscpy_s(usePath, MAX_PATH, txtPath);
-            g_cfgFromTxt = 1;   /* 保存时迁移 */
-        } else return;
-
-        /* _SH_DENYNO：不拒绝其他进程读写，文件被编辑器打开也能读，读完立即关闭 */
-        f = _wfsopen(usePath, L"rb", _SH_DENYNO);
-        if (!f) return;
-        while (fgets(line, sizeof(line), f)) ParseConfigLine(line);
-        fclose(f);
+        if (FileHasCfgMarker(iniPath)
+            && MessageBoxTh(NULL, tr(TR_MIGRATE_Q), tr(TR_MIGRATE_CAP),
+                           MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            f = _wfsopen(iniPath, L"rb", _SH_DENYNO);
+            if (f) {
+                while (fgets(line, sizeof(line), f)) ParseConfigLine(line);
+                fclose(f);
+                g_cfgFromIni = 1;   /* 尾部写成功并校验后删除源文件 */
+            }
+        }
     }
 
     if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 323;
@@ -2578,31 +2759,13 @@ static const char *SortColName(void)
     return g_sortCol == SORT_TITLE ? "title" : g_sortCol == SORT_DATE ? "date" : "duration";
 }
 
-/* 仅在退出时调用一次：优先把配置写进自身 exe 尾部（写后读回校验，通过才删除
- * 迁移源 ini/txt）；尾部写失败（只读介质等）回退覆盖写 feeds.ini，静默放弃 */
-static void SaveConfig(void)
+/* 组装当前配置文本（唯一生成处：exe 尾部写盘与「导出配置」共用）。
+ * 返回 malloc 缓冲（调用方 free），失败返回 NULL，*lenOut 收字节数 */
+static char *BuildConfigText(DWORD *lenOut)
 {
-    wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH];
-    FILE *f;
-    int i;
     StrBuf sb;
+    int i;
 
-    ExeDir(iniPath, MAX_PATH);
-    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-
-    /* 退出前回收剧集三列的实际宽度 */
-    if (g_listEp) {
-        int ci;
-        for (ci = 0; ci < 3; ci++) {
-            LVCOLUMNW col;
-            ZeroMemory(&col, sizeof(col));
-            col.mask = LVCF_WIDTH;
-            if (SendMessageW(g_listEp, LVM_GETCOLUMNW, ci, (LPARAM)&col))
-                g_colW[ci] = col.cx;
-        }
-    }
-
-    /* 组装配置文本（唯一生成处，尾部与回退 ini 共用同一份） */
     sb.p = NULL; sb.len = 0; sb.cap = 0;
     SbAddf(&sb, "; LiteTune config\n");
     SbAddf(&sb, "; Add one RSS feed URL per line under [feeds]\n");
@@ -2656,38 +2819,60 @@ static void SaveConfig(void)
     for (i = 0; i < g_feedUrlCount; i++)
         SbAddf(&sb, "%s\n", g_feedUrls[i]);
 
-    if (sb.p && CfgTailWrite(sb.p, (DWORD)sb.len)) {
+    *lenOut = (DWORD)sb.len;
+    return sb.p;
+}
+
+/* 仅在退出时调用一次：优先把配置写进自身 exe 尾部（写后读回校验，通过才删除
+ * 迁移源 ini）；尾部写失败（只读介质等）回退覆盖写 feeds.ini，静默放弃 */
+static void SaveConfig(void)
+{
+    wchar_t iniPath[MAX_PATH];
+    FILE *f;
+    DWORD clen = 0;
+    char *cfg;
+
+    if (g_skipSave) return;   /* 导入配置后退出：不能让旧内存状态覆盖刚导入的尾部 */
+
+    ExeDir(iniPath, MAX_PATH);
+    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
+
+    /* 退出前回收剧集三列的实际宽度 */
+    if (g_listEp) {
+        int ci;
+        for (ci = 0; ci < 3; ci++) {
+            LVCOLUMNW col;
+            ZeroMemory(&col, sizeof(col));
+            col.mask = LVCF_WIDTH;
+            if (SendMessageW(g_listEp, LVM_GETCOLUMNW, ci, (LPARAM)&col))
+                g_colW[ci] = col.cx;
+        }
+    }
+
+    cfg = BuildConfigText(&clen);
+    if (cfg && CfgTailWrite(cfg, clen)) {
         /* 写后读回校验，确认无误才视为成功 */
         char *v = CfgTailRead();
-        if (v && sb.len == strlen(v) && memcmp(v, sb.p, sb.len) == 0) {
+        if (v && clen == strlen(v) && memcmp(v, cfg, clen) == 0) {
             free(v);
-            free(sb.p);
+            free(cfg);
             /* 迁移完成：删除旧配置文件 */
-            if (g_cfgFromIni || g_cfgFromTxt) {
-                ExeDir(txtPath, MAX_PATH);
-                wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+            if (g_cfgFromIni) {
                 DeleteFileW(iniPath);
-                DeleteFileW(txtPath);
-                g_cfgFromIni = 0; g_cfgFromTxt = 0;
+                g_cfgFromIni = 0;
             }
             return;
         }
         free(v);
     }
-    if (sb.p) {
+    if (cfg) {
         /* 回退：尾部写失败或校验不符（只读介质/异常），覆盖写 feeds.ini */
         f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
         if (f) {
-            fwrite(sb.p, 1, sb.len, f);
+            fwrite(cfg, 1, clen, f);
             fclose(f);
-            if (g_cfgFromTxt) {
-                ExeDir(txtPath, MAX_PATH);
-                wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
-                DeleteFileW(txtPath);
-                g_cfgFromTxt = 0;
-            }
         }
-        free(sb.p);
+        free(cfg);
     }
 }
 
@@ -5058,38 +5243,115 @@ static void MovePodcastTo(int i, int j)
 #define ID_IB_EDIT   9001
 #define ID_IB_OK     9002
 #define ID_IB_CANCEL 9003
+#define ID_IB_OPML   9004
 
 static wchar_t g_ibBuf[2048];
 static int     g_ibResult = 0;
 static int     g_ibMode = 0;   /* 0=订阅 URL，1=定时关机分钟数 */
+
+/* 前置声明（实现在导入导出段） */
+static BOOL FileDlg(int save, const wchar_t *title, const wchar_t *filter,
+                    const wchar_t *defExt, wchar_t *path, int pathMax);
+static char *ReadFileAll(const wchar_t *path, DWORD *lenOut);
+static int ImportOpmlText(const char *buf);
+
+/* 添加订阅对话框内直接选 OPML 导入（与设置→导入同一套解析） */
+static void DoOpmlPickImport(HWND h)
+{
+    static const wchar_t *FILTER =
+        L"OPML files (*.opml)\0*.opml\0All Files (*.*)\0*.*\0";
+    wchar_t path[MAX_PATH];
+    DWORD len;
+    char *buf;
+    int added;
+
+    if (!FileDlg(0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
+    buf = ReadFileAll(path, &len);
+    if (!buf) {
+        MessageBoxTh(h, tr(TR_IMP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+        return;
+    }
+    added = ImportOpmlText(buf);
+    free(buf);
+    if (added > 0) {
+        wchar_t msg[96];
+        swprintf(msg, 96, tr(TR_IMP_OPML_OK_FMT), added);
+        MessageBoxTh(h, msg, tr(TR_IMP_TITLE), MB_OK | MB_ICONINFORMATION);
+        ReloadFeeds(0);   /* 新订阅无缓存联网拉取，老订阅走缓存秒开 */
+        g_ibResult = 0;
+        DestroyWindow(h); /* 导入完成，关闭添加对话框（URL 留空即不添加） */
+    } else {
+        MessageBoxTh(h, tr(TR_IMP_OPML_NONE), tr(TR_IMP_TITLE),
+                     MB_OK | MB_ICONINFORMATION);
+    }
+}
 
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
         HWND e, lab;
-        e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        UINT btnStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        e = CreateWindowExW(g_darkMode ? 0 : WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
             12, 32, 356, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
         lab = CreateWindowExW(0, L"STATIC",
             g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_INPUT_LABEL),
             WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 10, 356, 18, h, NULL, NULL, NULL);
+        if (g_darkMode) btnStyle |= BS_OWNERDRAW;   /* 暗色按钮自绘 */
+        if (g_ibMode == 0)
+            CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
+                btnStyle | BS_PUSHBUTTON,
+                12, 72, 140, 26, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
         CreateWindowExW(0, L"BUTTON", tr(TR_OK),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            btnStyle | BS_DEFPUSHBUTTON,
             212, 72, 72, 26, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
         CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            btnStyle | BS_PUSHBUTTON,
             296, 72, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
         SendMessageW(e, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(lab, WM_SETFONT, (WPARAM)g_font, TRUE);
         SetFocus(e);
         return 0;
     }
+    case WM_ERASEBKGND:
+        if (g_darkMode) {
+            HDC dc = (HDC)wp;
+            RECT rc;
+            GetClientRect(h, &rc);
+            FillRect(dc, &rc, DlgBgBrush());
+            return 1;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+        if (g_darkMode) {
+            HDC dc = (HDC)wp;
+            SetBkColor(dc, ThWinBg());
+            SetTextColor(dc, ThText());
+            return (LRESULT)DlgBgBrush();
+        }
+        break;
+    case WM_CTLCOLOREDIT:
+        if (g_darkMode) {
+            HDC dc = (HDC)wp;
+            SetBkColor(dc, ThPanel());
+            SetTextColor(dc, ThText());
+            return (LRESULT)DlgPanelBrush();
+        }
+        break;
+    case WM_DRAWITEM:
+        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
+            DrawDarkBtn((DRAWITEMSTRUCT*)lp);
+            return TRUE;
+        }
+        break;
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_CANCEL) {
             g_ibResult = 0;
             DestroyWindow(h);
+        } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_OPML) {
+            DoOpmlPickImport(h);
         } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_OK) {
             wchar_t raw[2048];
             wchar_t *s, *e;
@@ -5105,7 +5367,7 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 /* 分钟数：1-600（ES_NUMBER 已挡掉非数字输入） */
                 int mins = _wtoi(s);
                 if (mins < 1 || mins > 600) {
-                    MessageBoxW(h, tr(TR_CUSTOM_BAD), L"LiteTune", MB_ICONWARNING);
+                    MessageBoxTh(h, tr(TR_CUSTOM_BAD), L"LiteTune", MB_ICONWARNING);
                     return 0;
                 }
                 wcsncpy(g_ibBuf, s, 2047);
@@ -5116,7 +5378,7 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             }
 
             if (!wcsstr(s, L"://")) {
-                MessageBoxW(h, tr(TR_BAD_URL),
+                MessageBoxTh(h, tr(TR_BAD_URL),
                             L"LiteTune", MB_ICONWARNING);
                 return 0;
             }
@@ -5126,11 +5388,11 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 if (dup) break;
             }
             if (dup) {
-                MessageBoxW(h, tr(TR_DUP_FEED), L"LiteTune", MB_ICONINFORMATION);
+                MessageBoxTh(h, tr(TR_DUP_FEED), L"LiteTune", MB_ICONINFORMATION);
                 return 0;
             }
             if (g_feedUrlCount >= MAX_PODCASTS) {
-                MessageBoxW(h, tr(TR_MAX_FEEDS), L"LiteTune", MB_ICONWARNING);
+                MessageBoxTh(h, tr(TR_MAX_FEEDS), L"LiteTune", MB_ICONWARNING);
                 return 0;
             }
             wcsncpy(g_ibBuf, s, 2047);
@@ -6093,11 +6355,273 @@ static void ApplyLanguage(void)
     }
 }
 
+/* ================= 设置菜单：导入 / 导出 ================= */
+
+/* 通用打开/保存文件对话框（comdlg32），返回是否选中路径 */
+static BOOL FileDlg(int save, const wchar_t *title, const wchar_t *filter,
+                    const wchar_t *defExt, wchar_t *path, int pathMax)
+{
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    path[0] = 0;
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = pathMax;
+    ofn.lpstrTitle  = title;
+    ofn.lpstrDefExt = defExt;
+    ofn.Flags = OFN_HIDEREADONLY | (save ? OFN_OVERWRITEPROMPT
+                                         : OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST);
+    return save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
+}
+
+/* 读整个文件到内存（上限 4MB），返回 malloc 缓冲（NUL 结尾），失败 NULL */
+static char *ReadFileAll(const wchar_t *path, DWORD *lenOut)
+{
+    FILE *f = _wfsopen(path, L"rb", _SH_DENYNO);
+    char *buf;
+    long sz;
+    *lenOut = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 4 * 1024 * 1024) { fclose(f); return NULL; }
+    buf = (char*)malloc((size_t)sz + 1);
+    if (buf) {
+        if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+            free(buf); buf = NULL;
+        } else {
+            buf[sz] = 0;
+            *lenOut = (DWORD)sz;
+        }
+    }
+    fclose(f);
+    return buf;
+}
+
+/* URL 是否已在订阅列表（与添加对话框同口径：宽字符不区分大小写比较） */
+static int FeedUrlDup(const char *url)
+{
+    int k;
+    wchar_t *w = U8ToW(url);
+    if (!w) return 0;
+    for (k = 0; k < g_feedUrlCount; k++) {
+        wchar_t *e = U8ToW(g_feedUrls[k]);
+        if (e) {
+            int same = (_wcsicmp(e, w) == 0);
+            free(e);
+            if (same) { free(w); return 1; }
+        }
+    }
+    free(w);
+    return 0;
+}
+
+/* 就地还原 OPML 里的 &amp; 实体（URL 查询串最常见），其余实体不处理 */
+static void DecodeAmp(char *s)
+{
+    char *w = s;
+    while (*s) {
+        if (strncmp(s, "&amp;", 5) == 0) { *w++ = '&'; s += 5; }
+        else *w++ = *s++;
+    }
+    *w = 0;
+}
+
+/* 扫描 OPML 文本里的 xmlUrl="..." / xmlUrl='...'，去重后加入订阅列表。
+ * 返回新导入数量（受 MAX_PODCASTS 上限约束） */
+static int ImportOpmlText(const char *buf)
+{
+    const char *p = buf;
+    int added = 0;
+    while (g_feedUrlCount < MAX_PODCASTS && (p = strstr(p, "xmlUrl")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '=') {
+            p++;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (*p == '"' || *p == '\'') {
+                char q = *p++;
+                const char *e = strchr(p, q);
+                if (!e) break;
+                if (e - p > 4 && e - p < MAX_FEED_LINE && strstr(p, "://")) {
+                    char *url = (char*)malloc((size_t)(e - p) + 1);
+                    if (url) {
+                        int before = g_feedUrlCount;
+                        memcpy(url, p, (size_t)(e - p));
+                        url[e - p] = 0;
+                        DecodeAmp(url);
+                        if (!FeedUrlDup(url)) AddFeedUrl(url);
+                        if (g_feedUrlCount > before) added++;
+                        free(url);
+                    }
+                }
+                p = e + 1;
+            }
+        }
+    }
+    return added;
+}
+
+/* XML 属性转义（& < > " '）；UTF-8 多字节序列高位为 1，不会被误改 */
+static char *XmlEscapeUtf8(const char *s)
+{
+    size_t n = strlen(s), w = 0;
+    char *o = (char*)malloc(n * 6 + 1);
+    if (!o) return NULL;
+    for (; *s; s++) {
+        const char *rep;
+        switch (*s) {
+        case '&':  rep = "&amp;";  break;
+        case '<':  rep = "&lt;";   break;
+        case '>':  rep = "&gt;";   break;
+        case '"':  rep = "&quot;"; break;
+        case '\'': rep = "&apos;"; break;
+        default:   o[w++] = *s;    continue;
+        }
+        memcpy(o + w, rep, strlen(rep));
+        w += strlen(rep);
+    }
+    o[w] = 0;
+    return o;
+}
+
+/* 按 feedUrl 在播客列表里找显示名（失败占位条目 title 为 NULL，调用方自回退） */
+static const wchar_t *PodTitleByUrl(const char *url)
+{
+    int i;
+    for (i = 0; i < g_podCount; i++)
+        if (g_pods[i].feedUrl && strcmp(g_pods[i].feedUrl, url) == 0)
+            return g_pods[i].title;
+    return NULL;
+}
+
+/* 导出订阅列表为标准 OPML 2.0（text 用播客名，加载失败/未就绪则用 URL） */
+static void DoExportOpml(void)
+{
+    static const wchar_t *FILTER =
+        L"OPML (*.opml)\0*.opml\0All Files (*.*)\0*.*\0";
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    int i;
+
+    if (!FileDlg(1, tr(TR_EXP_OPML_CAP), FILTER, L"opml", path, MAX_PATH)) return;
+    f = _wfsopen(path, L"wb", _SH_DENYNO);
+    if (!f) {
+        MessageBoxTh(g_hwnd, tr(TR_EXP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+        return;
+    }
+    fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<opml version=\"2.0\">\n"
+          "  <head><title>LiteTune subscriptions</title></head>\n"
+          "  <body>\n", f);
+    for (i = 0; i < g_feedUrlCount; i++) {
+        const wchar_t *t = PodTitleByUrl(g_feedUrls[i]);
+        char *t8  = t ? WToU8(t) : NULL;
+        char *txt = XmlEscapeUtf8(t8 ? t8 : g_feedUrls[i]);
+        char *url = XmlEscapeUtf8(g_feedUrls[i]);
+        free(t8);
+        if (txt && url)
+            fprintf(f, "    <outline type=\"rss\" text=\"%s\" xmlUrl=\"%s\"/>\n",
+                    txt, url);
+        free(txt);
+        free(url);
+    }
+    fputs("  </body>\n</opml>\n", f);
+    fclose(f);
+    SetStatusTemp(tr(TR_EXP_DONE));
+}
+
+/* 导出完整配置为 ini（文本与 exe 尾部内嵌配置完全一致，可导入回来） */
+static void DoExportIni(void)
+{
+    static const wchar_t *FILTER =
+        L"Configuration (*.ini)\0*.ini\0All Files (*.*)\0*.*\0";
+    wchar_t path[MAX_PATH];
+    FILE *f;
+    DWORD len = 0;
+    char *cfg;
+
+    if (!FileDlg(1, tr(TR_EXP_INI_CAP), FILTER, L"ini", path, MAX_PATH)) return;
+    cfg = BuildConfigText(&len);
+    if (!cfg) return;
+    f = _wfsopen(path, L"wb", _SH_DENYNO);
+    if (f) {
+        fwrite(cfg, 1, len, f);
+        fclose(f);
+        SetStatusTemp(tr(TR_EXP_DONE));
+    } else {
+        MessageBoxTh(g_hwnd, tr(TR_EXP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+    }
+    free(cfg);
+}
+
+/* 导入：带标记头的配置 ini（全量恢复，写回尾部后退出生效）或 OPML（合并订阅） */
+static void DoImport(void)
+{
+    static const wchar_t *FILTER =
+        L"Supported files (*.opml;*.ini)\0*.opml;*.ini\0"
+        L"OPML (*.opml)\0*.opml\0Configuration (*.ini)\0*.ini\0"
+        L"All Files (*.*)\0*.*\0";
+    wchar_t path[MAX_PATH];
+    DWORD len = 0;
+    char *buf;
+
+    if (!FileDlg(0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
+    buf = ReadFileAll(path, &len);
+    if (!buf) {
+        MessageBoxTh(g_hwnd, tr(TR_IMP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (MemHasCfgMarker(buf)) {
+        /* 配置 ini：确认后写进 exe 尾部；g_skipSave 保证退出时不被旧内存覆盖 */
+        if (MessageBoxTh(g_hwnd, tr(TR_IMP_INI_Q), tr(TR_IMP_TITLE),
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            int ok = 0;
+            if (CfgTailWrite(buf, len)) {
+                char *v = CfgTailRead();
+                ok = (v && len == strlen(v) && memcmp(v, buf, len) == 0);
+                free(v);
+            }
+            if (ok) {
+                free(buf);
+                g_skipSave = 1;
+                MessageBoxTh(g_hwnd, tr(TR_IMP_INI_DONE), tr(TR_IMP_TITLE),
+                            MB_OK | MB_ICONINFORMATION);
+                SendMessageW(g_hwnd, WM_CLOSE, 0, 0);   /* 正常走清理并退出 */
+                return;
+            }
+            MessageBoxTh(g_hwnd, tr(TR_IMP_WRITE_FAIL), L"LiteTune",
+                        MB_OK | MB_ICONERROR);
+        }
+    } else if (strstr(buf, "xmlUrl")) {
+        int added = ImportOpmlText(buf);
+        free(buf);
+        if (added > 0) {
+            wchar_t msg[96];
+            swprintf(msg, 96, tr(TR_IMP_OPML_OK_FMT), added);
+            MessageBoxTh(g_hwnd, msg, tr(TR_IMP_TITLE), MB_OK | MB_ICONINFORMATION);
+            ReloadFeeds(0);   /* 新订阅无缓存联网拉取，老订阅走缓存秒开 */
+        } else {
+            MessageBoxTh(g_hwnd, tr(TR_IMP_OPML_NONE), tr(TR_IMP_TITLE),
+                        MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    } else {
+        MessageBoxTh(g_hwnd, tr(TR_IMP_UNKNOWN), L"LiteTune", MB_OK | MB_ICONWARNING);
+    }
+    free(buf);
+}
+
 static void OnSettingsButton(void)
 {
     HMENU menu = CreatePopupMenu();
     HMENU sub  = CreatePopupMenu();
     HMENU lang = CreatePopupMenu();
+    HMENU exp  = CreatePopupMenu();
     POINT pt;
     int cmd;
     wchar_t curDir[MAX_PATH];
@@ -6110,6 +6634,11 @@ static void OnSettingsButton(void)
     AppendMenuW(menu, MF_STRING, 1, tr(TR_M_OPEN_CACHE));
     AppendMenuW(menu, MF_STRING, 2, tr(TR_M_CHANGE_CACHE));
     AppendMenuW(menu, MF_STRING, 3, tr(TR_M_DEFAULT_CACHE));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, 22, tr(TR_M_IMPORT));
+    AppendMenuW(exp, MF_STRING, 23, tr(TR_M_EXP_OPML));
+    AppendMenuW(exp, MF_STRING, 24, tr(TR_M_EXP_INI));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)exp, tr(TR_M_EXPORT));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (g_darkMode ? MF_CHECKED : 0), 4, tr(TR_M_NIGHT));
     AppendMenuW(lang, MF_STRING | (g_lang == 0 ? MF_CHECKED : 0), 20, tr(TR_LANG_ZH));
@@ -6139,6 +6668,9 @@ static void OnSettingsButton(void)
     if (cmd == 0) return;
 
     /* 外观/语言/定时类命令先处理，不涉及缓存目录 */
+    if (cmd == 22) { DoImport(); return; }
+    if (cmd == 23) { DoExportOpml(); return; }
+    if (cmd == 24) { DoExportIni(); return; }
     if (cmd == 4) {
         g_darkMode = !g_darkMode;
         ApplyTheme();
@@ -6164,16 +6696,16 @@ static void OnSettingsButton(void)
                 SetStatusTemp(tr(TR_PHONE_ON));
                 /* 服务开了但防火墙没放行：本机页面正常，手机会一直转圈 */
                 if (r == 2)
-                    MessageBoxW(g_hwnd, tr(TR_PHONE_FW), tr(TR_PHONE_TITLE),
+                    MessageBoxTh(g_hwnd, tr(TR_PHONE_FW), tr(TR_PHONE_TITLE),
                                 MB_OK | MB_ICONWARNING);
             } else {
-                MessageBoxW(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
+                MessageBoxTh(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
             }
         }
         return;
     }
     if (cmd == 7) {
-        MessageBoxW(g_hwnd, tr(TR_ABOUT_TEXT), tr(TR_M_ABOUT),
+        MessageBoxTh(g_hwnd, tr(TR_ABOUT_TEXT), tr(TR_M_ABOUT),
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -6212,7 +6744,7 @@ static void OnSettingsButton(void)
                 _wcsicmp(curDir, newDir) != 0) {
                 wchar_t msg[256];
                 swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
-                if (MessageBoxW(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     CreateDirectoryW(newPath, NULL);
                     MoveCacheFiles(curDir, newDir, L"mp3");
                 }
@@ -6232,7 +6764,7 @@ static void OnSettingsButton(void)
         if (CountMp3InDir(curDir) > 0 && _wcsicmp(curDir, defDir) != 0) {
             wchar_t msg[256];
             swprintf(msg, 256, tr(TR_MOVE_Q_DEF_FMT), CountMp3InDir(curDir));
-            if (MessageBoxW(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 EnsureCacheDir();            /* 确保默认目录已创建 */
                 MoveCacheFiles(curDir, defDir, L"mp3");
             }

@@ -23,6 +23,14 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 
+<!-- Begin  Tag -->
+<div class="sf-root" data-id="4153251" data-badge="oss-users-love-us-white" style="width:126px">
+    <a href="https://sourceforge.net/projects/litetune/" target="_blank">LiteTune</a>
+</div>
+<script>(function () {var sc=document.createElement('script');sc.async=true;sc.src='https://b.sf-syn.com/badge_js?sf_id=4153251';var p=document.getElementsByTagName('script')[0];p.parentNode.insertBefore(sc, p);})();
+</script>
+<!-- End  Tag -->
+
 ![LiteTune 界面：桌面端（暗色主题）与手机遥控网页](screenshot.png)
 
 > 左：桌面端（暗色主题）· 右：手机浏览器打开的「手机出声 / 遥控」网页
