@@ -2,7 +2,8 @@
  * LiteTune - 纯 C / Win32 播客播放器
  *
  * 功能：
- *   - RSS 订阅保存在同目录 feeds.ini（订阅列表与界面配置同文件）
+ *   - 配置内嵌 exe 尾部（PE overlay）：单文件便携，复制 exe 即带走全部配置；
+ *     旧版同目录 feeds.ini / feeds.txt 首次保存时自动迁移并删除
  *   - 后台线程下载并解析 RSS 2.0（含 itunes 扩展）
  *   - 音频先下载到 cache\ 缓存，再用 Media Foundation 播放，支持离线收听
  *   - 显示码率 / 采样率 / 声道 / 格式 / 进度，支持 seek、暂停、音量
@@ -43,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <math.h>
 #include <share.h>
@@ -130,6 +132,7 @@ typedef struct {
     Episode *eps;
     int      epCount;
     int      epCap;
+    int      loadFailed; /* 1=订阅获取/解析失败的占位条目（无剧集，可删除/重试） */
 } Podcast;
 
 typedef struct {
@@ -242,6 +245,7 @@ static int      g_winW = 480, g_winH = 360;  /* 窗口尺寸（默认=最小 4:3
 static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
 static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
 static int      g_cfgFromTxt = 0;        /* 配置来自旧 feeds.txt，保存时迁移 */
+static int      g_cfgFromIni = 0;        /* 配置来自旧 feeds.ini（exe 尾部无配置时），保存成功后删除 */
 static int      g_darkMode = 0;          /* 夜间模式（存 ini：dark=1） */
 static int      g_lang = 0;              /* 界面语言：0=简体中文 1=English（存 ini：lang） */
 static HBRUSH   g_bgBrush = NULL;        /* 主窗口背景刷，随主题重建 */
@@ -352,6 +356,7 @@ enum {
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
     TR_BATCH_DONE_CAP, TR_BATCH_CANCELLED, TR_BATCH_STOPPING,
     TR_LOADING_PROG,
+    TR_FEED_FAIL_TITLE, TR_FEED_FAIL_SUB,
     TR_N
 };
 
@@ -421,7 +426,9 @@ static const wchar_t *tr(int id)
         L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中",
         L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）",
         L"已取消批量下载", L"正在停止批量下载…",
-        L"正在加载订阅 %d/%d ..."
+        L"正在加载订阅 %d/%d ...",
+        L"加载失败的订阅",
+        L"无法获取或解析，点「-」按钮可删除；刷新可重试"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -497,7 +504,9 @@ static const wchar_t *tr(int id)
         L"Select episodes first (Ctrl+click)", L"Batch cache in progress",
         L"Batch cache done (%d/%d ok, rest over limit skipped)",
         L"Batch cache cancelled", L"Stopping batch cache…",
-        L"Loading feeds %d/%d ..."
+        L"Loading feeds %d/%d ...",
+        L"Failed to load feed",
+        L"Cannot fetch or parse. Press \"-\" to remove, Refresh to retry"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -2293,18 +2302,208 @@ static void ParseSortValue(const char *v)
     if (strstr(v, ":desc")) g_sortDir = -1;
 }
 
-/* feeds.ini 格式：
+/* 配置文本格式（exe 尾部内嵌与旧 feeds.ini 完全同构，互为迁移）：
  *   [settings] 下 sort=title|date|duration:asc|desc, w1/w2=列宽千分比
  *   [feeds] 下一行一个 RSS 地址（裸 URL，直接粘贴）
  *   兼容旧版无 section 的 feeds.txt */
+
+/* ---------- 配置内嵌 exe 尾部（PE overlay）：单文件便携 ----------
+ * 配置跟着 exe 走：复制 exe 到 U 盘/别的电脑 = 连配置一起带走。
+ * 运行中的 exe 不能改写只能改名，保存时走「改名-复制-写尾」：
+ * 自己改名 .tmp → CopyFile 回原路径 → 在副本上覆盖/追加尾部；
+ * 残留的 .tmp 被运行中映像占用删不掉，置隐藏属性，下次启动删除。
+ * 已用最小复现工具实测：Defender 实时防护与自定义扫描均无误报。 */
+
+static const char CFG_TAIL_MAGIC[4] = { 'L','T','S','T' };
+
+/* 读取自身 exe 尾部的配置文本. 成功返回 malloc 缓冲（NUL 结尾），无尾部返回 NULL */
+static char* CfgTailRead(void)
+{
+    wchar_t exe[MAX_PATH];
+    HANDLE h; LARGE_INTEGER sz, at; DWORD rd, len; unsigned char hdr[8]; char *buf = NULL;
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return NULL;
+    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 8) {
+        at.QuadPart = sz.QuadPart - 8;
+        if (SetFilePointerEx(h, at, NULL, FILE_BEGIN) && ReadFile(h, hdr, 8, &rd, NULL) && rd == 8
+            && memcmp(hdr + 4, CFG_TAIL_MAGIC, 4) == 0) {
+            memcpy(&len, hdr, 4);
+            if (len > 0 && (LONGLONG)len <= sz.QuadPart - 8 && len <= (1u << 20)) {
+                buf = (char*)malloc((size_t)len + 1);
+                if (buf) {
+                    at.QuadPart = sz.QuadPart - 8 - (LONGLONG)len;
+                    if (!SetFilePointerEx(h, at, NULL, FILE_BEGIN)
+                        || !ReadFile(h, buf, len, &rd, NULL) || rd != len) {
+                        free(buf); buf = NULL;
+                    } else buf[len] = 0;
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+    return buf;
+}
+
+/* 把配置文本写进自身 exe 尾部（有旧尾部则原地覆盖，没有则追加到文件末尾） */
+static int CfgTailWrite(const char *data, DWORD len)
+{
+    wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8];
+    HANDLE h; LARGE_INTEGER sz, at; DWORD rd, wr; unsigned char hdr[8];
+    LONGLONG tailOff = -1, exeSize = 0;
+    int ok = 0;
+
+    if (!data || len == 0 || !GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+    lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".tmp");
+
+    /* 先只读探测现有尾部位置与文件大小 */
+    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 8) {
+        exeSize = sz.QuadPart;
+        at.QuadPart = sz.QuadPart - 8;
+        if (SetFilePointerEx(h, at, NULL, FILE_BEGIN) && ReadFile(h, hdr, 8, &rd, NULL) && rd == 8
+            && memcmp(hdr + 4, CFG_TAIL_MAGIC, 4) == 0) {
+            DWORD oldLen; memcpy(&oldLen, hdr, 4);
+            if (oldLen > 0 && (LONGLONG)oldLen <= sz.QuadPart - 8)
+                tailOff = sz.QuadPart - 8 - (LONGLONG)oldLen;
+        }
+    }
+    CloseHandle(h);
+    if (!exeSize) return 0;
+
+    DeleteFileW(tmp);   /* 清掉上次残留（隐藏属性不影响删除） */
+    if (!MoveFileExW(exe, tmp, MOVEFILE_REPLACE_EXISTING)) return 0;
+    if (!CopyFileW(tmp, exe, FALSE)) {
+        MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING);   /* 尽力回滚改名 */
+        return 0;
+    }
+    h = CreateFileW(exe, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING);
+        return 0;
+    }
+    at.QuadPart = (tailOff >= 0) ? tailOff : exeSize;
+    ok = SetFilePointerEx(h, at, NULL, FILE_BEGIN)
+      && WriteFile(h, data, len, &wr, NULL) && wr == len
+      && WriteFile(h, &len, 4, &wr, NULL) && wr == 4
+      && WriteFile(h, CFG_TAIL_MAGIC, 4, &wr, NULL) && wr == 4
+      && SetEndOfFile(h);
+    CloseHandle(h);
+    SetFileAttributesW(tmp, FILE_ATTRIBUTE_HIDDEN);   /* 残留副本隐藏，下次启动删除 */
+    return ok;
+}
+
+/* ---------- 配置文本动态缓冲 ---------- */
+typedef struct { char *p; size_t len, cap; } StrBuf;
+
+/* 追加一段格式化文本（单行 < 1KB；内存不足时丢该行保主体） */
+static void SbAddf(StrBuf *sb, const char *fmt, ...)
+{
+    char tmp[1024];
+    va_list ap; int n;
+    va_start(ap, fmt);
+    n = _vsnprintf(tmp, sizeof(tmp) - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) { tmp[sizeof(tmp) - 1] = 0; n = (int)strlen(tmp); }   /* 截断保护 */
+    if (n <= 0) return;
+    if (sb->len + (size_t)n + 1 > sb->cap) {
+        size_t nc = sb->cap ? sb->cap * 2 : 4096;
+        char *np;
+        while (nc < sb->len + (size_t)n + 1) nc *= 2;
+        np = (char*)realloc(sb->p, nc);
+        if (!np) return;
+        sb->p = np; sb->cap = nc;
+    }
+    memcpy(sb->p + sb->len, tmp, (size_t)n);
+    sb->len += (size_t)n;
+    sb->p[sb->len] = 0;
+}
+
+/* 解析单行配置（就地修改缓冲）：key=value 或 [feeds] 段的裸 URL */
+static void ParseConfigLine(char *line)
+{
+    char *s = line, *eq;
+    size_t n;
+    if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+        s += 3;
+    while (*s == ' ' || *s == '\t') s++;
+    n = strlen(s);
+    while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t'))
+        s[--n] = 0;
+    if (*s == 0 || *s == '#' || *s == ';' || *s == '[') return;
+
+    eq = strchr(s, '=');
+    if (eq) {
+        char *val = eq + 1;
+        *eq = 0;
+        while (eq > s && (eq[-1]==' '||eq[-1]=='\t')) { eq--; *eq = 0; }
+        if (strcmp(s, "sort") == 0) ParseSortValue(val);
+        else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
+        else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
+        else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
+        else if (strcmp(s, "winw") == 0) g_winW = atoi(val);
+        else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
+        else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
+        else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
+        else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
+        else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
+        else if (strcmp(s, "dark") == 0) g_darkMode = (atoi(val) != 0);
+        else if (strcmp(s, "lang") == 0) g_lang = (strcmp(val, "en") == 0) ? 1 : 0;
+        else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
+        else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
+        else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
+        else if (strcmp(s, "lastep") == 0) {
+            /* 格式 lastep=<hash hex>,<sec>,<utf8url 余下整行> */
+            unsigned int h; long long sec;
+            char *c1 = strchr(val, ',');
+            if (c1) {
+                char *c2;
+                *c1 = 0; c2 = strchr(c1 + 1, ',');
+                if (c2) {
+                    wchar_t *w;
+                    *c2 = 0;
+                    h = (unsigned int)strtoul(val, NULL, 16);
+                    sec = atoll(c1 + 1);
+                    if (h != 0 && sec >= 0 && (w = U8ToW(c2 + 1)) != NULL) {
+                        LastEpSet(h, w, sec);
+                        free(w);
+                    }
+                }
+            }
+        }
+        else if (strcmp(s, "cachedir") == 0) {
+            wchar_t *w = U8ToW(val);
+            if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
+        }
+    } else if (strstr(s, "://")) {
+        AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
+    }
+}
+
+/* 解析内存中的整份配置文本（exe 尾部载荷），按 \n 拆行复用 ParseConfigLine */
+static void ParseConfigMem(char *buf)
+{
+    char *p = buf;
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        ParseConfigLine(p);
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
 /* 只在程序启动时调用一次（读取订阅与全部界面设置）；
- * 运行期间的增删/排序/刷新都在内存里进行，退出时由 SaveConfig 统一写回 */
+ * 运行期间的增删/排序/刷新都在内存里进行，退出时由 SaveConfig 统一写回。
+ * 配置来源：exe 尾部内嵌 > 同目录 feeds.ini > 旧版 feeds.txt */
 static void LoadConfig(void)
 {
     wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH], usePath[MAX_PATH];
     FILE *f;
     char line[MAX_FEED_LINE];
     int i;
+    char *tailCfg;
 
     for (i = 0; i < g_feedUrlCount; i++) free(g_feedUrls[i]);
     free(g_feedUrls);
@@ -2318,85 +2517,46 @@ static void LoadConfig(void)
     g_lang = 0;
     g_speed = 100;
     g_cfgFromTxt = 0;
+    g_cfgFromIni = 0;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
     LastEpFreeAll();
 
-    ExeDir(iniPath, MAX_PATH);
-    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-    ExeDir(txtPath, MAX_PATH);
-    wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
-
-    if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES)
-        wcscpy_s(usePath, MAX_PATH, iniPath);
-    else if (GetFileAttributesW(txtPath) != INVALID_FILE_ATTRIBUTES) {
-        wcscpy_s(usePath, MAX_PATH, txtPath);
-        g_cfgFromTxt = 1;   /* 退出保存时迁移成 ini */
-    } else return;
-
-    /* _SH_DENYNO：不拒绝其他进程读写，文件被编辑器打开也能读，读完立即关闭 */
-    f = _wfsopen(usePath, L"rb", _SH_DENYNO);
-    if (!f) return;
-
-    while (fgets(line, sizeof(line), f)) {
-        char *s = line, *eq;
-        size_t n;
-        if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
-            s += 3;
-        while (*s == ' ' || *s == '\t') s++;
-        n = strlen(s);
-        while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t'))
-            s[--n] = 0;
-        if (*s == 0 || *s == '#' || *s == ';' || *s == '[') continue;
-
-        eq = strchr(s, '=');
-        if (eq) {
-            char *val = eq + 1;
-            *eq = 0;
-            while (eq > s && (eq[-1]==' '||eq[-1]=='\t')) { eq--; *eq = 0; }
-            if (strcmp(s, "sort") == 0) ParseSortValue(val);
-            else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
-            else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
-            else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
-            else if (strcmp(s, "winw") == 0) g_winW = atoi(val);
-            else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
-            else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
-            else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
-            else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
-            else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
-            else if (strcmp(s, "dark") == 0) g_darkMode = (atoi(val) != 0);
-            else if (strcmp(s, "lang") == 0) g_lang = (strcmp(val, "en") == 0) ? 1 : 0;
-            else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
-            else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
-            else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
-            else if (strcmp(s, "lastep") == 0) {
-                /* 格式 lastep=<hash hex>,<sec>,<utf8url 余下整行> */
-                unsigned int h; long long sec;
-                char *c1 = strchr(val, ',');
-                if (c1) {
-                    char *c2;
-                    *c1 = 0; c2 = strchr(c1 + 1, ',');
-                    if (c2) {
-                        wchar_t *w;
-                        *c2 = 0;
-                        h = (unsigned int)strtoul(val, NULL, 16);
-                        sec = atoll(c1 + 1);
-                        if (h != 0 && sec >= 0 && (w = U8ToW(c2 + 1)) != NULL) {
-                            LastEpSet(h, w, sec);
-                            free(w);
-                        }
-                    }
-                }
-            }
-            else if (strcmp(s, "cachedir") == 0) {
-                wchar_t *w = U8ToW(val);
-                if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
-            }
-        } else if (strstr(s, "://")) {
-            AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
+    /* 上次保存残留的隐藏改名副本，此时已无占用，顺手删除 */
+    {
+        wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8];
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".tmp");
+            DeleteFileW(tmp);
         }
     }
-    fclose(f);
+
+    /* 1) 优先读 exe 尾部内嵌配置（单文件便携） */
+    tailCfg = CfgTailRead();
+    if (tailCfg) {
+        ParseConfigMem(tailCfg);
+        free(tailCfg);
+    } else {
+        /* 2) 回退同目录 feeds.ini / 旧版 feeds.txt（保存成功后迁移删除） */
+        ExeDir(iniPath, MAX_PATH);
+        wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
+        ExeDir(txtPath, MAX_PATH);
+        wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+
+        if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(usePath, MAX_PATH, iniPath);
+            g_cfgFromIni = 1;
+        } else if (GetFileAttributesW(txtPath) != INVALID_FILE_ATTRIBUTES) {
+            wcscpy_s(usePath, MAX_PATH, txtPath);
+            g_cfgFromTxt = 1;   /* 保存时迁移 */
+        } else return;
+
+        /* _SH_DENYNO：不拒绝其他进程读写，文件被编辑器打开也能读，读完立即关闭 */
+        f = _wfsopen(usePath, L"rb", _SH_DENYNO);
+        if (!f) return;
+        while (fgets(line, sizeof(line), f)) ParseConfigLine(line);
+        fclose(f);
+    }
 
     if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 323;
     if (g_w2perm < 100 || g_w2perm > 800) g_w2perm = 383;
@@ -2418,16 +2578,17 @@ static const char *SortColName(void)
     return g_sortCol == SORT_TITLE ? "title" : g_sortCol == SORT_DATE ? "date" : "duration";
 }
 
-/* 仅在退出时调用一次：覆盖写 feeds.ini（文件被编辑器锁定时静默放弃，不影响退出） */
+/* 仅在退出时调用一次：优先把配置写进自身 exe 尾部（写后读回校验，通过才删除
+ * 迁移源 ini/txt）；尾部写失败（只读介质等）回退覆盖写 feeds.ini，静默放弃 */
 static void SaveConfig(void)
 {
     wchar_t iniPath[MAX_PATH], txtPath[MAX_PATH];
     FILE *f;
     int i;
+    StrBuf sb;
+
     ExeDir(iniPath, MAX_PATH);
     wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-    f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
-    if (!f) return;
 
     /* 退出前回收剧集三列的实际宽度 */
     if (g_listEp) {
@@ -2441,30 +2602,32 @@ static void SaveConfig(void)
         }
     }
 
-    fprintf(f, "; LiteTune config\n");
-    fprintf(f, "; Add one RSS feed URL per line under [feeds]\n");
-    fprintf(f, "[settings]\n");
-    fprintf(f, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
-    fprintf(f, "w1=%d\n", g_w1perm);
-    fprintf(f, "w2=%d\n", g_w2perm);
-    fprintf(f, "cw0=%d\n", g_colW[0]);
-    fprintf(f, "cw1=%d\n", g_colW[1]);
-    fprintf(f, "cw2=%d\n", g_colW[2]);
-    fprintf(f, "vol=%d\n", g_volume);
-    fprintf(f, "font=%d\n", g_fontLevel);
-    fprintf(f, "dark=%d\n", g_darkMode);
-    fprintf(f, "lang=%s\n", g_lang ? "en" : "zh");
-    fprintf(f, "speed=%d\n", g_speed);
-    fprintf(f, "winw=%d\n", g_winW);
-    fprintf(f, "winh=%d\n", g_winH);
+    /* 组装配置文本（唯一生成处，尾部与回退 ini 共用同一份） */
+    sb.p = NULL; sb.len = 0; sb.cap = 0;
+    SbAddf(&sb, "; LiteTune config\n");
+    SbAddf(&sb, "; Add one RSS feed URL per line under [feeds]\n");
+    SbAddf(&sb, "[settings]\n");
+    SbAddf(&sb, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
+    SbAddf(&sb, "w1=%d\n", g_w1perm);
+    SbAddf(&sb, "w2=%d\n", g_w2perm);
+    SbAddf(&sb, "cw0=%d\n", g_colW[0]);
+    SbAddf(&sb, "cw1=%d\n", g_colW[1]);
+    SbAddf(&sb, "cw2=%d\n", g_colW[2]);
+    SbAddf(&sb, "vol=%d\n", g_volume);
+    SbAddf(&sb, "font=%d\n", g_fontLevel);
+    SbAddf(&sb, "dark=%d\n", g_darkMode);
+    SbAddf(&sb, "lang=%s\n", g_lang ? "en" : "zh");
+    SbAddf(&sb, "speed=%d\n", g_speed);
+    SbAddf(&sb, "winw=%d\n", g_winW);
+    SbAddf(&sb, "winh=%d\n", g_winH);
     /* 续播记忆：正在播放/暂停时记住剧集与位置；已手动停止则不写（下次不续播） */
     if (g_playUrl && g_playState != 0) {
         long long pos = PlayerGet100ns(0);
         char *u8;
         if (pos < 0) pos = 0;
-        fprintf(f, "resume=%d\n", (int)(pos / 10000000LL));
+        SbAddf(&sb, "resume=%d\n", (int)(pos / 10000000LL));
         u8 = WToU8(g_playUrl);
-        if (u8) { fprintf(f, "resumeurl=%s\n", u8); free(u8); }
+        if (u8) { SbAddf(&sb, "resumeurl=%s\n", u8); free(u8); }
         /* 退出时刻把当前剧集精确写入每播客标记（订阅视图才记） */
         if (g_playPod >= 0 && g_playPod < g_podCount &&
             g_pods[g_playPod].feedUrl)
@@ -2478,8 +2641,8 @@ static void SaveConfig(void)
             if (g_lastEps[li].epUrl && g_lastEps[li].hash != 0) {
                 char *u8 = WToU8(g_lastEps[li].epUrl);
                 if (u8) {
-                    fprintf(f, "lastep=%x,%d,%s\n",
-                            g_lastEps[li].hash, (int)g_lastEps[li].sec, u8);
+                    SbAddf(&sb, "lastep=%x,%d,%s\n",
+                           g_lastEps[li].hash, (int)g_lastEps[li].sec, u8);
                     free(u8);
                 }
             }
@@ -2487,19 +2650,44 @@ static void SaveConfig(void)
     }
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
-        if (u8) { fprintf(f, "cachedir=%s\n", u8); free(u8); }
+        if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
     }
-    fprintf(f, "\n[feeds]\n");
+    SbAddf(&sb, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
-        fprintf(f, "%s\n", g_feedUrls[i]);
-    fclose(f);
+        SbAddf(&sb, "%s\n", g_feedUrls[i]);
 
-    /* 首次迁移：删除旧 feeds.txt */
-    if (g_cfgFromTxt) {
-        ExeDir(txtPath, MAX_PATH);
-        wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
-        DeleteFileW(txtPath);
-        g_cfgFromTxt = 0;
+    if (sb.p && CfgTailWrite(sb.p, (DWORD)sb.len)) {
+        /* 写后读回校验，确认无误才视为成功 */
+        char *v = CfgTailRead();
+        if (v && sb.len == strlen(v) && memcmp(v, sb.p, sb.len) == 0) {
+            free(v);
+            free(sb.p);
+            /* 迁移完成：删除旧配置文件 */
+            if (g_cfgFromIni || g_cfgFromTxt) {
+                ExeDir(txtPath, MAX_PATH);
+                wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+                DeleteFileW(iniPath);
+                DeleteFileW(txtPath);
+                g_cfgFromIni = 0; g_cfgFromTxt = 0;
+            }
+            return;
+        }
+        free(v);
+    }
+    if (sb.p) {
+        /* 回退：尾部写失败或校验不符（只读介质/异常），覆盖写 feeds.ini */
+        f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
+        if (f) {
+            fwrite(sb.p, 1, sb.len, f);
+            fclose(f);
+            if (g_cfgFromTxt) {
+                ExeDir(txtPath, MAX_PATH);
+                wcscat_s(txtPath, MAX_PATH, L"feeds.txt");
+                DeleteFileW(txtPath);
+                g_cfgFromTxt = 0;
+            }
+        }
+        free(sb.p);
     }
 }
 
@@ -2575,7 +2763,19 @@ static HBITMAP LoadCoverImage(const char *url)
 }
 
 /* ================= 后台线程：加载 feeds ================= */
-/* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设），失败返回 NULL。
+/* 构造一个"加载失败"占位条目：保留 feedUrl 供删除/重试用，标题由 UI 按语言绘制 */
+static Podcast* MakeFailedPod(const char *url)
+{
+    Podcast *p = (Podcast*)calloc(1, sizeof(Podcast));
+    if (!p) return NULL;
+    p->loadFailed = 1;
+    p->feedUrl = _strdup(url);
+    return p;
+}
+
+/* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设）；
+ * 失败时返回 loadFailed=1 的占位条目（让 URL 在列表中可见、可删除、可重试），
+ * 仅在内存分配彻底失败时返回 NULL。
  * netFirst=0 启动模式：缓存命中就不联网，秒开且断网可用；
  * netFirst=1 刷新模式：强制联网取最新，成功后更新缓存，
  *            联网失败时回退缓存（断网刷新列表不清空） */
@@ -2598,9 +2798,9 @@ static Podcast* LoadOneFeed(const char *url, int netFirst)
             fromNet = 1;
         } else if (netFirst) {
             xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
-            if (!xml) return NULL;
+            if (!xml) return MakeFailedPod(url);
         } else {
-            return NULL;
+            return MakeFailedPod(url);
         }
     }
 
@@ -2615,7 +2815,7 @@ static Podcast* LoadOneFeed(const char *url, int netFirst)
     }
     if (pod) { FreePodcast(pod); free(pod); }
     free(xml);
-    return NULL;
+    return MakeFailedPod(url);
 }
 
 /* 加载线程参数：订阅 URL 快照。线程不再读 g_feedUrls，
@@ -2642,7 +2842,7 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
         Podcast *pod = LoadOneFeed(a->urls[i], a->netFirst);
         if (pod) {
             PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 0, (LPARAM)pod);
-            loaded++;
+            if (!pod->loadFailed) loaded++;
         }
         /* 每条完成（成败都算）上报进度，状态栏显示 已加载/总数 */
         PostMessageW(g_hwnd, WM_APP_FEED_PROGRESS, i + 1, a->count);
@@ -4390,6 +4590,24 @@ static void SelectPodcast(int idx)
         g_curEp = -1;
     }
     g_curPod = idx;
+    if (g_pods[idx].loadFailed) {
+        /* 加载失败占位条目：清空剧集列表，详情区只显示订阅地址，避免访问空字段 */
+        wchar_t *feedW;
+        SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
+        SetWindowTextW(g_editDesc, L"");
+        feedW = U8ToW(g_pods[idx].feedUrl);
+        if (feedW) {
+            wchar_t buf[1024];
+            size_t pos = 0;
+            ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos, tr(TR_F_FEEDURL), feedW);
+            SetWindowTextW(g_editDesc, buf);
+            free(feedW);
+        }
+        SyncScrollBar(g_vsEp);
+        SyncScrollBar(g_hsEp);
+        SyncScrollBar(g_vsDesc);
+        return;
+    }
     SortPodcast(&g_pods[idx]);
     FillEpisodeList();
     ShowPodcastDetail(idx);
@@ -4819,9 +5037,10 @@ static void MovePodcastTo(int i, int j)
         }
     }
 
-    title = g_pods[j].title;   /* 搬家后目标位置的标题 */
+    title = g_pods[j].title;   /* 搬家后目标位置的标题（失败占位为 NULL，owner-draw 自绘） */
     SendMessageW(g_listPod, LB_DELETESTRING, (WPARAM)i, 0);
-    SendMessageW(g_listPod, LB_INSERTSTRING, (WPARAM)j, (LPARAM)title);
+    SendMessageW(g_listPod, LB_INSERTSTRING, (WPARAM)j,
+        (LPARAM)(title ? title : tr(TR_FEED_FAIL_TITLE)));
     SendMessageW(g_listPod, LB_SETCURSEL, (WPARAM)j, 0);
 
     /* 选中/正在播放的播客下标跟着搬 */
@@ -6724,6 +6943,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(ab);
                 DeleteObject(gp);
                 textLeft = rc.left + 56;
+            } else if (!isCache && p->loadFailed) {
+                /* 加载失败占位：黄色警示三角（暗色下用亮黄）。背景整行已填充，直接画图标 */
+                COLORREF warn = g_darkMode ? RGB(255,200,60) : RGB(200,140,0);
+                HBRUSH wb = CreateSolidBrush(warn);
+                HPEN wp = CreatePen(PS_SOLID, 2, warn);
+                HGDIOBJ oldPen, oldBrush;
+                POINT tri[3] = {
+                    {rc.left + 26, rc.top + 8},
+                    {rc.left + 44, rc.top + 44},
+                    {rc.left + 8,  rc.top + 44} };
+                oldPen = SelectObject(di->hDC, wp);
+                oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                Polygon(di->hDC, tri, 3);
+                SelectObject(di->hDC, wb);
+                /* 感叹号：竖线 + 点 */
+                {
+                    RECT bar = { rc.left+24, rc.top+18, rc.left+28, rc.top+34 };
+                    RECT dot = { rc.left+24, rc.top+37, rc.left+28, rc.top+41 };
+                    FillRect(di->hDC, &bar, wb);
+                    FillRect(di->hDC, &dot, wb);
+                }
+                SelectObject(di->hDC, oldPen);
+                SelectObject(di->hDC, oldBrush);
+                DeleteObject(wb);
+                DeleteObject(wp);
+                textLeft = rc.left + 56;
             } else if (g_podMode == 1) {
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
                 HPEN rp = CreatePen(PS_SOLID, 5, RGB(205, 40, 40));
@@ -6754,7 +6999,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             SetBkMode(di->hDC, TRANSPARENT);
 
-            /* 标题：加粗，播放中绿色 */
+            /* 标题：加粗，播放中绿色；加载失败占位用固定文案+置灰 */
             {
                 wchar_t title[64];
                 const wchar_t *tp;
@@ -6766,19 +7011,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (isCache) {
                     swprintf(title, 64, tr(TR_CACHED_FMT), g_cacheFileCount);
                     tp = title;
+                } else if (p->loadFailed) {
+                    tp = tr(TR_FEED_FAIL_TITLE);
                 } else tp = p->title;
-                SetTextColor(di->hDC, isPlaying ? ThGreen() : ThText());
+                SetTextColor(di->hDC,
+                    p->loadFailed ? ThDim() : (isPlaying ? ThGreen() : ThText()));
                 SelectObject(di->hDC, g_fontBold);
                 DrawTextW(di->hDC, tp, -1, &rct,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
 
             /* 副标题：copyright（空则 author），小字号灰色，标题下方；
-             * 虚拟行固定提示离线播放 */
+             * 虚拟行固定提示离线播放；失败占位显示原因说明 */
             {
                 const wchar_t *sub = isCache
                     ? tr(TR_OFFLINE_LOCAL)
-                    : (p->copyright ? p->copyright : p->author);
+                    : (p->loadFailed ? tr(TR_FEED_FAIL_SUB)
+                       : (p->copyright ? p->copyright : p->author));
                 if (sub && *sub) {
                     RECT rcs = rc;
                     rcs.left = textLeft;
@@ -7381,8 +7630,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_podCount < MAX_PODCASTS) {
                 int newIdx = g_podCount;
                 g_pods[g_podCount] = *pod;
-                /* 插入到“已缓存”虚拟行之前（无虚拟行时等同末尾追加） */
-                SendMessageW(g_listPod, LB_INSERTSTRING, newIdx, (LPARAM)pod->title);
+                /* 插入到"已缓存"虚拟行之前（无虚拟行时等同末尾追加）。
+                 * owner-draw 列表真正显示在 WM_DRAWITEM 里画，这里 lParam 仅作占位 */
+                SendMessageW(g_listPod, LB_INSERTSTRING, newIdx,
+                    (LPARAM)(pod->loadFailed ? tr(TR_FEED_FAIL_TITLE) : (pod->title ? pod->title : L"")));
                 g_podCount++;
                 if (incremental) {
                     if (g_viewCached) {
@@ -7714,8 +7965,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     (void)hPrev; (void)lpCmdLine;
 
-    /* 单实例：重复启动时把已运行的窗口带到前台后退出。
-     * 双开会各自在退出时写 feeds.ini 互相覆盖，丢失订阅/设置 */
+    /* 单实例：重复启动时把已运行的窗口带到前台后退出，避免双开互相干扰（配置内嵌 exe 尾部） */
     {
         HANDLE mu = CreateMutexW(NULL, FALSE, L"Local\\LiteTune_SingleInstance");
         if (mu && GetLastError() == ERROR_ALREADY_EXISTS) {
