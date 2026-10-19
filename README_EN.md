@@ -2,9 +2,9 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 240 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 256 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![size](https://img.shields.io/badge/size-240%20KB-brightgreen?style=for-the-badge)
+![size](https://img.shields.io/badge/size-256%20KB-brightgreen?style=for-the-badge)
 ![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
 ![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
@@ -49,11 +49,12 @@ English | [简体中文](README.md)
 - Multimedia keyboard media keys (play/pause, previous, next, stop)
 - Arrow keys navigate lists and buttons (click anywhere first, then use arrows)
 - Light / dark theme (switched at runtime)
-- Bilingual UI, English & Chinese (Settings menu, remembered, default English)
+- Bilingual UI, English & Chinese (chosen on first run, switchable in the Settings menu, remembered)
 - Sleep timer (presets 15–120 min or custom 1–600 min, countdown in the title bar; force shutdown at the end, Windows gives a 15-second cancel window)
 - Auto-clean cache older than 30 days at startup (default %TEMP% folder only; custom folders are never touched)
 - Three UI font sizes (Ctrl + mouse wheel)
 - Custom cache folder (open / change / move existing cache)
+- **Dual-mode config storage**: embed it in the exe (single-file portable — copying the exe takes it along) or keep it as an external `feeds.ini` next to the exe (easy upgrades / backups / manual editing); chosen on first run, switchable anytime in the Settings menu (see "Config storage")
 - Taskbar thumbnail toolbar: previous / play-pause / next / shuffle-next
 - Tooltips: button hints, full episode text, podcast cover + title + author
 - Original crescent-moon app icon (window / taskbar / Explorer)
@@ -72,18 +73,29 @@ English | [简体中文](README.md)
 
 | File | Description |
 |------|------|
-| `LiteTune.exe` | Main program (portable single file, config embedded in the exe tail — copying the exe takes your config with it) |
+| `LiteTune.exe` | Main program (portable single file; the config is either embedded in the exe tail or kept as an external `feeds.ini` next to it — see "Config storage") |
 | `main.c` | All source code |
-| `feeds.ini` | (deprecated) Legacy config file; migrated into the exe tail on first save and deleted. Falls back to this if the exe tail can't be written (e.g. read-only media) |
+| `feeds.ini` | (optional) External config file, same format as the legacy one. Present only in "external" mode (or when chosen on first run); absent in embedded mode |
 | Cache folder | Downloaded audio (filename = URL hash), feed & cover cache (`feed_*.xml` / `cover_*.img`). Defaults to `%TEMP%\LiteTune\`, auto-cleaned by Windows; stored in the ini if you pick a custom folder. Deleting a feed cleans its RSS/cover cache (audio is kept) |
 | `resource.rc` / `app.manifest` / `app.ico` | Build resources (DPI-aware manifest, icon) |
 | `screenshot.png` | Screenshot for the README (desktop + phone web) |
 | `LICENSE` | MIT license |
 | `tools\make_ico.ps1` | Icon generator (run after changing the icon, then rebuild) |
 
-## Config (embedded in the exe tail)
+## Config storage
 
-The config and feed list are embedded at the end of the exe file (PE overlay, magic `LTST`), in exactly the same format as the legacy feeds.ini:
+The config and feed list can be **embedded in the exe tail** or kept as an **external `feeds.ini` next to the exe**. Which mode is used is not decided by any config key — only by what's on disk — and is auto-detected at startup in this order:
+
+1. A `feeds.ini` exists next to the exe → **external** config is used (an embedded tail, if any, is ignored);
+2. Otherwise the exe has an embedded config in its tail → **embedded** config is used;
+3. Neither exists (first run) → a first-run dialog asks you to pick the UI language and the storage mode (closing the dialog = quit the app).
+
+You can switch anytime under **Settings → Config Storage**; the current mode is shown with a check mark:
+
+- **Embedded in program**: the config is written into the exe tail (PE overlay, magic `LTST`). Truly single-file portable — copy the exe to a USB stick or another PC and the config comes along. Switching asks for confirmation first, then deletes the `feeds.ini` next to the exe.
+- **External `feeds.ini`**: the config is saved as `feeds.ini` next to the exe, convenient for upgrades, backups, and manual editing. Switching strips the embedded tail so your subscriptions aren't shipped along with the exe.
+
+Both modes use exactly the same config format (identical to the legacy `feeds.ini`):
 
 ```ini
 [settings]
@@ -112,7 +124,7 @@ https://example.com/feed2.xml
 
 > The config is read at startup and saved at exit only; nothing is locked while running. Resume / last-heard records are written at exit; stale entries of deleted feeds are cleaned at startup.
 >
-> Save flow: on exit the config is written into the exe tail and read back for verification (a running exe can't be rewritten, so the new image is written to exe.new, the old image is renamed into the temp folder, then exe.new is atomically renamed over — the exe folder stays clean). After verification the legacy feeds.ini / feeds.txt migration sources are deleted. If the tail can't be written (read-only media), it falls back to overwriting feeds.ini. Config follows the exe: copy the exe to a USB stick or another PC and your config comes along.
+> Save flow: saved according to the current mode — external mode overwrites `feeds.ini` directly; embedded mode writes the config into the exe tail and reads it back for verification (a running exe can't be rewritten, so the new image is written to exe.new, the old image is renamed into the temp folder, then exe.new is atomically renamed over — the exe folder stays clean). If the embedded write fails (read-only media), it falls back to overwriting `feeds.ini`.
 
 ## Phone remote
 

@@ -1,10 +1,10 @@
 # LiteTune
 
-English | [简体中文](README.md)
+[English](README_EN.md) | 简体中文
 
-**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 256 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![size](https://img.shields.io/badge/size-240%20KB-brightgreen?style=for-the-badge)
+![size](https://img.shields.io/badge/size-256%20KB-brightgreen?style=for-the-badge)
 ![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
 ![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
@@ -50,11 +50,12 @@ English | [简体中文](README.md)
 - 多媒体键盘媒体键（播放/暂停、上一曲、下一曲、停止）
 - 方向键操作列表与按钮（鼠标点击任意区域后即可使用）
 - 亮色 / 暗色主题（运行时即时切换）
-- 中英文双语界面（设置菜单切换，自动记忆，默认中文）
+- 中英文双语界面（首次运行选择语言，设置菜单随时切换，自动记忆）
 - 定时关机（预设 15–120 分钟或自定义 1–600 分钟，标题栏显示倒计时；到点强制关机，系统提供 15 秒取消窗口）
 - 启动时自动清理 30 天前的旧缓存（仅默认 %TEMP% 目录，自定义目录不清理）
 - 三档字号调节（Ctrl + 鼠标滚轮）
 - 可自定义缓存目录（支持打开 / 更改 / 移动已有缓存）
+- **配置存储双模式**：可内嵌到 exe（单文件便携，复制即带走）或外挂为同目录 `feeds.ini`（便于升级 / 备份 / 手动编辑）；首次运行弹窗选择，设置菜单随时切换（详见「配置存储」）
 - 任务栏缩略图按钮：上一曲 / 播放暂停 / 下一曲 / 随机下一曲
 - 鼠标悬停提示：按钮说明、剧集完整文本、播客封面 + 标题 + 作者
 - 原创夜空弯月应用图标（窗口 / 任务栏 / 资源管理器统一）
@@ -73,18 +74,29 @@ English | [简体中文](README.md)
 
 | 文件 | 说明 |
 |------|------|
-| `LiteTune.exe` | 主程序（绿色单文件，配置内嵌在 exe 尾部，复制 exe 即带走全部配置） |
+| `LiteTune.exe` | 主程序（绿色单文件；配置可内嵌于 exe 尾部，或外挂为同目录 `feeds.ini`，见「配置存储」） |
 | `main.c` | 全部源代码 |
-| `feeds.ini` | （已废弃）旧版配置文件，首次保存时自动迁入 exe 尾部并删除；exe 尾部写失败（如只读介质）时回退使用 |
+| `feeds.ini` | （可选）外挂配置文件，格式与旧版一致。仅「外挂」模式（或首次运行选择外挂）下存在；内嵌模式下不存在 |
 | 缓存目录 | 已下载音频（文件名 = URL 哈希）、订阅与封面缓存（`feed_*.xml` / `cover_*.img`）。默认存 `%TEMP%\LiteTune\`，Windows 自动清理；手动选择过其它目录则存在 ini 里。删除订阅时自动清理对应的订阅/封面缓存（音频保留） |
 | `resource.rc` / `app.manifest` / `app.ico` | 编译资源（DPI 感知清单、图标） |
 | `screenshot.png` | README 展示用界面截图（桌面端 + 手机网页） |
 | `LICENSE` | MIT 许可证 |
 | `tools\make_ico.ps1` | 图标生成脚本（改图标后运行，再重新编译） |
 
-## 配置（内嵌 exe 尾部）
+## 配置存储
 
-配置与订阅源内嵌在 exe 文件末尾（PE overlay，魔数 `LTST`），格式与旧版 feeds.ini 完全相同：
+配置与订阅源可以**内嵌在 exe 尾部**，也可以**外挂为同目录的 `feeds.ini`**。采用哪种模式不由配置项决定，只由磁盘现状决定，启动时按以下优先级自动判定：
+
+1. 同目录存在 `feeds.ini` → 用**外挂**配置（exe 尾部若有内嵌配置，一律忽略）；
+2. 否则 exe 尾部有内嵌配置 → 用**内嵌**配置；
+3. 两者都没有（首次运行）→ 弹出首启弹窗，让你选择界面语言并选择存储方式（关闭该弹窗＝退出程序）。
+
+之后可在**设置 → 配置存储位置**随时切换，当前模式在菜单里以勾选显示：
+
+- **内嵌到程序内**：配置写进 exe 尾部（PE overlay，魔数 `LTST`）。真正的单文件便携，复制 exe 到 U 盘或别的电脑＝连配置一起带走。切换时会先弹窗征求同意，再删除同目录 `feeds.ini`。
+- **外挂 `feeds.ini`**：配置保存为 exe 同目录的 `feeds.ini`，便于升级、备份、手动编辑。切换时会剥离 exe 尾部的内嵌配置，避免把订阅随 exe 分发出去。
+
+两种模式采用完全相同的配置格式（与旧版 `feeds.ini` 一致）：
 
 ```ini
 [settings]
@@ -113,7 +125,7 @@ https://example.com/feed2.xml
 
 > 配置仅在启动时读取、退出时保存，运行中不锁定。续播 / 上次听到记录在退出时写入，启动时自动清理已删除订阅的残留。
 >
-> 保存流程：退出时把配置写进自身 exe 尾部并读回校验（运行中的 exe 本体不能改写，走「新镜像写 exe.new → 旧镜像挪进临时目录 → 原子改名顶上」的换装流程，exe 所在目录不留临时文件）；校验通过后删除旧版 feeds.ini / feeds.txt 完成迁移。尾部写失败（只读介质等）时回退覆盖写 feeds.ini。配置跟着 exe 走：复制 exe 到 U 盘或别的电脑 = 连配置一起带走。
+> 保存流程：按当前模式落地——外挂模式直接覆盖写 `feeds.ini`；内嵌模式把配置写进自身 exe 尾部并读回校验（运行中的 exe 本体不能改写，走「新镜像写 exe.new → 旧镜像挪进临时目录 → 原子改名顶上」的换装流程，exe 所在目录不留临时文件）。内嵌写失败（只读介质等）时自动回退覆盖写 `feeds.ini`。
 
 ## 手机遥控
 
