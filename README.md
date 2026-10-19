@@ -1,5 +1,7 @@
 # LiteTune
 
+English | [简体中文](README.md)
+
 **极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 240 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
 ![size](https://img.shields.io/badge/size-240%20KB-brightgreen?style=for-the-badge)
@@ -23,13 +25,7 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 
-<!-- Begin  Tag -->
-<div class="sf-root" data-id="4153251" data-badge="oss-users-love-us-white" style="width:126px">
-    <a href="https://sourceforge.net/projects/litetune/" target="_blank">LiteTune</a>
-</div>
-<script>(function () {var sc=document.createElement('script');sc.async=true;sc.src='https://b.sf-syn.com/badge_js?sf_id=4153251';var p=document.getElementsByTagName('script')[0];p.parentNode.insertBefore(sc, p);})();
-</script>
-<!-- End  Tag -->
+[![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)
 
 ![LiteTune 界面：桌面端（暗色主题）与手机遥控网页](screenshot.png)
 
@@ -117,7 +113,7 @@ https://example.com/feed2.xml
 
 > 配置仅在启动时读取、退出时保存，运行中不锁定。续播 / 上次听到记录在退出时写入，启动时自动清理已删除订阅的残留。
 >
-> 保存流程：退出时把配置写进自身 exe 尾部并读回校验（运行中的 exe 不能改写只能改名，走「改名-复制-写尾」，残留的隐藏 `.tmp` 下次启动自动删除）；校验通过后删除旧版 feeds.ini / feeds.txt 完成迁移。尾部写失败（只读介质等）时回退覆盖写 feeds.ini。配置跟着 exe 走：复制 exe 到 U 盘或别的电脑 = 连配置一起带走。
+> 保存流程：退出时把配置写进自身 exe 尾部并读回校验（运行中的 exe 本体不能改写，走「新镜像写 exe.new → 旧镜像挪进临时目录 → 原子改名顶上」的换装流程，exe 所在目录不留临时文件）；校验通过后删除旧版 feeds.ini / feeds.txt 完成迁移。尾部写失败（只读介质等）时回退覆盖写 feeds.ini。配置跟着 exe 走：复制 exe 到 U 盘或别的电脑 = 连配置一起带走。
 
 ## 手机遥控
 

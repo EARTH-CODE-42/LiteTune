@@ -2,9 +2,9 @@
  * LiteTune - 纯 C / Win32 播客播放器
  *
  * 功能：
- *   - 配置内嵌 exe 尾部（PE overlay）：单文件便携，复制 exe 即带走全部配置；
- *     首启发现同目录带标记头的 feeds.ini 时弹窗询问迁移；设置菜单支持
- *     导入/导出 OPML 订阅列表与配置 ini
+ *   - 配置双模式（内嵌 exe 尾部 PE overlay / 外挂同目录 feeds.ini）：启动时
+ *     由磁盘现状决定——有 feeds.ini 用外挂，否则用内嵌尾部，两者皆无的首启
+ *     弹窗询问；设置菜单可随时切换，并支持导入/导出 OPML 订阅列表与配置 ini
  *   - 后台线程下载并解析 RSS 2.0（含 itunes 扩展）
  *   - 音频先下载到 cache\ 缓存，再用 Media Foundation 播放，支持离线收听
  *   - 显示码率 / 采样率 / 声道 / 格式 / 进度，支持 seek、暂停、音量
@@ -245,7 +245,8 @@ static int      g_volume = 80;           /* 音量 0-100 */
 static int      g_winW = 480, g_winH = 360;  /* 窗口尺寸（默认=最小 4:3） */
 static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
 static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
-static int      g_cfgFromIni = 0;        /* 配置来自旧 feeds.ini（exe 尾部无配置且用户确认迁移），保存成功后删除 */
+static int      g_cfgExternal = 0;       /* 配置存储模式：1=外挂同目录 feeds.ini 0=内嵌 exe 尾部。
+                                          * 仅运行时依据磁盘现状（有 feeds.ini 即外挂）得出，不写进配置 */
 static int      g_skipSave = 0;          /* 导入配置后退出：不能让旧内存状态覆盖刚导入的尾部 */
 static int      g_darkMode = 1;          /* 夜间模式（存 ini：dark=1，默认开） */
 static int      g_lang = 1;              /* 界面语言：0=简体中文 1=English（存 ini：lang，默认英文） */
@@ -279,6 +280,7 @@ static int  g_posSec = 0, g_durSec = 0;  /* 500ms 定时器缓存的进度（秒
 static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径 */
 static long long g_resumeSec = 0;         /* 待续播的位置（秒） */
 static long long g_resumeSeek100ns = 0;   /* 播放开始事件里一次性消费的待定位 */
+static int       g_resumePaused = 0;      /* 退出时是暂停：重开后定位到位但保持暂停 */
 
 /* 每播客续播标记：记住每个订阅“上次听到哪”（剧集 URL + 秒数）。
  * 键用 feed URL 的 FNV-1a 哈希（列表下标会因增删/排序漂移，URL 不会）；
@@ -362,7 +364,9 @@ enum {
     TR_IMP_TITLE, TR_EXP_OPML_CAP, TR_EXP_INI_CAP, TR_EXP_DONE, TR_EXP_FAIL,
     TR_IMP_INI_Q, TR_IMP_INI_DONE, TR_IMP_WRITE_FAIL,
     TR_IMP_OPML_OK_FMT, TR_IMP_OPML_NONE, TR_IMP_UNKNOWN, TR_IMP_FAIL,
-    TR_MIGRATE_Q, TR_MIGRATE_CAP,
+    TR_CFGMODE_CAP, TR_CFGMODE_BODY, TR_CFGMODE_DELINI_Q,
+    TR_M_CFGMODE, TR_M_CFG_EMB, TR_M_CFG_EXT,
+    TR_CFGMODE_EMB_DONE, TR_CFGMODE_EXT_DONE, TR_CFGMODE_FAIL,
     TR_N
 };
 
@@ -444,9 +448,14 @@ static const wchar_t *tr(int id)
         L"已从 OPML 导入 %d 个新订阅",
         L"OPML 中没有发现新订阅（可能都已存在）",
         L"无法识别的文件格式", L"无法读取文件",
-        L"发现旧版配置文件 feeds.ini，是否迁移到 LiteTune？\r\n"
-            L"（确认后原文件将删除，订阅与设置保存在程序内部）",
-        L"迁移配置"
+        L"配置存储方式",
+        L"首次运行，请选择配置的保存方式（之后可在设置里随时更改）：\r\n\r\n"
+            L"内嵌到程序内：配置写进 exe 尾部，单文件便携，复制 exe 即连配置一起带走。\r\n\r\n"
+            L"外挂 feeds.ini：配置存为同目录的 feeds.ini，便于升级、备份，也可手动编辑。",
+        L"切换到内嵌会删除同目录的 feeds.ini。\r\n是否继续？",
+        L"配置存储位置", L"内嵌到程序内", L"外挂 feeds.ini",
+        L"配置已切换为内嵌", L"配置已切换为外挂 feeds.ini",
+        L"切换配置存储方式失败（exe 被占用或只读？）"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -478,7 +487,7 @@ static const wchar_t *tr(int id)
         L"Invalid URL. Please enter a link starting with http:// or https://",
         L"This feed already exists", L"Maximum number of feeds reached",
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
-        L"Night Mode", L"Language", L"Simplified Chinese", L"English",
+        L"Night Mode", L"Language", L"简体中文", L"English",
         L"Sleep Timer", L"Cancel Sleep Timer", L"Shut down in %d min",
         L"Custom minutes...", L"Custom Sleep Timer",
         L"Shut down in how many minutes (1-600)?",
@@ -536,9 +545,18 @@ static const wchar_t *tr(int id)
         L"Imported %d new feed(s) from OPML",
         L"No new feeds found in the OPML (all may already exist)",
         L"Unrecognized file format", L"Cannot read the file",
-        L"Found feeds.ini from an older version. Import it into LiteTune?\r\n"
-            L"(The original file will be deleted after a successful import)",
-        L"Migrate Configuration"
+        L"Config Storage",
+        L"First run: choose where to store the configuration (changeable later in Settings):\r\n\r\n"
+            L"Embedded in program: written into the exe's tail; truly single-file "
+            L"portable — copying the exe carries the config too.\r\n\r\n"
+            L"External feeds.ini: saved as feeds.ini next to the exe; convenient "
+            L"for upgrades, backups, and manual editing.",
+        L"Switching to embedded will delete the feeds.ini in the same folder.\r\n"
+            L"Continue?",
+        L"Config Storage", L"Embedded in program", L"External feeds.ini",
+        L"Configuration is now embedded",
+        L"Configuration is now external (feeds.ini)",
+        L"Failed to change config storage (exe in use or read-only?)"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -634,6 +652,8 @@ static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
  * 固定偏移访问违例（点按钮即崩）。SetWindowSubclass 有独立存储，安全 */
 static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR id, DWORD_PTR ref);
+static void ApplyDarkTitlebar(HWND hwnd, int dark);
+static void ApplyDarkMenus(HWND hwnd, int dark);
 
 static BOOL CALLBACK MsgBoxBtnEnum(HWND btn, LPARAM lp)
 {
@@ -661,6 +681,24 @@ static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
         FillRect(dc, &rc, DlgBgBrush());
         return 1;
     }
+    case WM_PAINT: {
+        /* 实测激活前系统已按亮色画过、且激活后仍有局部重绘路径绕过
+         * WM_ERASEBKGND（底部按钮区白条）：每次绘制都把客户区填满暗色 */
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, DlgBgBrush());
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        HDC dc = (HDC)wp;
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, DlgBgBrush());
+        return 0;
+    }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         SetBkColor(dc, ThWinBg());
@@ -683,8 +721,19 @@ static LRESULT CALLBACK MsgBoxHookProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HCBT_ACTIVATE) {
         HWND h = (HWND)wp;
+        wchar_t cls[16];
+        /* 只认系统对话框类：弹窗关闭、主窗口重新激活时本钩子还在装着，
+         * 若不拦会把弹窗专用的暗色过程挂到主窗口上——主窗口自己的
+         * WM_DRAWITEM 被截走，按钮图标全部消失 */
+        if (!GetClassNameW(h, cls, 16) || _wcsicmp(cls, L"#32770") != 0)
+            return CallNextHookEx(NULL, code, wp, lp);
         SetWindowSubclass(h, MsgBoxSubProc, 1, 0);   /* 同 id 重装即更新 */
         EnumChildWindows(h, MsgBoxBtnEnum, 0);
+        ApplyDarkTitlebar(h, g_darkMode);   /* 弹窗标题栏跟随暗色（Win10 1809+） */
+        ApplyDarkMenus(h, g_darkMode);      /* 原生暗色主题（按钮/标题栏由系统渲染） */
+        /* 子类化前弹窗可能已按系统配色画过一遍（底部按钮区尤甚），
+         * 强制整窗按暗色重画 */
+        InvalidateRect(h, NULL, TRUE);
     }
     return CallNextHookEx(NULL, code, wp, lp);
 }
@@ -736,6 +785,41 @@ static void ApplyDarkTitlebar(HWND hwnd, int dark)
         }
         FreeLibrary(m);
     }
+}
+
+/* Win10 1809+ 原生暗色菜单/非客户区：uxtheme 未公开接口。
+ * 低版本（含 Win7）按序号取不到函数指针 → 全部跳过，回落系统亮色外观；
+ * 版本号先放行再按序号取值，避免旧版误取到序号 133/135/136 对应的其它函数 */
+typedef int  (WINAPI *SetPreferredAppModeFn)(int);
+typedef void (WINAPI *FlushMenuThemesFn)(void);
+typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
+static void ApplyDarkMenus(HWND hwnd, int dark)
+{
+    static int inited = 0;
+    static AllowDarkModeForWindowFn pAllow = NULL;
+    static FlushMenuThemesFn pFlush = NULL;
+    if (!inited) {
+        LONG (WINAPI *pRtlGetVersion)(void*);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        struct { ULONG sz, major, minor, build, plat; WCHAR csd[128]; } vi;
+        inited = 1;
+        pRtlGetVersion = NULL;
+        *(void**)&pRtlGetVersion = nt ? (void*)GetProcAddress(nt, "RtlGetVersion") : NULL;
+        vi.sz = sizeof(vi); vi.major = 0; vi.minor = 0; vi.build = 0; vi.plat = 0; vi.csd[0] = 0;
+        if (pRtlGetVersion && pRtlGetVersion(&vi) == 0
+            && (vi.major > 10 || (vi.major == 10 && vi.build >= 17763))) {
+            HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+            if (ux) {
+                SetPreferredAppModeFn pMode = NULL;
+                *(void**)&pMode = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+                if (pMode) pMode(1);   /* 1 = AllowDark，菜单跟随本程序自己的夜间开关 */
+                *(void**)&pFlush = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+                *(void**)&pAllow = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+            }
+        }
+    }
+    if (pAllow) pAllow(hwnd, dark ? TRUE : FALSE);
+    if (pFlush) pFlush();
 }
 
 /* 给剧集表头的 3 列设置/取消自绘格式（选中播客会重建列，必须重新应用） */
@@ -937,6 +1021,7 @@ static void ApplyTheme(void)
         LayoutControls(g_hwnd);
     }
     ApplyDarkTitlebar(g_hwnd, g_darkMode);
+    ApplyDarkMenus(g_hwnd, g_darkMode);   /* 菜单/非客户区走系统原生暗色渲染 */
     if (g_hwnd) {
         /* DWM 暗色标题栏属性运行期切换后，需重算非客户区并模拟一次
          * 激活同步，标题栏才会立即按新属性重绘 */
@@ -2472,10 +2557,10 @@ static void ParseSortValue(const char *v)
 
 /* ---------- 配置内嵌 exe 尾部（PE overlay）：单文件便携 ----------
  * 配置跟着 exe 走：复制 exe 到 U 盘/别的电脑 = 连配置一起带走。
- * 运行中的 exe 不能改写只能改名，保存时走「改名-复制-写尾」：
- * 自己改名 .tmp → CopyFile 回原路径 → 在副本上覆盖/追加尾部；
- * 残留的 .tmp 被运行中映像占用删不掉，置隐藏属性，下次启动删除。
- * 已用最小复现工具实测：Defender 实时防护与自定义扫描均无误报。 */
+ * 运行中的 exe 本体不能改写，保存时走「整机换装」：
+ *   新镜像（旧文件 + 新尾部）整体写 exe.new → 旧镜像改名挪进 %TEMP%
+ *   （跨盘失败退回同目录隐藏 exe.tmp）→ exe.new 原子改名顶上。
+ * 残留副本下次启动顺手删除；exe 所在目录正常情况下不留任何临时文件。 */
 
 static const char CFG_TAIL_MAGIC[4] = { 'L','T','S','T' };
 
@@ -2508,53 +2593,143 @@ static char* CfgTailRead(void)
     return buf;
 }
 
-/* 把配置文本写进自身 exe 尾部（有旧尾部则原地覆盖，没有则追加到文件末尾） */
+/* 把配置文本写进自身 exe 尾部（有旧尾部则原地覆盖，没有则追加到文件末尾）。
+ * 见文件头「整机换装」流程说明 */
 static int CfgTailWrite(const char *data, DWORD len)
 {
-    wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8];
-    HANDLE h; LARGE_INTEGER sz, at; DWORD rd, wr; unsigned char hdr[8];
-    LONGLONG tailOff = -1, exeSize = 0;
-    int ok = 0;
+    wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8], dump[MAX_PATH + 8], tdir[MAX_PATH];
+    HANDLE h; LARGE_INTEGER sz; DWORD rd, wr, exeLen = 0, base, nl;
+    LONGLONG tailOff = -1;
+    unsigned char *img = NULL, *ni;
+    int ok = 0, dumped = 0;
 
     if (!data || len == 0 || !GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
-    lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".tmp");
+    lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".new");
+    lstrcpynW(dump, exe, MAX_PATH); lstrcatW(dump, L".tmp");
 
-    /* 先只读探测现有尾部位置与文件大小 */
+    /* 整镜读入内存，并探测现有尾部位置 */
     h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 8) {
-        exeSize = sz.QuadPart;
-        at.QuadPart = sz.QuadPart - 8;
-        if (SetFilePointerEx(h, at, NULL, FILE_BEGIN) && ReadFile(h, hdr, 8, &rd, NULL) && rd == 8
-            && memcmp(hdr + 4, CFG_TAIL_MAGIC, 4) == 0) {
-            DWORD oldLen; memcpy(&oldLen, hdr, 4);
-            if (oldLen > 0 && (LONGLONG)oldLen <= sz.QuadPart - 8)
-                tailOff = sz.QuadPart - 8 - (LONGLONG)oldLen;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 8 && sz.QuadPart <= (1 << 26)) {
+        exeLen = (DWORD)sz.QuadPart;
+        img = (unsigned char*)malloc((size_t)exeLen);
+        if (img && ReadFile(h, img, exeLen, &rd, NULL) && rd == exeLen) {
+            if (memcmp(img + exeLen - 4, CFG_TAIL_MAGIC, 4) == 0) {
+                DWORD oldLen; memcpy(&oldLen, img + exeLen - 8, 4);
+                if (oldLen > 0 && (LONGLONG)oldLen <= exeLen - 8)
+                    tailOff = exeLen - 8 - (LONGLONG)oldLen;
+            }
+        } else { free(img); img = NULL; }
+    }
+    CloseHandle(h);
+    if (!img) return 0;
+
+    /* 新镜像 = 截掉旧尾部 + 新配置 + 长度 + 魔数，整体写 exe.new */
+    base = (tailOff >= 0) ? (DWORD)tailOff : exeLen;
+    nl = base + len + 8;
+    ni = (unsigned char*)malloc(nl);
+    if (!ni) { free(img); return 0; }
+    memcpy(ni, img, base);
+    memcpy(ni + base, data, len);
+    memcpy(ni + base + len, &len, 4);
+    memcpy(ni + base + len + 4, CFG_TAIL_MAGIC, 4);
+    free(img);
+    DeleteFileW(tmp);
+    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        ok = WriteFile(h, ni, nl, &wr, NULL) && wr == nl;
+        CloseHandle(h);
+    }
+    free(ni);
+    if (!ok) return 0;
+
+    /* 旧镜像挪走：优先 %TEMP%（exe 目录不留痕迹），跨盘失败退回同目录 .tmp */
+    if (GetTempPathW(MAX_PATH, tdir)) {
+        lstrcatW(tdir, L"LiteTune_old.exe");
+        if (MoveFileExW(exe, tdir, MOVEFILE_REPLACE_EXISTING)) {
+            lstrcpynW(dump, tdir, MAX_PATH);
+            dumped = 1;
         }
     }
-    CloseHandle(h);
-    if (!exeSize) return 0;
+    if (!dumped) {
+        DeleteFileW(dump);
+        if (!MoveFileExW(exe, dump, MOVEFILE_REPLACE_EXISTING)) return 0;
+    }
+    if (!MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(dump, exe, MOVEFILE_REPLACE_EXISTING);   /* 尽力回滚改名 */
+        return 0;
+    }
+    if (!dumped) SetFileAttributesW(dump, FILE_ATTRIBUTE_HIDDEN);
+    return 1;
+}
 
-    DeleteFileW(tmp);   /* 清掉上次残留（隐藏属性不影响删除） */
-    if (!MoveFileExW(exe, tmp, MOVEFILE_REPLACE_EXISTING)) return 0;
-    if (!CopyFileW(tmp, exe, FALSE)) {
-        MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING);   /* 尽力回滚改名 */
-        return 0;
+/* 外挂配置文件的完整路径（exe 同目录 feeds.ini） */
+static void CfgExternalPath(wchar_t *out, int outMax)
+{
+    ExeDir(out, outMax);
+    wcscat_s(out, (size_t)outMax, L"feeds.ini");
+}
+
+/* 剥离自身 exe 尾部的内嵌配置（切换到外挂模式时调用），走与 CfgTailWrite 相同的
+ * 整机换装流程。本就无尾部时视为成功；失败返回 0（不阻断，外挂 ini 仍生效） */
+static int CfgStripTail(void)
+{
+    wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8], dump[MAX_PATH + 8], tdir[MAX_PATH];
+    HANDLE h; LARGE_INTEGER sz; DWORD rd, wr, exeLen, base;
+    unsigned char *img;
+    int ok = 0, dumped = 0;
+
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+    lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".new");
+    lstrcpynW(dump, exe, MAX_PATH); lstrcatW(dump, L".tmp");
+
+    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 8 || sz.QuadPart > (1 << 26)) {
+        CloseHandle(h); return 0;
     }
-    h = CreateFileW(exe, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING);
-        return 0;
+    exeLen = (DWORD)sz.QuadPart;
+    img = (unsigned char*)malloc(exeLen);
+    if (!img || !ReadFile(h, img, exeLen, &rd, NULL) || rd != exeLen) {
+        free(img); CloseHandle(h); return 0;
     }
-    at.QuadPart = (tailOff >= 0) ? tailOff : exeSize;
-    ok = SetFilePointerEx(h, at, NULL, FILE_BEGIN)
-      && WriteFile(h, data, len, &wr, NULL) && wr == len
-      && WriteFile(h, &len, 4, &wr, NULL) && wr == 4
-      && WriteFile(h, CFG_TAIL_MAGIC, 4, &wr, NULL) && wr == 4
-      && SetEndOfFile(h);
     CloseHandle(h);
-    SetFileAttributesW(tmp, FILE_ATTRIBUTE_HIDDEN);   /* 残留副本隐藏，下次启动删除 */
-    return ok;
+
+    base = exeLen;
+    if (memcmp(img + exeLen - 4, CFG_TAIL_MAGIC, 4) == 0) {
+        DWORD oldLen; memcpy(&oldLen, img + exeLen - 8, 4);
+        if (oldLen > 0 && (LONGLONG)oldLen <= exeLen - 8)
+            base = exeLen - 8 - oldLen;
+    }
+    if (base == exeLen) { free(img); return 1; }   /* 本就无尾部 */
+
+    DeleteFileW(tmp);
+    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        ok = WriteFile(h, img, base, &wr, NULL) && wr == base;
+        CloseHandle(h);
+    }
+    free(img);
+    if (!ok) return 0;
+
+    /* 旧镜像挪走，与新镜像原子换装（与 CfgTailWrite 同一套流程） */
+    if (GetTempPathW(MAX_PATH, tdir)) {
+        lstrcatW(tdir, L"LiteTune_old.exe");
+        if (MoveFileExW(exe, tdir, MOVEFILE_REPLACE_EXISTING)) {
+            lstrcpynW(dump, tdir, MAX_PATH);
+            dumped = 1;
+        }
+    }
+    if (!dumped) {
+        DeleteFileW(dump);
+        if (!MoveFileExW(exe, dump, MOVEFILE_REPLACE_EXISTING)) return 0;
+    }
+    if (!MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(dump, exe, MOVEFILE_REPLACE_EXISTING);   /* 尽力回滚改名 */
+        return 0;
+    }
+    if (!dumped) SetFileAttributesW(dump, FILE_ATTRIBUTE_HIDDEN);
+    return 1;
 }
 
 /* ---------- 配置文本动态缓冲 ---------- */
@@ -2616,6 +2791,7 @@ static void ParseConfigLine(char *line)
         else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
         else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
         else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
+        else if (strcmp(s, "resumeplay") == 0) { g_resumePaused = (atoi(val) == 0); }
         else if (strcmp(s, "lastep") == 0) {
             /* 格式 lastep=<hash hex>,<sec>,<utf8url 余下整行> */
             unsigned int h; long long sec;
@@ -2667,6 +2843,147 @@ static int MemHasCfgMarker(const char *buf)
     return strncmp(s, "; LiteTune config", 17) == 0;
 }
 
+/* ---- 首启弹窗：选语言 + 选配置存储方式 ----
+ * 主窗口尚未创建、g_lang 仍是默认值时弹出。顶部 中文/English 按钮点选即切换
+ * 本弹窗文案（并把 g_lang 定为该语言，稍后建窗即用此语言）；底部两个按钮
+ * 选定存储方式。关闭对话框按「内嵌」处理。 */
+#define ID_FR_ZH   1
+#define ID_FR_EN   2
+#define ID_FR_BODY 3
+#define ID_FR_EMB  4
+#define ID_FR_EXT  5
+
+static int g_frResult = 0;   /* 1=外挂 feeds.ini 0=内嵌 exe 尾部 -1=用户关窗（退出程序） */
+static int g_skipStartup = 0;   /* 首启弹窗被关闭：放弃启动，wWinMain 直接退出 */
+
+/* 按当前 g_lang 刷新本弹窗内的文案 */
+static void FrRelabel(HWND h)
+{
+    SetWindowTextW(GetDlgItem(h, ID_FR_BODY), tr(TR_CFGMODE_BODY));
+    SetWindowTextW(GetDlgItem(h, ID_FR_EMB), tr(TR_M_CFG_EMB));
+    SetWindowTextW(GetDlgItem(h, ID_FR_EXT), tr(TR_M_CFG_EXT));
+}
+
+static LRESULT CALLBACK FirstRunProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        UINT bs = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+        HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HWND c;
+        if (g_darkMode) bs |= BS_OWNERDRAW;   /* 暗色按钮自绘 */
+        c = CreateWindowExW(0, L"BUTTON", tr(TR_LANG_ZH), bs | BS_PUSHBUTTON,
+            12, 12, 84, 28, h, (HMENU)(INT_PTR)ID_FR_ZH, NULL, NULL);
+        SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+        c = CreateWindowExW(0, L"BUTTON", tr(TR_LANG_EN), bs | BS_PUSHBUTTON,
+            102, 12, 96, 28, h, (HMENU)(INT_PTR)ID_FR_EN, NULL, NULL);
+        SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+        c = CreateWindowExW(0, L"STATIC", tr(TR_CFGMODE_BODY),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            12, 52, 436, 128, h, (HMENU)(INT_PTR)ID_FR_BODY, NULL, NULL);
+        SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+        c = CreateWindowExW(0, L"BUTTON", tr(TR_M_CFG_EMB), bs | BS_DEFPUSHBUTTON,
+            42, 190, 180, 30, h, (HMENU)(INT_PTR)ID_FR_EMB, NULL, NULL);
+        SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+        c = CreateWindowExW(0, L"BUTTON", tr(TR_M_CFG_EXT), bs | BS_PUSHBUTTON,
+            238, 190, 180, 30, h, (HMENU)(INT_PTR)ID_FR_EXT, NULL, NULL);
+        SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        if (g_darkMode) {
+            HDC dc = (HDC)wp;
+            RECT rc;
+            GetClientRect(h, &rc);
+            FillRect(dc, &rc, DlgBgBrush());
+            return 1;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+        if (g_darkMode) {
+            HDC dc = (HDC)wp;
+            SetBkColor(dc, ThWinBg());
+            SetTextColor(dc, ThText());
+            return (LRESULT)DlgBgBrush();
+        }
+        break;
+    case WM_DRAWITEM:
+        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
+            DrawDarkBtn((DRAWITEMSTRUCT*)lp);
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (HIWORD(wp) != BN_CLICKED) return 0;
+        if (LOWORD(wp) == ID_FR_ZH || LOWORD(wp) == ID_FR_EN) {
+            int nl = (LOWORD(wp) == ID_FR_EN) ? 1 : 0;
+            if (nl != g_lang) { g_lang = nl; FrRelabel(h); }
+            return 0;
+        }
+        if (LOWORD(wp) == ID_FR_EMB || LOWORD(wp) == ID_FR_EXT) {
+            g_frResult = (LOWORD(wp) == ID_FR_EXT) ? 1 : 0;
+            DestroyWindow(h);
+            return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        g_frResult = -1;   /* 关闭 = 什么都不做，退出程序 */
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* 模态弹出首启弹窗，返回 1=外挂 0=内嵌 -1=用户关闭弹窗（应退出程序） */
+static int AskFirstRunMode(void)
+{
+    static const wchar_t *FR_CLASS = L"LpFirstRun";
+    WNDCLASSW wc;
+    HWND d;
+    RECT scr, rc;
+    MSG m;
+
+    if (!GetClassInfoW(GetModuleHandleW(NULL), FR_CLASS, &wc)) {
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = FirstRunProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = FR_CLASS;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassW(&wc);
+    }
+
+    g_frResult = 0;
+    {
+        RECT wr = { 0, 0, 460, 232 };
+        AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                           FALSE, WS_EX_DLGMODALFRAME);
+        d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, FR_CLASS,
+            L"LiteTune", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            0, 0, wr.right - wr.left, wr.bottom - wr.top,
+            NULL, NULL, GetModuleHandleW(NULL), NULL);
+    }
+    if (!d) return 0;
+
+    /* 此刻主窗口还没建：居中到屏幕工作区 */
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &scr, 0);
+    GetWindowRect(d, &rc);
+    SetWindowPos(d, NULL,
+        scr.left + ((scr.right - scr.left) - (rc.right - rc.left)) / 2,
+        scr.top  + ((scr.bottom - scr.top)  - (rc.bottom - rc.top)) / 2,
+        0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+    ShowWindow(d, SW_SHOW);
+    UpdateWindow(d);
+    while (IsWindow(d) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(d, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    return g_frResult;
+}
+
 /* 检查文件开头是否带 LiteTune 配置标记（只读前 64 字节） */
 static int FileHasCfgMarker(const wchar_t *path)
 {
@@ -2683,7 +3000,8 @@ static int FileHasCfgMarker(const wchar_t *path)
 
 /* 只在程序启动时调用一次（读取订阅与全部界面设置）；
  * 运行期间的增删/排序/刷新都在内存里进行，退出时由 SaveConfig 统一写回。
- * 配置来源：exe 尾部内嵌 > 首启时同目录带标记头的 feeds.ini（弹窗确认迁移） */
+ * 配置来源由磁盘现状决定：同目录 feeds.ini（外挂）> exe 尾部内嵌；两者皆无
+ * 则首启询问用户选哪种，此后一律以文件现状为准（模式不写进配置本身） */
 static void LoadConfig(void)
 {
     wchar_t iniPath[MAX_PATH];
@@ -2703,40 +3021,46 @@ static void LoadConfig(void)
     g_darkMode = 1;
     g_lang = 1;
     g_speed = 100;
-    g_cfgFromIni = 0;
+    g_cfgExternal = 0;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
+    g_resumePaused = 0;
     LastEpFreeAll();
 
-    /* 上次保存残留的隐藏改名副本，此时已无占用，顺手删除 */
+    /* 上次保存残留的改名副本（此时已无占用），顺手删除 */
     {
-        wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8];
+        wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8], tdir[MAX_PATH];
         if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
             lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".tmp");
             DeleteFileW(tmp);
+            lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".new");
+            DeleteFileW(tmp);
+        }
+        if (GetTempPathW(MAX_PATH, tdir)) {
+            lstrcatW(tdir, L"LiteTune_old.exe");
+            DeleteFileW(tdir);
         }
     }
 
-    /* 1) 优先读 exe 尾部内嵌配置（单文件便携） */
-    tailCfg = CfgTailRead();
-    if (tailCfg) {
+    /* 1) 同目录 feeds.ini 存在 = 外挂模式（内嵌尾部一律作废） */
+    CfgExternalPath(iniPath, MAX_PATH);
+    if (FileHasCfgMarker(iniPath)) {
+        g_cfgExternal = 1;
+        f = _wfsopen(iniPath, L"rb", _SH_DENYNO);
+        if (f) {
+            while (fgets(line, sizeof(line), f)) ParseConfigLine(line);
+            fclose(f);
+        }
+    } else if ((tailCfg = CfgTailRead()) != NULL) {
+        /* 2) 无 ini，有内嵌尾部 = 内嵌模式 */
+        g_cfgExternal = 0;
         ParseConfigMem(tailCfg);
         free(tailCfg);
     } else {
-        /* 2) 首启（尾部无配置）：同目录发现带标记头的 feeds.ini 时询问迁移。
-         *    不认识的文件绝不碰；feeds.txt 不再自动迁移（需要时用「导入」） */
-        ExeDir(iniPath, MAX_PATH);
-        wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
-        if (FileHasCfgMarker(iniPath)
-            && MessageBoxTh(NULL, tr(TR_MIGRATE_Q), tr(TR_MIGRATE_CAP),
-                           MB_YESNO | MB_ICONQUESTION) == IDYES) {
-            f = _wfsopen(iniPath, L"rb", _SH_DENYNO);
-            if (f) {
-                while (fgets(line, sizeof(line), f)) ParseConfigLine(line);
-                fclose(f);
-                g_cfgFromIni = 1;   /* 尾部写成功并校验后删除源文件 */
-            }
-        }
+        /* 3) 首次运行（既无 ini 也无内嵌配置）：弹首启弹窗，选语言 + 选存储方式。
+         *    用户关窗 = 放弃启动 */
+        g_cfgExternal = AskFirstRunMode();
+        if (g_cfgExternal < 0) { g_skipStartup = 1; return; }
     }
 
     if (g_w1perm < 100 || g_w1perm > 800) g_w1perm = 323;
@@ -2789,6 +3113,7 @@ static char *BuildConfigText(DWORD *lenOut)
         char *u8;
         if (pos < 0) pos = 0;
         SbAddf(&sb, "resume=%d\n", (int)(pos / 10000000LL));
+        SbAddf(&sb, "resumeplay=%d\n", g_playState == 1 ? 1 : 0);
         u8 = WToU8(g_playUrl);
         if (u8) { SbAddf(&sb, "resumeurl=%s\n", u8); free(u8); }
         /* 退出时刻把当前剧集精确写入每播客标记（订阅视图才记） */
@@ -2823,8 +3148,8 @@ static char *BuildConfigText(DWORD *lenOut)
     return sb.p;
 }
 
-/* 仅在退出时调用一次：优先把配置写进自身 exe 尾部（写后读回校验，通过才删除
- * 迁移源 ini）；尾部写失败（只读介质等）回退覆盖写 feeds.ini，静默放弃 */
+/* 仅在退出时调用一次：按当前模式分流——外挂直接覆盖写同目录 feeds.ini；
+ * 内嵌写进自身 exe 尾部（写后读回校验），失败才回退覆盖写 feeds.ini */
 static void SaveConfig(void)
 {
     wchar_t iniPath[MAX_PATH];
@@ -2832,10 +3157,9 @@ static void SaveConfig(void)
     DWORD clen = 0;
     char *cfg;
 
-    if (g_skipSave) return;   /* 导入配置后退出：不能让旧内存状态覆盖刚导入的尾部 */
+    if (g_skipSave) return;   /* 导入配置后退出：不能让旧内存状态覆盖刚导入的配置 */
 
-    ExeDir(iniPath, MAX_PATH);
-    wcscat_s(iniPath, MAX_PATH, L"feeds.ini");
+    CfgExternalPath(iniPath, MAX_PATH);
 
     /* 退出前回收剧集三列的实际宽度 */
     if (g_listEp) {
@@ -2850,30 +3174,36 @@ static void SaveConfig(void)
     }
 
     cfg = BuildConfigText(&clen);
-    if (cfg && CfgTailWrite(cfg, clen)) {
-        /* 写后读回校验，确认无误才视为成功 */
-        char *v = CfgTailRead();
-        if (v && clen == strlen(v) && memcmp(v, cfg, clen) == 0) {
-            free(v);
-            free(cfg);
-            /* 迁移完成：删除旧配置文件 */
-            if (g_cfgFromIni) {
-                DeleteFileW(iniPath);
-                g_cfgFromIni = 0;
-            }
-            return;
-        }
-        free(v);
-    }
-    if (cfg) {
-        /* 回退：尾部写失败或校验不符（只读介质/异常），覆盖写 feeds.ini */
+    if (!cfg) return;
+
+    if (g_cfgExternal) {
+        /* 外挂模式：直接写 feeds.ini */
         f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
         if (f) {
             fwrite(cfg, 1, clen, f);
             fclose(f);
         }
         free(cfg);
+        return;
     }
+
+    /* 内嵌模式：写 exe 尾部，写后读回校验 */
+    if (CfgTailWrite(cfg, clen)) {
+        char *v = CfgTailRead();
+        if (v && clen == strlen(v) && memcmp(v, cfg, clen) == 0) {
+            free(v);
+            free(cfg);
+            return;
+        }
+        free(v);
+    }
+    /* 回退：尾部写失败或校验不符（只读介质/异常），覆盖写 feeds.ini */
+    f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
+    if (f) {
+        fwrite(cfg, 1, clen, f);
+        fclose(f);
+    }
+    free(cfg);
 }
 
 /* ================= 排序 ================= */
@@ -4607,12 +4937,14 @@ static Podcast* ActivePodcast(void)
     return NULL;
 }
 
-/* 用当前播客的剧集填充 ListView（调用前数组应已排序） */
+/* 用当前播客的剧集填充 ListView（调用前数组应已排序）。
+ * WM_SETREDRAW 括起来：几百条时逐条插入的中间重绘既闪又慢，一次画完秒出 */
 static void FillEpisodeList(void)
 {
     Podcast *p = ActivePodcast();
     int i;
     if (!p) return;
+    SendMessageW(g_listEp, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     for (i = 0; i < p->epCount; i++) {
         wchar_t dur[16];
@@ -4637,6 +4969,8 @@ static void FillEpisodeList(void)
         lvi.pszText = p->eps[i].durationSec > 0 ? dur : L"";
         SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&lvi);
     }
+    SendMessageW(g_listEp, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_listEp, NULL, TRUE);
 }
 
 /* 构建剧集 tooltip 文本（标题+播客/日期+时长），写入 buf */
@@ -4982,7 +5316,8 @@ static void PlayAdjacent(int delta)
     RequestPlayEpisode(pod, target);
 }
 
-/* 启动续播：feeds 加载完成后按 g_resumeUrl 定位剧集并自动播放。
+/* 启动续播：feeds 加载完成后按 g_resumeUrl 定位剧集恢复播放。
+ * 退出时是暂停（g_resumePaused）则在 PLAY 事件里定位后立即暂停回暂停态。
  * 匹配依据是剧集 enclosure URL（离线视图里是本地 mp3 路径），排序/增删不影响。
  * 找到后置 g_resumeSeek100ns，由 MFP_EVENT_TYPE_PLAY 一次性应用定位。 */
 static void TryResumePlayback(void)
@@ -5295,21 +5630,21 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         e = CreateWindowExW(g_darkMode ? 0 : WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
-            12, 32, 356, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
+            12, 36, 408, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
         lab = CreateWindowExW(0, L"STATIC",
             g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_INPUT_LABEL),
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 10, 356, 18, h, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 12, 408, 18, h, NULL, NULL, NULL);
         if (g_darkMode) btnStyle |= BS_OWNERDRAW;   /* 暗色按钮自绘 */
         if (g_ibMode == 0)
             CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
                 btnStyle | BS_PUSHBUTTON,
-                12, 72, 140, 26, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
+                12, 74, 168, 26, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
         CreateWindowExW(0, L"BUTTON", tr(TR_OK),
             btnStyle | BS_DEFPUSHBUTTON,
-            212, 72, 72, 26, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+            276, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
         CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
             btnStyle | BS_PUSHBUTTON,
-            296, 72, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+            348, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
         SendMessageW(e, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(lab, WM_SETFONT, (WPARAM)g_font, TRUE);
         SetFocus(e);
@@ -5432,10 +5767,17 @@ static int AskInputBox(const wchar_t *title, int mode)
     g_ibMode = mode;
     g_ibResult = 0;
     g_ibBuf[0] = 0;
-    d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, IB_CLASS,
-        title,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        0, 0, 384, 138, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    /* 按目标客户区 432x112 反算含边框标题栏的外尺寸（四边留出间距） */
+    {
+        RECT wr = { 0, 0, 432, 112 };
+        AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                           FALSE, WS_EX_DLGMODALFRAME);
+        d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, IB_CLASS,
+            title,
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            0, 0, wr.right - wr.left, wr.bottom - wr.top,
+            g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    }
     if (!d) return 0;
 
     /* 居中到主窗口 */
@@ -6577,11 +6919,21 @@ static void DoImport(void)
     }
 
     if (MemHasCfgMarker(buf)) {
-        /* 配置 ini：确认后写进 exe 尾部；g_skipSave 保证退出时不被旧内存覆盖 */
+        /* 配置 ini：确认后按当前模式落地（外挂写 feeds.ini / 内嵌写 exe 尾部）；
+         * g_skipSave 保证退出时不被旧内存状态覆盖 */
         if (MessageBoxTh(g_hwnd, tr(TR_IMP_INI_Q), tr(TR_IMP_TITLE),
                         MB_YESNO | MB_ICONQUESTION) == IDYES) {
             int ok = 0;
-            if (CfgTailWrite(buf, len)) {
+            if (g_cfgExternal) {
+                wchar_t iniPath[MAX_PATH];
+                FILE *f;
+                CfgExternalPath(iniPath, MAX_PATH);
+                f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
+                if (f) {
+                    ok = ((DWORD)fwrite(buf, 1, len, f) == len);
+                    fclose(f);
+                }
+            } else if (CfgTailWrite(buf, len)) {
                 char *v = CfgTailRead();
                 ok = (v && len == strlen(v) && memcmp(v, buf, len) == 0);
                 free(v);
@@ -6616,12 +6968,61 @@ static void DoImport(void)
     free(buf);
 }
 
+/* 切换配置存储模式：0=内嵌 exe 尾部，1=外挂同目录 feeds.ini。
+ * 仅由用户在此手动切换；启动时的模式一律由磁盘现状决定（见 LoadConfig） */
+static void CfgSwitchMode(int external)
+{
+    wchar_t iniPath[MAX_PATH];
+    DWORD len = 0;
+    char *cfg;
+    FILE *f;
+
+    if (external == g_cfgExternal) return;
+    CfgExternalPath(iniPath, MAX_PATH);
+
+    if (external) {
+        /* 切外挂：先把当前配置写入 feeds.ini，再剥离 exe 尾部内嵌配置（防尾随分发） */
+        cfg = BuildConfigText(&len);
+        if (!cfg) return;
+        f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
+        if (!f) {
+            free(cfg);
+            MessageBoxTh(g_hwnd, tr(TR_CFGMODE_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+            return;
+        }
+        fwrite(cfg, 1, len, f);
+        fclose(f);
+        free(cfg);
+        CfgStripTail();   /* 尽力剥离，失败不影响外挂生效 */
+        g_cfgExternal = 1;
+        SetStatusTemp(tr(TR_CFGMODE_EXT_DONE));
+    } else {
+        /* 切内嵌：存在 feeds.ini 时先征得同意（切换即删除），再写尾部 */
+        if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES
+            && MessageBoxTh(g_hwnd, tr(TR_CFGMODE_DELINI_Q), tr(TR_CFGMODE_CAP),
+                            MB_YESNO | MB_ICONQUESTION) != IDYES)
+            return;
+        cfg = BuildConfigText(&len);
+        if (!cfg) return;
+        if (!CfgTailWrite(cfg, len)) {
+            free(cfg);
+            MessageBoxTh(g_hwnd, tr(TR_CFGMODE_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
+            return;
+        }
+        free(cfg);
+        DeleteFileW(iniPath);
+        g_cfgExternal = 0;
+        SetStatusTemp(tr(TR_CFGMODE_EMB_DONE));
+    }
+}
+
 static void OnSettingsButton(void)
 {
     HMENU menu = CreatePopupMenu();
     HMENU sub  = CreatePopupMenu();
     HMENU lang = CreatePopupMenu();
     HMENU exp  = CreatePopupMenu();
+    HMENU cm   = CreatePopupMenu();
     POINT pt;
     int cmd;
     wchar_t curDir[MAX_PATH];
@@ -6644,6 +7045,9 @@ static void OnSettingsButton(void)
     AppendMenuW(lang, MF_STRING | (g_lang == 0 ? MF_CHECKED : 0), 20, tr(TR_LANG_ZH));
     AppendMenuW(lang, MF_STRING | (g_lang == 1 ? MF_CHECKED : 0), 21, tr(TR_LANG_EN));
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)lang, tr(TR_M_LANGUAGE));
+    AppendMenuW(cm, MF_STRING | (g_cfgExternal ? 0 : MF_CHECKED), 25, tr(TR_M_CFG_EMB));
+    AppendMenuW(cm, MF_STRING | (g_cfgExternal ? MF_CHECKED : 0), 26, tr(TR_M_CFG_EXT));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)cm, tr(TR_M_CFGMODE));
     for (i = 0; i < nMins; i++) {
         wchar_t t[32];
         swprintf(t, 32, tr(TR_SHUT_IN_MINS_FMT), mins[i]);
@@ -6671,6 +7075,8 @@ static void OnSettingsButton(void)
     if (cmd == 22) { DoImport(); return; }
     if (cmd == 23) { DoExportOpml(); return; }
     if (cmd == 24) { DoExportIni(); return; }
+    if (cmd == 25) { CfgSwitchMode(0); return; }
+    if (cmd == 26) { CfgSwitchMode(1); return; }
     if (cmd == 4) {
         g_darkMode = !g_darkMode;
         ApplyTheme();
@@ -7394,12 +7800,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    case WM_MEASUREITEM:
-        if (((MEASUREITEMSTRUCT*)lParam)->CtlID == IDC_LIST_POD) {
-            ((MEASUREITEMSTRUCT*)lParam)->itemHeight = 54;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT *mi = (MEASUREITEMSTRUCT*)lParam;
+        if (mi->CtlID == IDC_LIST_POD) {
+            mi->itemHeight = 54;
             return TRUE;
         }
         break;
+    }
 
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lParam;
@@ -8301,6 +8709,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
                     }
                 }
+                /* 退出时是暂停：定位完成即暂停，恢复到暂停状态（不自动出声） */
+                if (g_resumePaused) {
+                    g_resumePaused = 0;
+                    PauseResume();
+                }
                 if (g_listPod) InvalidateRect(g_listPod, NULL, TRUE);   /* 标题变绿 */
                 if (g_listEp) InvalidateRect(g_listEp, NULL, TRUE);    /* 剧集变绿 */
                 UpdateWindowTitle();
@@ -8532,6 +8945,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     /* 建窗前读取配置：排序/列宽/音量/窗口尺寸 */
     LoadConfig();
+    if (g_skipStartup) return 0;   /* 首启弹窗被关闭：不建窗直接退出 */
     EnsureCacheDir();   /* 配置里可能有自定义缓存目录，先确保存在 */
 
     /* 清理 30 天前的旧缓存（仅默认 %TEMP% 目录；自定义目录由用户自己管理） */
@@ -8620,10 +9034,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     if (!hwnd) return 1;
     g_hwnd = hwnd;
 
+    ApplyTheme();    /* 显示前应用主题（含暗色标题栏）：首帧即终态，不闪 */
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
     SetStatus(tr(TR_READY));   /* 初始状态文本跟随语言（静态初值固定为中文） */
-    ApplyTheme();    /* 若 ini 里 dark=1：暗色标题栏/表头/滚动条一次到位 */
     ReloadFeeds(0);   /* 启动：订阅缓存优先，已下载过就无需重新联网 */
     /* 离线启动时订阅可能加载很慢/失败：先立即挂上“已缓存”行，不等订阅 */
     RefreshCachedEntry();
