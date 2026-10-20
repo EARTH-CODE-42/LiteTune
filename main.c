@@ -198,13 +198,10 @@ static HICON    g_trayIco = NULL;    /* 托盘小图标（资源加载，退出�
 #endif
 
 /* 托盘迷你控制浮窗：4 个按钮（上一曲/播放暂停/下一曲/随机下一曲），
- * 体验对齐任务栏缩略图工具栏；鼠标悬停托盘图标即弹出，移开自动收起 */
+ * 体验对齐任务栏缩略图工具栏；左键单击托盘图标弹出，再点收起 */
 #define FLY_CLASS L"LiteTuneFlyout"
 static HWND     g_fly = NULL;        /* 浮窗（popup，平时隐藏） */
 static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
-static POINT    g_flyAnchor;         /* 弹出时托盘图标位置（光标点） */
-static int      g_flyMiss = 0;       /* 定时器连续判空次数，达 2 次即自动收起 */
-#define FLY_TMR   1                  /* 自动收起定时器 ID */
 #define FLY_PAD   6                  /* 浮窗内边距 */
 #define FLY_BTN   32                 /* 按钮边长 */
 #define FLY_GAP   2                  /* 按钮间距 */
@@ -5319,6 +5316,37 @@ static void PlayAdjacent(int delta)
     RequestPlayEpisode(pod, target);
 }
 
+/* 双击播客：优先续播“上次听到哪”的橙色剧集，无记录则从第 1 集开始。
+ * 与剧集列表双击同一约定：先置 g_resumeSeek100ns，再由 PLAY 事件一次性定位。 */
+static void PlayPodcastDefault(int pod)
+{
+    int target = 0, i;
+    Podcast *p;
+    LastEp *le;
+    if (pod < 0 || pod > g_podCount) return;
+    if (pod == g_podCount) {            /* 缓存聚合视图：无“上次听到”概念 */
+        if (g_cachePod.epCount <= 0) return;
+        g_resumeSeek100ns = 0;
+        RequestPlayEpisode(pod, 0);
+        return;
+    }
+    p = &g_pods[pod];
+    if (p->epCount <= 0) return;        /* 加载失败/无剧集 */
+    le = p->feedUrl ? LastEpFind(LastEpHash(p->feedUrl)) : NULL;
+    g_resumeSeek100ns = 0;
+    if (le && le->sec > 0 && le->epUrl) {
+        for (i = 0; i < p->epCount; i++) {
+            if (p->eps[i].url && wcscmp(p->eps[i].url, le->epUrl) == 0) {
+                target = i;
+                g_resumeSeek100ns = le->sec * 10000000LL;
+                break;
+            }
+        }
+        /* 记录里的那集已不在当前列表（订阅源下架等）→ 落回第 1 集 */
+    }
+    RequestPlayEpisode(pod, target);
+}
+
 /* 启动续播：feeds 加载完成后按 g_resumeUrl 定位剧集恢复播放。
  * 退出时是暂停（g_resumePaused）则在 PLAY 事件里定位后立即暂停回暂停态。
  * 匹配依据是剧集 enclosure URL（离线视图里是本地 mp3 路径），排序/增删不影响。
@@ -7251,31 +7279,12 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hwnd, NULL, TRUE);
         }
         return 0;
-    case WM_TIMER:
-        /* 悬停弹出后，鼠标移离「浮窗 + 托盘图标」区域一段时间即自动收起 */
-        if (wp == FLY_TMR) {
-            POINT c, a = g_flyAnchor;
-            RECT f, z;
-            GetCursorPos(&c);
-            GetWindowRect(hwnd, &f);
-            InflateRect(&f, 12, 12);
-            SetRect(&z, a.x - 24, a.y - 24, a.x + 24, a.y + 24);
-            if (!PtInRect(&f, c) && !PtInRect(&z, c)) {
-                if (++g_flyMiss >= 2) {
-                    KillTimer(hwnd, FLY_TMR);
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-            } else g_flyMiss = 0;
-        }
-        return 0;
     case WM_ACTIVATE:
         /* 点击浮窗以外的地方→失去激活→自动收起。
          * 不能用 WM_KILLFOCUS：点击窗内按钮时焦点会转到子控件，父窗随之收到
          * KILLFOCUS 而立即隐藏，导致 4 个按钮「按下去没反应」。 */
-        if (LOWORD(wp) == WA_INACTIVE) {
-            KillTimer(hwnd, FLY_TMR);
+        if (LOWORD(wp) == WA_INACTIVE)
             ShowWindow(hwnd, SW_HIDE);
-        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -7305,7 +7314,6 @@ static void ShowFlyout(void)
     if (!g_fly) return;
     g_flyHover = -1;
     GetCursorPos(&pt);
-    g_flyAnchor = pt;               /* 记下图标位置，供自动收起判定 */
     wr.left = pt.x - FLY_W / 2;
     wr.top = pt.y - FLY_H - 8;      /* 光标上方 8px */
     wr.right = wr.left + FLY_W;
@@ -7330,9 +7338,6 @@ static void ShowFlyout(void)
         SWP_NOSIZE | SWP_SHOWWINDOW);
     /* 接管前台：点击浮窗外时收到 WM_ACTIVATE(WA_INACTIVE) 自动隐藏 */
     SetForegroundWindow(g_fly);
-    /* 鼠标移离「浮窗 + 图标」区域一段时间后自动收起 */
-    g_flyMiss = 0;
-    SetTimer(g_fly, FLY_TMR, 200, NULL);
 }
 
 /* ---- 任务栏缩略图工具栏（ITaskbarList3） ---- */
@@ -8268,6 +8273,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (HIWORD(wParam) == LBN_SELCHANGE) {
             if (LOWORD(wParam) == IDC_LIST_POD)
                 SelectPodcast((int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0));
+        } else if (HIWORD(wParam) == LBN_DBLCLK) {
+            /* 双击播客：播橙色（上次听到）剧集，无记录则从第 1 集开始 */
+            if (LOWORD(wParam) == IDC_LIST_POD)
+                PlayPodcastDefault((int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0));
         } else if (HIWORD(wParam) == BN_CLICKED) {
             int id = LOWORD(wParam);
             if (id == IDC_BTN_PLAY) PauseResume();
@@ -8840,11 +8849,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件。
      * 左键单击：弹出迷你控制浮窗；右键：显示主窗口/退出菜单 */
     case WM_TRAYICON:
-        /* 鼠标移到托盘图标上即弹出浮窗（双击 / 右键行为不变） */
-        if (LOWORD(lParam) == WM_MOUSEMOVE) {
-            if (!(g_fly && IsWindowVisible(g_fly))) ShowFlyout();
-        } else if (LOWORD(lParam) == WM_LBUTTONUP) {
-            ShowFlyout();   /* 悬停时已弹出，此处仅保证显示，不再切换隐藏 */
+        /* 左键单击：弹出/收起控制浮窗（双击、右键行为不变） */
+        if (LOWORD(lParam) == WM_LBUTTONUP) {
+            if (g_fly && IsWindowVisible(g_fly)) ShowWindow(g_fly, SW_HIDE);
+            else ShowFlyout();
         } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
             /* 双击：直接恢复主窗口（第二击前单击已弹出的浮窗一并收起） */
             if (g_fly) ShowWindow(g_fly, SW_HIDE);
