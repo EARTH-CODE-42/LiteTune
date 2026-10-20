@@ -2,9 +2,9 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 256 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 257 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![size](https://img.shields.io/badge/size-256%20KB-brightgreen?style=for-the-badge)
+![size](https://img.shields.io/badge/size-257%20KB-brightgreen?style=for-the-badge)
 ![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
 ![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
@@ -40,12 +40,14 @@ English | [简体中文](README.md)
 - **Batch caching**: drag or Ctrl+click to multi-select episodes, hit the download button to cache them all (already-cached ones are skipped, playback is never interrupted)
 - Resume memory: remembers the episode and position on exit, resumes automatically next launch (not written if you stopped manually)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
+- **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
+- Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
 - Playback controls: previous / play-pause / next / stop / mute / volume
 - Play modes: sequential / shuffle / repeat one / play once (stop after this episode)
 - Playback speed: 0.5x–3.0x (quick presets 0.75 / 1 / 1.25 / 1.5 / 2)
 - Seekable progress bar; green while playing, yellow when cached, orange for "last heard"
 - **Phone playback / remote**: enable in the Settings menu, open the LAN page in your phone browser — playback controls, seekable progress bar, volume, episode picker, play mode & speed, sleep timer; lock-screen media controls supported
-- System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev/play/next), double-click restores the main window
+- System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev / play-pause / next / shuffle), double-click restores the main window
 - Multimedia keyboard media keys (play/pause, previous, next, stop)
 - Arrow keys navigate lists and buttons (click anywhere first, then use arrows)
 - Light / dark theme (switched at runtime)
@@ -55,7 +57,7 @@ English | [简体中文](README.md)
 - Three UI font sizes (Ctrl + mouse wheel)
 - Custom cache folder (open / change / move existing cache)
 - **Dual-mode config storage**: embed it in the exe (single-file portable — copying the exe takes it along) or keep it as an external `feeds.ini` next to the exe (easy upgrades / backups / manual editing); chosen on first run, switchable anytime in the Settings menu (see "Config storage")
-- Taskbar thumbnail toolbar: previous / play-pause / next / shuffle-next
+- Taskbar thumbnail toolbar: previous / play-pause / next / shuffle-next (icons adapt to the light / dark system taskbar theme)
 - Tooltips: button hints, full episode text, podcast cover + title + author
 - Original crescent-moon app icon (window / taskbar / Explorer)
 
