@@ -197,11 +197,14 @@ static HICON    g_trayIco = NULL;    /* 托盘小图标（资源加载，退出�
 #define GET_APPCOMMAND_LPARAM(lParam) ((short)HIWORD(lParam) & FAPPCOMMAND_MASK)
 #endif
 
-/* 托盘左键迷你控制浮窗：4 个按钮（上一曲/播放暂停/下一曲/随机下一曲），
- * 体验对齐任务栏缩略图工具栏；点击浮窗外自动隐藏 */
+/* 托盘迷你控制浮窗：4 个按钮（上一曲/播放暂停/下一曲/随机下一曲），
+ * 体验对齐任务栏缩略图工具栏；鼠标悬停托盘图标即弹出，移开自动收起 */
 #define FLY_CLASS L"LiteTuneFlyout"
 static HWND     g_fly = NULL;        /* 浮窗（popup，平时隐藏） */
 static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
+static POINT    g_flyAnchor;         /* 弹出时托盘图标位置（光标点） */
+static int      g_flyMiss = 0;       /* 定时器连续判空次数，达 2 次即自动收起 */
+#define FLY_TMR   1                  /* 自动收起定时器 ID */
 #define FLY_PAD   6                  /* 浮窗内边距 */
 #define FLY_BTN   32                 /* 按钮边长 */
 #define FLY_GAP   2                  /* 按钮间距 */
@@ -7205,7 +7208,8 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HBRUSH bg;
         if (di->CtlType != ODT_BUTTON) break;
         bg = CreateSolidBrush(
-            (int)di->CtlID == g_flyHover ? RGB(64, 64, 74) : RGB(45, 45, 52));
+            (di->itemState & ODS_SELECTED) ? RGB(96, 96, 112)
+            : ((int)di->CtlID == g_flyHover ? RGB(64, 64, 74) : RGB(45, 45, 52)));
         FillRect(di->hDC, &di->rcItem, bg);
         DeleteObject(bg);
         kind = (di->CtlID == 0) ? ICO_PREV
@@ -7247,8 +7251,31 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hwnd, NULL, TRUE);
         }
         return 0;
-    case WM_KILLFOCUS:
-        ShowWindow(hwnd, SW_HIDE);   /* 点击浮窗外自动收起 */
+    case WM_TIMER:
+        /* 悬停弹出后，鼠标移离「浮窗 + 托盘图标」区域一段时间即自动收起 */
+        if (wp == FLY_TMR) {
+            POINT c, a = g_flyAnchor;
+            RECT f, z;
+            GetCursorPos(&c);
+            GetWindowRect(hwnd, &f);
+            InflateRect(&f, 12, 12);
+            SetRect(&z, a.x - 24, a.y - 24, a.x + 24, a.y + 24);
+            if (!PtInRect(&f, c) && !PtInRect(&z, c)) {
+                if (++g_flyMiss >= 2) {
+                    KillTimer(hwnd, FLY_TMR);
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            } else g_flyMiss = 0;
+        }
+        return 0;
+    case WM_ACTIVATE:
+        /* 点击浮窗以外的地方→失去激活→自动收起。
+         * 不能用 WM_KILLFOCUS：点击窗内按钮时焦点会转到子控件，父窗随之收到
+         * KILLFOCUS 而立即隐藏，导致 4 个按钮「按下去没反应」。 */
+        if (LOWORD(wp) == WA_INACTIVE) {
+            KillTimer(hwnd, FLY_TMR);
+            ShowWindow(hwnd, SW_HIDE);
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -7278,6 +7305,7 @@ static void ShowFlyout(void)
     if (!g_fly) return;
     g_flyHover = -1;
     GetCursorPos(&pt);
+    g_flyAnchor = pt;               /* 记下图标位置，供自动收起判定 */
     wr.left = pt.x - FLY_W / 2;
     wr.top = pt.y - FLY_H - 8;      /* 光标上方 8px */
     wr.right = wr.left + FLY_W;
@@ -7300,16 +7328,32 @@ static void ShowFlyout(void)
     }
     SetWindowPos(g_fly, HWND_TOPMOST, wr.left, wr.top, 0, 0,
         SWP_NOSIZE | SWP_SHOWWINDOW);
-    /* 接管前台：点击浮窗外时收到 WM_KILLFOCUS 自动隐藏 */
+    /* 接管前台：点击浮窗外时收到 WM_ACTIVATE(WA_INACTIVE) 自动隐藏 */
     SetForegroundWindow(g_fly);
+    /* 鼠标移离「浮窗 + 图标」区域一段时间后自动收起 */
+    g_flyMiss = 0;
+    SetTimer(g_fly, FLY_TMR, 200, NULL);
 }
 
 /* ---- 任务栏缩略图工具栏（ITaskbarList3） ---- */
-/* 在 16x16 画布上画满幅的简洁白色线性图标（图形区约 14x14） */
+/* 任务栏/开始菜单是否为浅色（SystemUsesLightTheme=1）。缩略图工具栏按钮由
+ * 任务栏绘制底色，浅色下必须用深色图标，否则白图标几乎看不见。 */
+static int TaskbarIsLight(void)
+{
+    DWORD v = 0, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"SystemUsesLightTheme", RRF_RT_REG_DWORD, NULL, &v, &sz) == ERROR_SUCCESS)
+        return v != 0;
+    return 0;   /* 读不到（如 Win7）按深色处理 */
+}
+
+/* 在 16x16 画布上画满幅的简洁线性图标（图形区约 14x14），颜色随任务栏主题 */
 static void DrawTbGlyph(HDC hdc, int kind)
 {
-    HBRUSH wh = CreateSolidBrush(RGB(255, 255, 255));
-    HPEN p2 = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+    COLORREF col = TaskbarIsLight() ? RGB(28, 28, 28) : RGB(255, 255, 255);
+    HBRUSH wh = CreateSolidBrush(col);
+    HPEN p2 = CreatePen(PS_SOLID, 2, col);
     HGDIOBJ ob = SelectObject(hdc, wh);
     HGDIOBJ op = SelectObject(hdc, p2);
 
@@ -7597,6 +7641,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     switch (msg) {
+    case WM_SETTINGCHANGE:
+        /* 系统在浅色/深色之间切换后重画缩略图工具栏图标，避免颜色对不上 */
+        if (lParam && !wcscmp((const wchar_t *)lParam, L"ImmersiveColorSet"))
+            InitThumbbar();
+        break;
+    case WM_THEMECHANGED:
+        InitThumbbar();
+        break;
     case WM_CREATE: {
         HINSTANCE hInst = ((LPCREATESTRUCTW)lParam)->hInstance;
         /* 不带 WS_VSCROLL：系统滚动条彻底不用，滚动条全部自绘 */
@@ -8788,9 +8840,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件。
      * 左键单击：弹出迷你控制浮窗；右键：显示主窗口/退出菜单 */
     case WM_TRAYICON:
-        if (LOWORD(lParam) == WM_LBUTTONUP) {
-            if (g_fly && IsWindowVisible(g_fly)) ShowWindow(g_fly, SW_HIDE);
-            else ShowFlyout();
+        /* 鼠标移到托盘图标上即弹出浮窗（双击 / 右键行为不变） */
+        if (LOWORD(lParam) == WM_MOUSEMOVE) {
+            if (!(g_fly && IsWindowVisible(g_fly))) ShowFlyout();
+        } else if (LOWORD(lParam) == WM_LBUTTONUP) {
+            ShowFlyout();   /* 悬停时已弹出，此处仅保证显示，不再切换隐藏 */
         } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
             /* 双击：直接恢复主窗口（第二击前单击已弹出的浮窗一并收起） */
             if (g_fly) ShowWindow(g_fly, SW_HIDE);

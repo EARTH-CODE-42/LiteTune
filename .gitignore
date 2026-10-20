@@ -9,3 +9,6 @@ cache/
 
 # 个人配置与订阅（含本地路径、RSS 订阅地址），首次运行自动生成
 feeds.ini
+
+# 本地发版脚本（含 SourceForge 用户名，属个人环境配置）
+publish-sourceforge.ps1
