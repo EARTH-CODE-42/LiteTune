@@ -2,9 +2,9 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 257 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 255 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![size](https://img.shields.io/badge/size-257%20KB-brightgreen?style=for-the-badge)
+![size](https://img.shields.io/badge/size-255%20KB-brightgreen?style=for-the-badge)
 ![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
 ![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
@@ -35,10 +35,11 @@ English | [简体中文](README.md)
 - RSS podcast subscription management (add / delete / reorder / refresh), single-instance
 - Episode list (title, date, duration; sortable by column headers)
 - Online playback and local caching: audio auto-downloads to the cache folder, listen offline without network
+- **Local cache view**: the last row of the podcast list, “Cached (N)”, opens a browsable list of every downloaded episode — no network involved, ideal offline
 - **Feed cache**: RSS and cover art cached locally — instant startup from cache (no network needed), browse feeds offline; manual refresh fetches the latest and falls back to cache on failure (list is never cleared)
 - Loading progress: status bar shows "loaded x/n" while loading/refreshing feeds
 - **Batch caching**: drag or Ctrl+click to multi-select episodes, hit the download button to cache them all (already-cached ones are skipped, playback is never interrupted)
-- Resume memory: remembers the episode and position on exit, resumes automatically next launch (not written if you stopped manually)
+- Resume memory: remembers the episode and position on exit, resumes automatically next launch; if it was paused at exit, it reopens paused at the saved position (nothing is written after a manual stop)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
 - **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
 - Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
@@ -49,7 +50,7 @@ English | [简体中文](README.md)
 - **Phone playback / remote**: enable in the Settings menu, open the LAN page in your phone browser — playback controls, seekable progress bar, volume, episode picker, play mode & speed, sleep timer; lock-screen media controls supported
 - System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev / play-pause / next / shuffle), double-click restores the main window
 - Multimedia keyboard media keys (play/pause, previous, next, stop)
-- Arrow keys navigate lists and buttons (click anywhere first, then use arrows)
+- Arrow-key shortcuts: ←/→ seek back / forward 15 s, ↑/↓ previous / next episode; lists, edit boxes, sliders and scroll bars keep their own arrow-key behavior
 - Light / dark theme (switched at runtime)
 - Bilingual UI, English & Chinese (chosen on first run, switchable in the Settings menu, remembered)
 - Sleep timer (presets 15–120 min or custom 1–600 min, countdown in the title bar; force shutdown at the end, Windows gives a 15-second cancel window)
@@ -66,7 +67,8 @@ English | [简体中文](README.md)
 | Key | Action |
 |------|------|
 | `Space` | Play / pause |
-| `Arrow keys` | Move focus / selection in lists and buttons |
+| `←` / `→` | Seek back / forward 15 s (when focus is not on a list, edit box, slider or scroll bar) |
+| `↑` / `↓` | Previous / next episode (same condition) |
 | `Media keys` | Play/pause, previous, next, stop |
 | `Ctrl+Wheel` | Switch font size |
 | `ESC` | Quit the app (closes the add-feed dialog only when it's open) |
@@ -116,6 +118,7 @@ winw=480              ; window size (client area)
 winh=360
 cachedir=             ; cache folder (empty = default %TEMP%\LiteTune)
 resume=1234           ; last playback position in seconds (for auto resume)
+resumeplay=1          ; playing at exit? (0 = paused; reopens paused at the saved position)
 resumeurl=...         ; URL of the episode playing at last exit
 lastep=1a2b3c4d,567,  ; per-feed "last heard" (hash,seconds,episode URL), one line per feed
 
@@ -147,8 +150,9 @@ The primary build is **32-bit** (one exe for Windows 7–11, 32/64-bit). The rep
 .\mingw32\bin\gcc.exe -Os -s -mwindows -municode -std=gnu17 -Wall -Wextra `
     '-D_WIN32_WINNT=0x0601' '-Wl,--subsystem,windows:6.01' `
     -o LiteTune.exe main.c resource32.o `
-    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite `
-    -lole32 -lgdiplus -lws2_32 -liphlpapi -lshell32
+    -lwinhttp -lwinmm -lole32 -luuid -lshlwapi -lcomctl32 -lshell32 `
+    -lpropsys -lws2_32 -liphlpapi -lgdiplus -ladvapi32 -lcomdlg32 `
+    -lmf -lmfplat -lmfplay -lmfreadwrite
 ```
 
 Any other MinGW-w64 32-bit toolchain works with the same flags (make sure it uses the msvcrt runtime, not ucrt — otherwise ucrtbase.dll is missing on Windows 7 and the exe won't start).

@@ -2,9 +2,9 @@
 
 [English](README_EN.md) | 简体中文
 
-**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 257 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 255 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![size](https://img.shields.io/badge/size-257%20KB-brightgreen?style=for-the-badge)
+![size](https://img.shields.io/badge/size-255%20KB-brightgreen?style=for-the-badge)
 ![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
 ![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
@@ -36,10 +36,11 @@
 - RSS 播客订阅管理（添加 / 删除 / 调整顺序 / 刷新），单实例运行
 - 剧集列表（标题、日期、时长，列头点击排序）
 - 在线播放与本地缓存：音频自动下载到缓存目录，断网也能离线收听
+- **本地缓存视图**：播客列表最后一行「已缓存 (N)」，点开即可浏览、播放所有已下载剧集（不联网，断网时尤其好用）
 - **订阅缓存**：订阅 RSS 与封面图缓存到本地，启动直接读缓存（秒开、无需联网），断网也能浏览订阅列表；手动刷新联网取最新，联网失败自动回退缓存（列表不清空）
 - 加载进度：订阅加载 / 刷新时状态栏实时显示「已加载 x/n」，网速慢一眼可辨
 - **批量缓存**：剧集列表按住拖动 / Ctrl+点击 多选任意剧集，点下载按钮一次缓存（已缓存的自动跳过，不打断当前播放）
-- 续播记忆：退出时记住正在听的剧集和位置，下次启动自动续播（手动停止过则不续播）
+- 续播记忆：退出时记住正在听的剧集和位置，下次启动自动续播；退出时处于暂停状态则恢复为暂停待播（手动停止过则不续播）
 - 每播客"上次听到"标记：每个订阅记住最近一集（列表橙色高亮），双击它直接从上次的位置接着听
 - **双击播客快速续播**：双击左侧播客，直接播放该播客的橙色剧集并从记录位置续播；没有橙色记录则自动从第 1 集开始
 - 订阅导入 / 导出：导出 OPML 订阅列表（与其它播客应用互通）；导入 / 导出完整配置（.ini），备份、换机一键恢复
@@ -50,7 +51,7 @@
 - **手机播放 / 遥控**：设置菜单开启后，手机浏览器打开局域网网页即可——播放控制、进度条拖动定位、音量调节、选集播放、播放模式与倍速切换、定时关机；支持锁屏媒体控制
 - 系统托盘：点 × 直接退出；最小化收纳到托盘；托盘左键单击弹出迷你控制浮窗（上一曲/播放暂停/下一曲/随机），双击恢复主窗口
 - 多媒体键盘媒体键（播放/暂停、上一曲、下一曲、停止）
-- 方向键操作列表与按钮（鼠标点击任意区域后即可使用）
+- 方向键快捷操作：←/→ 快退 / 快进 15 秒，↑/↓ 上一曲 / 下一曲；焦点在列表 / 编辑框 / 滑块 / 滚动条时，方向键仍归控件自己使用
 - 亮色 / 暗色主题（运行时即时切换）
 - 中英文双语界面（首次运行选择语言，设置菜单随时切换，自动记忆）
 - 定时关机（预设 15–120 分钟或自定义 1–600 分钟，标题栏显示倒计时；到点强制关机，系统提供 15 秒取消窗口）
@@ -67,7 +68,8 @@
 | 按键 | 功能 |
 |------|------|
 | `空格` | 播放 / 暂停 |
-| `方向键` | 在列表 / 按钮间移动焦点、选择 |
+| `←` / `→` | 快退 / 快进 15 秒（焦点不在列表、编辑框、滑块、滚动条时） |
+| `↑` / `↓` | 上一曲 / 下一曲（同上） |
 | `媒体键` | 播放/暂停、上一曲、下一曲、停止 |
 | `Ctrl+滚轮` | 切换字号 |
 | `ESC` | 退出程序（添加订阅弹窗打开时仅关闭弹窗） |
@@ -117,6 +119,7 @@ winw=480              ; 窗口尺寸（客户区）
 winh=360
 cachedir=             ; 缓存目录（留空 = 默认 %TEMP%\LiteTune）
 resume=1234           ; 上次退出时的播放位置（秒，自动续播用）
+resumeplay=1          ; 退出时是否在播放（0=暂停，重开后定位到位但保持暂停）
 resumeurl=...         ; 上次退出时正在播的剧集 URL
 lastep=1a2b3c4d,567,  ; 每播客"上次听到"（哈希,秒,剧集URL），每个订阅一条
 
@@ -148,8 +151,9 @@ https://example.com/feed2.xml
 .\mingw32\bin\gcc.exe -Os -s -mwindows -municode -std=gnu17 -Wall -Wextra `
     '-D_WIN32_WINNT=0x0601' '-Wl,--subsystem,windows:6.01' `
     -o LiteTune.exe main.c resource32.o `
-    -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite `
-    -lole32 -lgdiplus -lws2_32 -liphlpapi -lshell32
+    -lwinhttp -lwinmm -lole32 -luuid -lshlwapi -lcomctl32 -lshell32 `
+    -lpropsys -lws2_32 -liphlpapi -lgdiplus -ladvapi32 -lcomdlg32 `
+    -lmf -lmfplat -lmfplay -lmfreadwrite
 ```
 
 若用其它 MinGW-w64 32 位工具链，同样参数即可（注意选 msvcrt 而非 ucrt 运行时，否则 Win7 上缺 ucrtbase.dll 无法启动）。

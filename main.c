@@ -314,6 +314,7 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 /* 批量缓存：Ctrl+多选剧集后点缓存按钮，独立线程逐集下载（不打断播放） */
 #define WM_APP_BATCH_DONE    (WM_APP + 13) /* wParam=ok(0/1) */
 #define WM_APP_BATCH_FINISH  (WM_APP + 14) /* wParam=成功数, lParam=总数 */
+#define WM_APP_BATCH_PROGRESS (WM_APP + 16) /* wParam=当前集百分比 0-100 */
 #define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
@@ -593,6 +594,14 @@ static COLORREF ThBlue(void)    { return g_darkMode ? RGB(96,175,255)  : RGB(0,9
 static COLORREF ThTrack(void)   { return g_darkMode ? RGB(58,58,64)   : RGB(229,229,232); }  /* 滑块滑槽 */
 static COLORREF ThAccent(void)  { return RGB(0,120,215);  }                                 /* 进度/滑块把手主色 */
 
+/* 用纯色填满矩形（临时画刷即用即删） */
+static void FillRectColor(HDC dc, const RECT *rc, COLORREF col)
+{
+    HBRUSH b = CreateSolidBrush(col);
+    FillRect(dc, rc, b);
+    DeleteObject(b);
+}
+
 /* ---- 暗色弹窗（MessageBox / InputBox 共用） ----
  * 亮色模式不接管任何消息，全部走系统原样 */
 static HBRUSH g_dlgBgBrush = NULL;      /* 弹窗背景刷，随主题重建 */
@@ -613,6 +622,14 @@ static void DlgBrushesReset(void)
 {
     if (g_dlgBgBrush) { DeleteObject(g_dlgBgBrush); g_dlgBgBrush = NULL; }
     if (g_dlgPanelBrush) { DeleteObject(g_dlgPanelBrush); g_dlgPanelBrush = NULL; }
+}
+
+/* 弹窗客户区整体填暗色背景 */
+static void FillDlgBg(HWND h, HDC dc)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+    FillRect(dc, &rc, DlgBgBrush());
 }
 
 /* 暗色下压按钮绘制：底色、边框（默认键描主色）、焦点框、文字 */
@@ -645,6 +662,39 @@ static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
     SelectObject(di->hDC, of);
 }
 
+/* 暗色弹窗通用消息：背景/文字/编辑框/自绘按钮。
+ * 已处理返回 1（结果写入 *res），否则返回 0 交回调用方 */
+static int DarkDlgMsg(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        if (!g_darkMode) return 0;
+        FillDlgBg(h, (HDC)wp);
+        *res = 1;
+        return 1;
+    case WM_CTLCOLORSTATIC:
+        if (!g_darkMode) return 0;
+        SetBkColor((HDC)wp, ThWinBg());
+        SetTextColor((HDC)wp, ThText());
+        *res = (LRESULT)DlgBgBrush();
+        return 1;
+    case WM_CTLCOLOREDIT:
+        if (!g_darkMode) return 0;
+        SetBkColor((HDC)wp, ThPanel());
+        SetTextColor((HDC)wp, ThText());
+        *res = (LRESULT)DlgPanelBrush();
+        return 1;
+    case WM_DRAWITEM:
+        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
+            DrawDarkBtn((DRAWITEMSTRUCT*)lp);
+            *res = TRUE;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /* MessageBox 暗色：WH_CBT 挂钩在激活时用 SetWindowSubclass 挂上暗色处理，
  * 只处理背景/文字颜色与按钮自绘，图标和布局仍由系统完成。
  * 注意：绝不能用 SetWindowLongPtr(GWLP_USERDATA) 手工链——系统消息框的
@@ -672,48 +722,25 @@ static BOOL CALLBACK MsgBoxBtnEnum(HWND btn, LPARAM lp)
 static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR id, DWORD_PTR ref)
 {
+    LRESULT r;
     (void)id; (void)ref;
     switch (msg) {
-    case WM_ERASEBKGND: {
-        HDC dc = (HDC)wp;
-        RECT rc;
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, DlgBgBrush());
-        return 1;
-    }
     case WM_PAINT: {
         /* 实测激活前系统已按亮色画过、且激活后仍有局部重绘路径绕过
          * WM_ERASEBKGND（底部按钮区白条）：每次绘制都把客户区填满暗色 */
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        RECT rc;
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, DlgBgBrush());
+        FillDlgBg(h, dc);
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_PRINTCLIENT: {
-        HDC dc = (HDC)wp;
-        RECT rc;
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, DlgBgBrush());
+    case WM_PRINTCLIENT:
+        FillDlgBg(h, (HDC)wp);
         return 0;
-    }
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        SetBkColor(dc, ThWinBg());
-        SetTextColor(dc, ThText());
-        return (LRESULT)DlgBgBrush();
-    }
     case WM_CTLCOLORBTN:
         return (LRESULT)DlgBgBrush();
-    case WM_DRAWITEM: {
-        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lp;
-        if (di->CtlType != ODT_BUTTON) break;
-        DrawDarkBtn(di);
-        return TRUE;
     }
-    }
+    if (DarkDlgMsg(h, msg, wp, lp, &r)) return r;
     return DefSubclassProc(h, msg, wp, lp);
 }
 
@@ -1316,14 +1343,12 @@ static void DSB_Draw(HWND hwnd, DarkScrollBar *dsb)
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
     RECT rc, btn;
-    HBRUSH bg, thumb;
+    HBRUSH thumb;
     HGDIOBJ ob, op;
     int horiz = dsb ? dsb->horizontal : 0;
 
     GetClientRect(hwnd, &rc);
-    bg = CreateSolidBrush(ThPanel());
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
+    FillRectColor(hdc, &rc, ThPanel());
 
     /* 两端箭头 */
     if (horiz) {
@@ -1626,6 +1651,17 @@ static void FmtTime(long long sec, wchar_t *buf, size_t n)
         swprintf(buf, n, L"%02d:%02d", (int)(sec/60), (int)(sec%60));
 }
 
+/* 进度文字“当前 / 总时长”；总时长未知时显示 --:-- */
+static void ShowTimeLabel(int posSec, int durSec)
+{
+    wchar_t buf[64], a[16], b[16];
+    FmtTime(posSec, a, 16);
+    if (durSec > 0) FmtTime(durSec, b, 16);
+    else wcscpy_s(b, 16, L"--:--");
+    swprintf(buf, 64, L"%ls / %ls", a, b);
+    SetWindowTextW(g_stTime, buf);
+}
+
 /* 顶部播放区第一行（状态跑马灯）的客户区矩形，几何与 LayoutControls 保持一致 */
 static void StatusRowRect(RECT *r)
 {
@@ -1663,6 +1699,15 @@ static void UpdateMarquee(void)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
+/* 把 text 显示到状态行：清跑马灯偏移并按新文本重测宽度 */
+static void StatusShow(const wchar_t *text)
+{
+    wcsncpy(g_statusText, text, 511);
+    g_statusText[511] = 0;
+    g_mqOffset = 0;
+    UpdateMarquee();
+}
+
 /* 设置持久状态（如“正在播放：…”）；若正在显示临时提示，只更新备份，
  * 等临时提示结束后自然恢复为新内容 */
 static void SetStatus(const wchar_t *text)
@@ -1677,12 +1722,7 @@ static void SetStatus(const wchar_t *text)
     }
     wcsncpy(g_statusBase, text, 511);
     g_statusBase[511] = 0;
-    /* 有临时提示在显示时（定时器4在跑），不抢显示 */
-    if (g_statusTempOn) return;
-    wcsncpy(g_statusText, g_statusBase, 511);
-    g_statusText[511] = 0;
-    g_mqOffset = 0;
-    UpdateMarquee();
+    if (!g_statusTempOn) StatusShow(g_statusBase);   /* 临时提示显示中不抢屏 */
 }
 
 /* 批量进度专用：直接写 g_statusBase + g_statusText（绕过重定向） */
@@ -1691,22 +1731,14 @@ static void SetBatchProgress(const wchar_t *text)
     if (!text) text = L"";
     wcsncpy(g_statusBase, text, 511);
     g_statusBase[511] = 0;
-    if (g_statusTempOn) return;   /* 临时提示在显示，只更新 base 不抢屏 */
-    wcsncpy(g_statusText, g_statusBase, 511);
-    g_statusText[511] = 0;
-    g_mqOffset = 0;
-    UpdateMarquee();
+    if (!g_statusTempOn) StatusShow(g_statusBase);
 }
 
 /* 临时提示（如“夜间模式已开启”）：显示片刻后自动恢复持久状态 */
 static void SetStatusTemp(const wchar_t *text)
 {
-    if (!text) text = L"";
     g_statusTempOn = 1;
-    wcsncpy(g_statusText, text, 511);
-    g_statusText[511] = 0;
-    g_mqOffset = 0;
-    UpdateMarquee();
+    StatusShow(text ? text : L"");
     SetTimer(g_hwnd, 4, TEMP_STATUS_MS, NULL);   /* 重复调用会自动重置计时 */
 }
 
@@ -1715,10 +1747,7 @@ static void RestoreBaseStatus(void)
 {
     g_statusTempOn = 0;
     KillTimer(g_hwnd, 4);
-    wcsncpy(g_statusText, g_statusBase, 511);
-    g_statusText[511] = 0;
-    g_mqOffset = 0;
-    UpdateMarquee();
+    StatusShow(g_statusBase);
 }
 
 static wchar_t* U8ToW(const char *src)
@@ -2593,54 +2622,63 @@ static char* CfgTailRead(void)
     return buf;
 }
 
-/* 把配置文本写进自身 exe 尾部（有旧尾部则原地覆盖，没有则追加到文件末尾）。
- * 见文件头「整机换装」流程说明 */
-static int CfgTailWrite(const char *data, DWORD len)
+/* 整镜读入自身 exe；tailOff 返回旧内嵌尾部起点（无尾部为 -1）。
+ * 成功返回 malloc 缓冲（调用方 free），失败 NULL */
+static unsigned char* ExeReadImage(DWORD *lenOut, LONGLONG *tailOff)
+{
+    wchar_t exe[MAX_PATH];
+    HANDLE h;
+    LARGE_INTEGER sz;
+    DWORD rd, exeLen;
+    unsigned char *img;
+
+    *lenOut = 0;
+    *tailOff = -1;
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return NULL;
+    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 8 || sz.QuadPart > (1 << 26)) {
+        CloseHandle(h);
+        return NULL;
+    }
+    exeLen = (DWORD)sz.QuadPart;
+    img = (unsigned char*)malloc(exeLen);
+    if (!img || !ReadFile(h, img, exeLen, &rd, NULL) || rd != exeLen) {
+        free(img);
+        CloseHandle(h);
+        return NULL;
+    }
+    CloseHandle(h);
+    if (memcmp(img + exeLen - 4, CFG_TAIL_MAGIC, 4) == 0) {
+        DWORD oldLen;
+        memcpy(&oldLen, img + exeLen - 8, 4);
+        if (oldLen > 0 && (LONGLONG)oldLen <= (LONGLONG)exeLen - 8)
+            *tailOff = (LONGLONG)exeLen - 8 - oldLen;
+    }
+    *lenOut = exeLen;
+    return img;
+}
+
+/* 把 img[0..len) 原子换装为当前 exe（见上方「整机换装」说明）。
+ * 接管 img 所有权；成功返回 1 */
+static int ExeSwapImage(unsigned char *img, DWORD len)
 {
     wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8], dump[MAX_PATH + 8], tdir[MAX_PATH];
-    HANDLE h; LARGE_INTEGER sz; DWORD rd, wr, exeLen = 0, base, nl;
-    LONGLONG tailOff = -1;
-    unsigned char *img = NULL, *ni;
+    HANDLE h;
+    DWORD wr;
     int ok = 0, dumped = 0;
 
-    if (!data || len == 0 || !GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+    if (!img || !GetModuleFileNameW(NULL, exe, MAX_PATH)) { free(img); return 0; }
     lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".new");
     lstrcpynW(dump, exe, MAX_PATH); lstrcatW(dump, L".tmp");
 
-    /* 整镜读入内存，并探测现有尾部位置 */
-    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 8 && sz.QuadPart <= (1 << 26)) {
-        exeLen = (DWORD)sz.QuadPart;
-        img = (unsigned char*)malloc((size_t)exeLen);
-        if (img && ReadFile(h, img, exeLen, &rd, NULL) && rd == exeLen) {
-            if (memcmp(img + exeLen - 4, CFG_TAIL_MAGIC, 4) == 0) {
-                DWORD oldLen; memcpy(&oldLen, img + exeLen - 8, 4);
-                if (oldLen > 0 && (LONGLONG)oldLen <= exeLen - 8)
-                    tailOff = exeLen - 8 - (LONGLONG)oldLen;
-            }
-        } else { free(img); img = NULL; }
-    }
-    CloseHandle(h);
-    if (!img) return 0;
-
-    /* 新镜像 = 截掉旧尾部 + 新配置 + 长度 + 魔数，整体写 exe.new */
-    base = (tailOff >= 0) ? (DWORD)tailOff : exeLen;
-    nl = base + len + 8;
-    ni = (unsigned char*)malloc(nl);
-    if (!ni) { free(img); return 0; }
-    memcpy(ni, img, base);
-    memcpy(ni + base, data, len);
-    memcpy(ni + base + len, &len, 4);
-    memcpy(ni + base + len + 4, CFG_TAIL_MAGIC, 4);
-    free(img);
     DeleteFileW(tmp);
     h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (h != INVALID_HANDLE_VALUE) {
-        ok = WriteFile(h, ni, nl, &wr, NULL) && wr == nl;
+        ok = WriteFile(h, img, len, &wr, NULL) && wr == len;
         CloseHandle(h);
     }
-    free(ni);
+    free(img);
     if (!ok) return 0;
 
     /* 旧镜像挪走：优先 %TEMP%（exe 目录不留痕迹），跨盘失败退回同目录 .tmp */
@@ -2663,6 +2701,54 @@ static int CfgTailWrite(const char *data, DWORD len)
     return 1;
 }
 
+/* 把配置文本写进自身 exe 尾部（有旧尾部则原地覆盖，没有则追加到文件末尾） */
+static int CfgTailWrite(const char *data, DWORD len)
+{
+    unsigned char *img, *ni;
+    DWORD exeLen, base, nl;
+    LONGLONG tailOff;
+
+    if (!data || len == 0) return 0;
+    img = ExeReadImage(&exeLen, &tailOff);
+    if (!img) return 0;
+    /* 新镜像 = 截掉旧尾部 + 新配置 + 长度 + 魔数 */
+    base = (tailOff >= 0) ? (DWORD)tailOff : exeLen;
+    nl = base + len + 8;
+    ni = (unsigned char*)malloc(nl);
+    if (!ni) { free(img); return 0; }
+    memcpy(ni, img, base);
+    memcpy(ni + base, data, len);
+    memcpy(ni + base + len, &len, 4);
+    memcpy(ni + base + len + 4, CFG_TAIL_MAGIC, 4);
+    free(img);
+    return ExeSwapImage(ni, nl);
+}
+
+/* 写内嵌配置并读回校验；写失败或校验不符返回 0 */
+static int CfgTailWriteVerified(const char *cfg, DWORD len)
+{
+    char *v;
+    int ok = 0;
+    if (!CfgTailWrite(cfg, len)) return 0;
+    v = CfgTailRead();
+    if (v) {
+        ok = (len == strlen(v) && memcmp(v, cfg, len) == 0);
+        free(v);
+    }
+    return ok;
+}
+
+/* 整段文本覆盖写入文件（失败返回 0）；配置/导出落盘统一走这里 */
+static int WriteTextFile(const wchar_t *path, const char *data, DWORD len)
+{
+    FILE *f = _wfsopen(path, L"wb", _SH_DENYNO);
+    int ok = 0;
+    if (!f) return 0;
+    if ((DWORD)fwrite(data, 1, len, f) == len) ok = 1;
+    fclose(f);
+    return ok;
+}
+
 /* 外挂配置文件的完整路径（exe 同目录 feeds.ini） */
 static void CfgExternalPath(wchar_t *out, int outMax)
 {
@@ -2674,62 +2760,15 @@ static void CfgExternalPath(wchar_t *out, int outMax)
  * 整机换装流程。本就无尾部时视为成功；失败返回 0（不阻断，外挂 ini 仍生效） */
 static int CfgStripTail(void)
 {
-    wchar_t exe[MAX_PATH], tmp[MAX_PATH + 8], dump[MAX_PATH + 8], tdir[MAX_PATH];
-    HANDLE h; LARGE_INTEGER sz; DWORD rd, wr, exeLen, base;
     unsigned char *img;
-    int ok = 0, dumped = 0;
+    DWORD exeLen, base;
+    LONGLONG tailOff;
 
-    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
-    lstrcpynW(tmp, exe, MAX_PATH); lstrcatW(tmp, L".new");
-    lstrcpynW(dump, exe, MAX_PATH); lstrcatW(dump, L".tmp");
-
-    h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 8 || sz.QuadPart > (1 << 26)) {
-        CloseHandle(h); return 0;
-    }
-    exeLen = (DWORD)sz.QuadPart;
-    img = (unsigned char*)malloc(exeLen);
-    if (!img || !ReadFile(h, img, exeLen, &rd, NULL) || rd != exeLen) {
-        free(img); CloseHandle(h); return 0;
-    }
-    CloseHandle(h);
-
-    base = exeLen;
-    if (memcmp(img + exeLen - 4, CFG_TAIL_MAGIC, 4) == 0) {
-        DWORD oldLen; memcpy(&oldLen, img + exeLen - 8, 4);
-        if (oldLen > 0 && (LONGLONG)oldLen <= exeLen - 8)
-            base = exeLen - 8 - oldLen;
-    }
+    img = ExeReadImage(&exeLen, &tailOff);
+    if (!img) return 0;
+    base = (tailOff >= 0) ? (DWORD)tailOff : exeLen;
     if (base == exeLen) { free(img); return 1; }   /* 本就无尾部 */
-
-    DeleteFileW(tmp);
-    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        ok = WriteFile(h, img, base, &wr, NULL) && wr == base;
-        CloseHandle(h);
-    }
-    free(img);
-    if (!ok) return 0;
-
-    /* 旧镜像挪走，与新镜像原子换装（与 CfgTailWrite 同一套流程） */
-    if (GetTempPathW(MAX_PATH, tdir)) {
-        lstrcatW(tdir, L"LiteTune_old.exe");
-        if (MoveFileExW(exe, tdir, MOVEFILE_REPLACE_EXISTING)) {
-            lstrcpynW(dump, tdir, MAX_PATH);
-            dumped = 1;
-        }
-    }
-    if (!dumped) {
-        DeleteFileW(dump);
-        if (!MoveFileExW(exe, dump, MOVEFILE_REPLACE_EXISTING)) return 0;
-    }
-    if (!MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExW(dump, exe, MOVEFILE_REPLACE_EXISTING);   /* 尽力回滚改名 */
-        return 0;
-    }
-    if (!dumped) SetFileAttributesW(dump, FILE_ATTRIBUTE_HIDDEN);
-    return 1;
+    return ExeSwapImage(img, base);
 }
 
 /* ---------- 配置文本动态缓冲 ---------- */
@@ -2866,6 +2905,9 @@ static void FrRelabel(HWND h)
 
 static LRESULT CALLBACK FirstRunProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
+    LRESULT r;
+    if (DarkDlgMsg(h, msg, wp, lp, &r)) return r;
+
     switch (msg) {
     case WM_CREATE: {
         UINT bs = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
@@ -2890,29 +2932,6 @@ static LRESULT CALLBACK FirstRunProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
         return 0;
     }
-    case WM_ERASEBKGND:
-        if (g_darkMode) {
-            HDC dc = (HDC)wp;
-            RECT rc;
-            GetClientRect(h, &rc);
-            FillRect(dc, &rc, DlgBgBrush());
-            return 1;
-        }
-        break;
-    case WM_CTLCOLORSTATIC:
-        if (g_darkMode) {
-            HDC dc = (HDC)wp;
-            SetBkColor(dc, ThWinBg());
-            SetTextColor(dc, ThText());
-            return (LRESULT)DlgBgBrush();
-        }
-        break;
-    case WM_DRAWITEM:
-        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
-            DrawDarkBtn((DRAWITEMSTRUCT*)lp);
-            return TRUE;
-        }
-        break;
     case WM_COMMAND:
         if (HIWORD(wp) != BN_CLICKED) return 0;
         if (LOWORD(wp) == ID_FR_ZH || LOWORD(wp) == ID_FR_EN) {
@@ -3153,7 +3172,6 @@ static char *BuildConfigText(DWORD *lenOut)
 static void SaveConfig(void)
 {
     wchar_t iniPath[MAX_PATH];
-    FILE *f;
     DWORD clen = 0;
     char *cfg;
 
@@ -3177,32 +3195,18 @@ static void SaveConfig(void)
     if (!cfg) return;
 
     if (g_cfgExternal) {
-        /* 外挂模式：直接写 feeds.ini */
-        f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
-        if (f) {
-            fwrite(cfg, 1, clen, f);
-            fclose(f);
-        }
+        WriteTextFile(iniPath, cfg, clen);   /* 外挂模式：直接写 feeds.ini */
         free(cfg);
         return;
     }
 
     /* 内嵌模式：写 exe 尾部，写后读回校验 */
-    if (CfgTailWrite(cfg, clen)) {
-        char *v = CfgTailRead();
-        if (v && clen == strlen(v) && memcmp(v, cfg, clen) == 0) {
-            free(v);
-            free(cfg);
-            return;
-        }
-        free(v);
+    if (CfgTailWriteVerified(cfg, clen)) {
+        free(cfg);
+        return;
     }
     /* 回退：尾部写失败或校验不符（只读介质/异常），覆盖写 feeds.ini */
-    f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
-    if (f) {
-        fwrite(cfg, 1, clen, f);
-        fclose(f);
-    }
+    WriteTextFile(iniPath, cfg, clen);
     free(cfg);
 }
 
@@ -3601,7 +3605,8 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
                             if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
                                 ok = 1;   /* 播放下载刚写完，直接算成功 */
                             } else {
-                                data = HttpFetch(url, &len, 0, &bc->reqSlot, NULL);
+                                data = HttpFetch(url, &len, WM_APP_BATCH_PROGRESS,
+                                                 &bc->reqSlot, NULL);
                                 if (data && len > 0) {
                                     f = _wfopen(cache, L"wb");
                                     if (f) {
@@ -5170,13 +5175,26 @@ static void ChangeSort(int col)
     }
 }
 
+/* 剧集列表里把第 ep 行设为唯一选中并滚到可见处 */
+static void HighlightEpisodeRow(int ep)
+{
+    LVITEMW lvi;
+    ZeroMemory(&lvi, sizeof(lvi));
+    lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    lvi.state = 0;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
+    lvi.state = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
+    SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)ep, FALSE);
+    InvalidateRect(g_listEp, NULL, TRUE);
+}
+
 /* 离线缓存视图：直接播放本地文件，不联网、不起下载线程 */
 static void PlayLocalEpisode(int ep)
 {
     Episode *e;
     wchar_t info[128], st[512];
     long long pd = 0;
-    LVITEMW lvi;
     if (ep < 0 || ep >= g_cachePod.epCount) return;
     e = &g_cachePod.eps[ep];
 
@@ -5192,14 +5210,7 @@ static void PlayLocalEpisode(int ep)
     if (g_viewCached) {
         g_curPod = g_podCount;
         g_curEp = ep;
-        ZeroMemory(&lvi, sizeof(lvi));
-        lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-        lvi.state = 0;
-        SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
-        lvi.state = LVIS_SELECTED | LVIS_FOCUSED;
-        SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
-        SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)ep, FALSE);
-        InvalidateRect(g_listEp, NULL, TRUE);
+        HighlightEpisodeRow(ep);
     }
 
     ShowEpisodeDetail(g_podCount, ep);
@@ -5229,16 +5240,8 @@ static void RequestPlayEpisode(int pod, int ep)
     g_playUrl = _wcsdup(e->url);
     /* 播放的正是当前浏览的播客：同步选中行；后台连播到别的播客时不动视图 */
     if (!g_viewCached && pod == g_curPod) {
-        LVITEMW lvi;
         g_curEp = ep;
-        ZeroMemory(&lvi, sizeof(lvi));
-        lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-        lvi.state = 0;
-        SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
-        lvi.state = LVIS_SELECTED | LVIS_FOCUSED;
-        SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
-        SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)ep, FALSE);
-        InvalidateRect(g_listEp, NULL, TRUE);   /* 播放目标确定，立即标绿 */
+        HighlightEpisodeRow(ep);   /* 播放目标确定，立即标绿 */
     }
     ShowEpisodeDetail(pod, ep);
     SetStatus(tr(TR_PREPARING));
@@ -5338,29 +5341,27 @@ static void PlayPodcastDefault(int pod)
  * 找到后置 g_resumeSeek100ns，由 MFP_EVENT_TYPE_PLAY 一次性应用定位。 */
 static void TryResumePlayback(void)
 {
-    int i, j;
+    int i, j, pod = -1, ep = -1;
     if (!g_resumeUrl || !g_resumeUrl[0]) return;
-    for (j = 0; j < g_cachePod.epCount; j++) {
+    /* 先查“已缓存”聚合视图，再查普通订阅；pod=g_podCount 表示缓存视图 */
+    for (j = 0; j < g_cachePod.epCount && pod < 0; j++)
         if (g_cachePod.eps[j].url && wcscmp(g_cachePod.eps[j].url, g_resumeUrl) == 0) {
-            g_resumeSeek100ns = g_resumeSec * 10000000LL;
-            SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
-            SelectPodcast(g_podCount);
-            RequestPlayEpisode(g_podCount, j);
-            goto done;
+            pod = g_podCount;
+            ep = j;
         }
-    }
-    for (i = 0; i < g_podCount; i++) {
-        for (j = 0; j < g_pods[i].epCount; j++) {
+    for (i = 0; i < g_podCount && pod < 0; i++)
+        for (j = 0; j < g_pods[i].epCount; j++)
             if (g_pods[i].eps[j].url && wcscmp(g_pods[i].eps[j].url, g_resumeUrl) == 0) {
-                g_resumeSeek100ns = g_resumeSec * 10000000LL;
-                SendMessageW(g_listPod, LB_SETCURSEL, i, 0);
-                SelectPodcast(i);
-                RequestPlayEpisode(i, j);
-                goto done;
+                pod = i;
+                ep = j;
+                break;
             }
-        }
+    if (pod >= 0) {
+        g_resumeSeek100ns = g_resumeSec * 10000000LL;
+        SendMessageW(g_listPod, LB_SETCURSEL, pod, 0);
+        SelectPodcast(pod);
+        RequestPlayEpisode(pod, ep);
     }
-done:
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
 }
@@ -5371,6 +5372,26 @@ static void ToggleMute(void)
     g_muted = !g_muted;
     if (g_player) g_player->lpVtbl->SetMute(g_player, g_muted ? TRUE : FALSE);
     InvalidateRect(g_btnMute, NULL, TRUE);
+}
+
+/* 设定音量（0..100）：滑块、数字、播放器与静音状态一起同步，
+ * 音量滑块拖动、手机遥控、启动恢复共用这一条路径
+ * （手动调音量时自动解除静音） */
+static void SetVolumeValue(int v)
+{
+    wchar_t buf[16];
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    g_volume = v;
+    if (g_sldVol) SendMessageW(g_sldVol, TBM_SETPOS, TRUE, v);
+    swprintf(buf, 16, L"%d", v);
+    if (g_stVol) SetWindowTextW(g_stVol, buf);
+    if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
+    if (g_muted) {
+        g_muted = 0;
+        if (g_player) g_player->lpVtbl->SetMute(g_player, FALSE);
+        InvalidateRect(g_btnMute, NULL, TRUE);
+    }
 }
 
 /* 释放单个播客的全部堆内存与图片（字段允许为 NULL） */
@@ -5639,6 +5660,9 @@ static void DoOpmlPickImport(HWND h)
 
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
+    LRESULT r;
+    if (DarkDlgMsg(h, msg, wp, lp, &r)) return r;
+
     switch (msg) {
     case WM_CREATE: {
         HWND e, lab;
@@ -5666,37 +5690,6 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetFocus(e);
         return 0;
     }
-    case WM_ERASEBKGND:
-        if (g_darkMode) {
-            HDC dc = (HDC)wp;
-            RECT rc;
-            GetClientRect(h, &rc);
-            FillRect(dc, &rc, DlgBgBrush());
-            return 1;
-        }
-        break;
-    case WM_CTLCOLORSTATIC:
-        if (g_darkMode) {
-            HDC dc = (HDC)wp;
-            SetBkColor(dc, ThWinBg());
-            SetTextColor(dc, ThText());
-            return (LRESULT)DlgBgBrush();
-        }
-        break;
-    case WM_CTLCOLOREDIT:
-        if (g_darkMode) {
-            HDC dc = (HDC)wp;
-            SetBkColor(dc, ThPanel());
-            SetTextColor(dc, ThText());
-            return (LRESULT)DlgPanelBrush();
-        }
-        break;
-    case WM_DRAWITEM:
-        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
-            DrawDarkBtn((DRAWITEMSTRUCT*)lp);
-            return TRUE;
-        }
-        break;
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_CANCEL) {
             g_ibResult = 0;
@@ -6898,21 +6891,16 @@ static void DoExportIni(void)
     static const wchar_t *FILTER =
         L"Configuration (*.ini)\0*.ini\0All Files (*.*)\0*.*\0";
     wchar_t path[MAX_PATH];
-    FILE *f;
     DWORD len = 0;
     char *cfg;
 
     if (!FileDlg(1, tr(TR_EXP_INI_CAP), FILTER, L"ini", path, MAX_PATH)) return;
     cfg = BuildConfigText(&len);
     if (!cfg) return;
-    f = _wfsopen(path, L"wb", _SH_DENYNO);
-    if (f) {
-        fwrite(cfg, 1, len, f);
-        fclose(f);
+    if (WriteTextFile(path, cfg, len))
         SetStatusTemp(tr(TR_EXP_DONE));
-    } else {
+    else
         MessageBoxTh(g_hwnd, tr(TR_EXP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
-    }
     free(cfg);
 }
 
@@ -6942,17 +6930,10 @@ static void DoImport(void)
             int ok = 0;
             if (g_cfgExternal) {
                 wchar_t iniPath[MAX_PATH];
-                FILE *f;
                 CfgExternalPath(iniPath, MAX_PATH);
-                f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
-                if (f) {
-                    ok = ((DWORD)fwrite(buf, 1, len, f) == len);
-                    fclose(f);
-                }
-            } else if (CfgTailWrite(buf, len)) {
-                char *v = CfgTailRead();
-                ok = (v && len == strlen(v) && memcmp(v, buf, len) == 0);
-                free(v);
+                ok = WriteTextFile(iniPath, buf, len);
+            } else if (CfgTailWriteVerified(buf, len)) {
+                ok = 1;
             }
             if (ok) {
                 free(buf);
@@ -6991,7 +6972,6 @@ static void CfgSwitchMode(int external)
     wchar_t iniPath[MAX_PATH];
     DWORD len = 0;
     char *cfg;
-    FILE *f;
 
     if (external == g_cfgExternal) return;
     CfgExternalPath(iniPath, MAX_PATH);
@@ -7000,14 +6980,11 @@ static void CfgSwitchMode(int external)
         /* 切外挂：先把当前配置写入 feeds.ini，再剥离 exe 尾部内嵌配置（防尾随分发） */
         cfg = BuildConfigText(&len);
         if (!cfg) return;
-        f = _wfsopen(iniPath, L"wb", _SH_DENYNO);
-        if (!f) {
+        if (!WriteTextFile(iniPath, cfg, len)) {
             free(cfg);
             MessageBoxTh(g_hwnd, tr(TR_CFGMODE_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
             return;
         }
-        fwrite(cfg, 1, len, f);
-        fclose(f);
         free(cfg);
         CfgStripTail();   /* 尽力剥离，失败不影响外挂生效 */
         g_cfgExternal = 1;
@@ -7020,7 +6997,7 @@ static void CfgSwitchMode(int external)
             return;
         cfg = BuildConfigText(&len);
         if (!cfg) return;
-        if (!CfgTailWrite(cfg, len)) {
+        if (!CfgTailWriteVerified(cfg, len)) {
             free(cfg);
             MessageBoxTh(g_hwnd, tr(TR_CFGMODE_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
             return;
@@ -7218,13 +7195,10 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
         int kind;
-        HBRUSH bg;
         if (di->CtlType != ODT_BUTTON) break;
-        bg = CreateSolidBrush(
+        FillRectColor(di->hDC, &di->rcItem,
             (di->itemState & ODS_SELECTED) ? RGB(96, 96, 112)
             : ((int)di->CtlID == g_flyHover ? RGB(64, 64, 74) : RGB(45, 45, 52)));
-        FillRect(di->hDC, &di->rcItem, bg);
-        DeleteObject(bg);
         kind = (di->CtlID == 0) ? ICO_PREV
              : (di->CtlID == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
              : (di->CtlID == 2) ? ICO_NEXT : ICO_SHUFFLE;
@@ -7528,15 +7502,7 @@ static void CyclePlayMode(void)
 {
     g_playMode = (g_playMode + 1) % 4;
     InvalidateRect(g_btnPlayMode, NULL, TRUE);
-    if (g_hwndTip) {
-        TOOLINFOW ti; ZeroMemory(&ti, sizeof(ti));
-        ti.cbSize = sizeof(ti);
-        ti.uFlags = TTF_IDISHWND;
-        ti.hwnd = g_hwnd;
-        ti.uId = (UINT_PTR)g_btnPlayMode;
-        ti.lpszText = (LPWSTR)PlayModeTipText();
-        SendMessageW(g_hwndTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-    }
+    UpdateTipText(g_btnPlayMode, PlayModeTipText());
 }
 
 /* 播客自定义提示窗过程：左侧封面，右侧标题+作者 */
@@ -7569,18 +7535,14 @@ static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                     int dh = (int)(bm.bmHeight * r + 0.5);
                     int dx = rci.left + (96 - dw) / 2;
                     int dy = rci.top + (96 - dh) / 2;
-                    HBRUSH bk = CreateSolidBrush(ThPanel());
-                    FillRect(hdc, &rci, bk);
-                    DeleteObject(bk);
+                    FillRectColor(hdc, &rci, ThPanel());
                     SetStretchBltMode(hdc, HALFTONE);
                     StretchBlt(hdc, dx, dy, dw, dh, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
                 }
                 SelectObject(mem, old);
                 DeleteDC(mem);
             } else {
-                HBRUSH bk = CreateSolidBrush(ThPanel());
-                FillRect(hdc, &rci, bk);
-                DeleteObject(bk);
+                FillRectColor(hdc, &rci, ThPanel());
             }
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, GetSysColor(COLOR_INFOTEXT));
@@ -7857,11 +7819,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             /* 倍速按钮：文字按钮，显示 "1.0x" 等 */
             if (di->CtlID == IDC_BTN_SPEED) {
                 RECT rc = di->rcItem;
-                HBRUSH bg = CreateSolidBrush(ThWinBg());
                 HFONT oldf;
                 wchar_t txt[16];
-                FillRect(di->hDC, &rc, bg);
-                DeleteObject(bg);
+                FillRectColor(di->hDC, &rc, ThWinBg());
                 if (di->itemState & ODS_SELECTED)
                     DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
                 else
@@ -7886,24 +7846,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             Podcast *p = isCache ? &g_cachePod : &g_pods[di->itemID];
             int isSel = (di->itemState & ODS_SELECTED) != 0;
             int isPlaying = (g_playPod == (int)di->itemID && g_playState == 1);
-            HBRUSH bg = CreateSolidBrush(isSel ? ThSel() : ThPanel());
             RECT rc = di->rcItem;
             int textLeft;
 
-            FillRect(di->hDC, &rc, bg);
-            DeleteObject(bg);
+            FillRectColor(di->hDC, &rc, isSel ? ThSel() : ThPanel());
 
             /* 封面区：48x48，左留 2px、上留 3px。
              * 删除模式 → 大红叉按钮
              * "已缓存"虚拟行画一个下载缓存图标 */
             if (isCache) {
                 RECT ib = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
-                HBRUSH fb = CreateSolidBrush(g_darkMode ? RGB(50,56,66) : RGB(238,242,248));
                 HPEN gp = CreatePen(PS_SOLID, 2, g_darkMode ? RGB(130,150,180) : RGB(120,140,170));
                 HBRUSH ab = CreateSolidBrush(g_darkMode ? RGB(130,150,180) : RGB(120,140,170));
                 HGDIOBJ oldPen, oldBrush;
-                FillRect(di->hDC, &ib, fb);
-                DeleteObject(fb);
+                FillRectColor(di->hDC, &ib, g_darkMode ? RGB(50,56,66) : RGB(238,242,248));
                 oldPen = SelectObject(di->hDC, gp);
                 oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
                 RoundRect(di->hDC, ib.left+3, ib.top+3, ib.right-3, ib.bottom-3, 8, 8);
@@ -8368,19 +8324,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (playing) {
                         /* 播放行同时是选中行（默认蓝底白字会盖住绿字），
                          * 自己铺一层浅绿底再用深绿字 */
-                        RECT rr = cd->nmcd.rc;
-                        HBRUSH bg = CreateSolidBrush(ThGreenBg());
-                        FillRect(cd->nmcd.hdc, &rr, bg);
-                        DeleteObject(bg);
+                        FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThGreenBg());
                         cd->clrText = ThGreen();
                     } else {
                         /* 选中行自己铺主题高亮色（暗色下系统高亮仍是浅色） */
-                        if (sel) {
-                            RECT rr = cd->nmcd.rc;
-                            HBRUSH bg = CreateSolidBrush(ThSel());
-                            FillRect(cd->nmcd.hdc, &rr, bg);
-                            DeleteObject(bg);
-                        }
+                        if (sel)
+                            FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThSel());
                         /* 优先级：批量队列蓝 > 上次听到橙 > 已缓存黄 */
                         cd->clrText = queued
                             ? ThBlue()
@@ -8400,30 +8349,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_HSCROLL:
         if ((HWND)lParam == g_sldVol) {
-            wchar_t buf[16];
-            int v = (int)SendMessageW(g_sldVol, TBM_GETPOS, 0, 0);
-            g_volume = v;
-            swprintf(buf, 16, L"%d", v);
-            SetWindowTextW(g_stVol, buf);
-            if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
-            /* 手动调音量时自动解除静音 */
-            if (g_muted) {
-                g_muted = 0;
-                if (g_player) g_player->lpVtbl->SetMute(g_player, FALSE);
-                InvalidateRect(g_btnMute, NULL, TRUE);
-            }
+            SetVolumeValue((int)SendMessageW(g_sldVol, TBM_GETPOS, 0, 0));
             /* 音量退出时统一保存 */
         } else if ((HWND)lParam == g_sldSeek) {
             int code = LOWORD(wParam);
             if (code == TB_THUMBTRACK || code == TB_THUMBPOSITION) {
                 g_seeking = 1;
                 if (g_dur100ns > 0) {
-                    wchar_t buf[64], a[16], b[16];
                     int pm = (int)SendMessageW(g_sldSeek, TBM_GETPOS, 0, 0);
-                    FmtTime(g_dur100ns / 10000000 * pm / 1000, a, 16);
-                    FmtTime(g_dur100ns / 10000000, b, 16);
-                    swprintf(buf, 64, L"%ls / %ls", a, b);
-                    SetWindowTextW(g_stTime, buf);
+                    ShowTimeLabel((int)(g_dur100ns / 10000000 * pm / 1000),
+                                  (int)(g_dur100ns / 10000000));
                 }
             } else if (code == TB_ENDTRACK) {
                 int pm = (int)SendMessageW(g_sldSeek, TBM_GETPOS, 0, 0);
@@ -8471,7 +8406,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             long long dur = PlayerGet100ns(1);
             if (dur > 0) g_dur100ns = dur;
             if (pos >= 0) {
-                wchar_t buf[64], a[16], b[16];
                 g_posSec = (int)(pos / 10000000);              /* 供手机 /status 读 */
                 g_durSec = g_dur100ns > 0 ? (int)(g_dur100ns / 10000000) : 0;
                 /* 每播客“上次听到哪”：随播放实时刷新内存，退出/崩溃都不丢太多 */
@@ -8479,11 +8413,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_pods[g_playPod].feedUrl && g_playUrl)
                     LastEpSet(LastEpHash(g_pods[g_playPod].feedUrl), g_playUrl,
                               pos / 10000000);
-                FmtTime(pos / 10000000, a, 16);
-                if (g_dur100ns > 0) FmtTime(g_dur100ns / 10000000, b, 16);
-                else wcscpy_s(b, 16, L"--:--");
-                swprintf(buf, 64, L"%ls / %ls", a, b);
-                SetWindowTextW(g_stTime, buf);
+                ShowTimeLabel(g_posSec, g_durSec);
                 if (g_dur100ns > 0) {
                     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
                         (LPARAM)(pos * 1000 / g_dur100ns));
@@ -8519,23 +8449,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     /* 手机遥控：音量（wParam=0..100），与音量滑块同一套行为 */
-    case WM_APP_REMOTE_VOL: {
-        int v = (int)wParam;
-        wchar_t buf[16];
-        if (v < 0) v = 0;
-        if (v > 100) v = 100;
-        g_volume = v;
-        SendMessageW(g_sldVol, TBM_SETPOS, TRUE, v);
-        swprintf(buf, 16, L"%d", v);
-        SetWindowTextW(g_stVol, buf);
-        if (g_player) g_player->lpVtbl->SetVolume(g_player, v / 100.0f);
-        if (g_muted) {
-            g_muted = 0;
-            if (g_player) g_player->lpVtbl->SetMute(g_player, FALSE);
-            InvalidateRect(g_btnMute, NULL, TRUE);
-        }
+    case WM_APP_REMOTE_VOL:
+        SetVolumeValue((int)wParam);
         return 0;
-    }
 
     /* 手机遥控：点选剧集播放（wParam=pod，lParam=ep；pod==g_podCount 为缓存视图） */
     case WM_APP_REMOTE_PLAYEP:
@@ -8557,6 +8473,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         ApplySpeed();
         if (g_btnSpeed) InvalidateRect(g_btnSpeed, NULL, TRUE);
         SetStatusTemp(tr(TR_SPEED_SET));
+        return 0;
+    }
+
+    /* 批量缓存：当前这一集的下载百分比（批量线程 HttpFetch 直接 Post 上来）。
+     * head 在取件时已 +1，即当前正在下载的序号；取消/完成后到达的滞留消息直接丢弃 */
+    case WM_APP_BATCH_PROGRESS: {
+        BatchCache *bc = g_batch;
+        if (bc && g_batchActive) {
+            wchar_t st[128];
+            int head, cnt, len;
+            EnterCriticalSection(&bc->cs);
+            head = bc->head; cnt = bc->count;
+            LeaveCriticalSection(&bc->cs);
+            len = swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), head, cnt);
+            swprintf(st + len, 128 - len, L" %d%%", (int)wParam);
+            SetBatchProgress(st);
+        }
         return 0;
     }
 
