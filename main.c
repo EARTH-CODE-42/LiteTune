@@ -5003,21 +5003,6 @@ static void BuildEpisodeTipText(wchar_t *buf, int bufMax, int i)
     }
 }
 
-/* 剧集 tooltip：标题被列宽截断时显示完整标题 + 播客/日期/时长。
- * 走 ListView 原生 LVS_EX_INFOTIP 机制：悬停计时、命中行判断全由控件完成，
- * 这里只在 LVN_GETINFOTIPW 回调里把文本写进控件给的缓冲。 */
-static void FillEpisodeTip(LPNMLVGETINFOTIPW gt)
-{
-    wchar_t line[1024];
-    size_t cap;
-    BuildEpisodeTipText(line, 1024, (int)gt->iItem);
-    cap = gt->cchTextMax;
-    if (cap == 0) return;
-    if (cap > 1024) cap = 1024;
-    wcsncpy(gt->pszText, line, cap - 1);
-    gt->pszText[cap - 1] = 0;
-}
-
 /* 把字段拼成 "【标题】\r\n内容\r\n\r\n..." 塞进简介框 */
 static void ShowDetailField(wchar_t *buf, size_t bufSize, size_t *pos,
                             const wchar_t *label, const wchar_t *value)
@@ -7731,7 +7716,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SendMessageW(g_listEp, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
             }
             ListView_SetExtendedListViewStyle(g_listEp,
-                LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
+                LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
             SendMessageW(g_listEp, LVM_SETBKCOLOR, 0, (LPARAM)ThPanel());
             SendMessageW(g_listEp, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
         }
@@ -8341,9 +8326,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_resumeSeek100ns = 0;   /* 缓存聚合视图无单一 feed，从头播 */
                 }
                 if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
-            } else if (nm->code == LVN_GETINFOTIPW) {
-                /* ListView 原生悬停提示（LVS_EX_INFOTIP）：控件自己管计时/命中 */
-                FillEpisodeTip((LPNMLVGETINFOTIPW)lParam);
             } else if (nm->code == NM_CUSTOMDRAW) {
                 /* 正在播放 → 绿；已缓存（非播放）→ 黄 */
                 LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
