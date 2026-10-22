@@ -23,6 +23,7 @@
 ![clean](https://img.shields.io/badge/Cache-auto%20clean-4B0082)
 ![resume](https://img.shields.io/badge/Playback-resume-blueviolet)
 ![remote](https://img.shields.io/badge/Control-phone%20web-red)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 
 [![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)
