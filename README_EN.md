@@ -2,27 +2,27 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 255 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 260 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![size](https://img.shields.io/badge/size-255%20KB-brightgreen?style=for-the-badge)
-![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
-![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
-![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
-![license](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+![version](https://img.shields.io/badge/Version-1.3-blue)
+![size](https://img.shields.io/badge/Size-260%20KB-brightgreen)
+![deps](https://img.shields.io/badge/Deps-none-success)
+![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
+![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
+![license](https://img.shields.io/badge/License-MIT-green)
 
-![language](https://img.shields.io/badge/language-pure%20C-00599C?style=for-the-badge&logo=c&logoColor=white)
-![ui](https://img.shields.io/badge/ui-native%20win32-0078D6?style=for-the-badge)
-![audio](https://img.shields.io/badge/audio-media%20foundation-7B2FBE?style=for-the-badge)
-![http](https://img.shields.io/badge/http-winhttp-0F7B6C?style=for-the-badge)
-![compiler](https://img.shields.io/badge/compiler-gcc%2015.2-FA7343?style=for-the-badge)
+![language](https://img.shields.io/badge/Language-pure%20C-00599C)
+![ui](https://img.shields.io/badge/UI-native%20Win32-0078D6)
+![audio](https://img.shields.io/badge/Audio-Media%20Foundation-7B2FBE)
+![http](https://img.shields.io/badge/HTTP-WinHTTP-0F7B6C)
+![compiler](https://img.shields.io/badge/Compiler-GCC%2015.2-FA7343)
 
-![feed](https://img.shields.io/badge/feed-rss%20subscribe-E34F26?style=for-the-badge)
-![play](https://img.shields.io/badge/play-offline%20cache-009688?style=for-the-badge)
-![resume](https://img.shields.io/badge/playback-resume-blueviolet?style=for-the-badge)
-![cache](https://img.shields.io/badge/cache-batch%20download-purple?style=for-the-badge)
-![remote](https://img.shields.io/badge/control-phone%20web-red?style=for-the-badge)
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
+![feed](https://img.shields.io/badge/Feed-RSS%20subscribe-E34F26)
+![search](https://img.shields.io/badge/Search-iTunes-orange)
+![cache](https://img.shields.io/badge/Cache-batch%20download-009688)
+![clean](https://img.shields.io/badge/Cache-auto%20clean-4B0082)
+![resume](https://img.shields.io/badge/Playback-resume-blueviolet)
+![remote](https://img.shields.io/badge/Control-phone%20web-red)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 [![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)
 
@@ -43,6 +43,7 @@ English | [简体中文](README.md)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
 - **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
 - Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
+- **Podcast search**: type a keyword (plain text, no `://`) in the "Add Subscription" box and press Enter or hit OK — results from iTunes appear below. A single click fills the RSS URL back into the edit box (press Enter again to add); a double-click adds it immediately
 - Playback controls: previous / play-pause / next / stop / mute / volume
 - Play modes: sequential / shuffle / repeat one / play once (stop after this episode)
 - Playback speed: 0.5x–3.0x (quick presets 0.75 / 1 / 1.25 / 1.5 / 2)
@@ -54,7 +55,7 @@ English | [简体中文](README.md)
 - Light / dark theme (switched at runtime)
 - Bilingual UI, English & Chinese (chosen on first run, switchable in the Settings menu, remembered)
 - Sleep timer (presets 15–120 min or custom 1–600 min, countdown in the title bar; force shutdown at the end, Windows gives a 15-second cancel window)
-- Auto-clean cache older than 30 days at startup (default %TEMP% folder only; custom folders are never touched)
+- Auto-clean old cache at startup: 30 days by default, adjustable in the settings menu (Off / 7 / 30 / 90 days; only files generated by the app itself are removed, so custom folders are equally safe)
 - Three UI font sizes (Ctrl + mouse wheel)
 - Custom cache folder (open / change / move existing cache)
 - **Dual-mode config storage**: embed it in the exe (single-file portable — copying the exe takes it along) or keep it as an external `feeds.ini` next to the exe (easy upgrades / backups / manual editing); chosen on first run, switchable anytime in the Settings menu (see "Config storage")
@@ -117,6 +118,7 @@ lang=zh               ; UI language zh/en
 winw=480              ; window size (client area)
 winh=360
 cachedir=             ; cache folder (empty = default %TEMP%\LiteTune)
+cachedays=30          ; cache auto-clean days (0 = off; default 30, written only when non-default)
 resume=1234           ; last playback position in seconds (for auto resume)
 resumeplay=1          ; playing at exit? (0 = paused; reopens paused at the saved position)
 resumeurl=...         ; URL of the episode playing at last exit

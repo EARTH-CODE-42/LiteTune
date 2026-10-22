@@ -210,6 +210,7 @@ static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
 
 /* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
 static wchar_t  g_cacheDir[MAX_PATH] = L"";
+static int      g_cacheDays = 30;   /* 自动清理天数：0=关（配置 cachedays，默认 30） */
 
 /* 工具提示 */
 static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 */
@@ -315,6 +316,7 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_BATCH_DONE    (WM_APP + 13) /* wParam=ok(0/1) */
 #define WM_APP_BATCH_FINISH  (WM_APP + 14) /* wParam=成功数, lParam=总数 */
 #define WM_APP_BATCH_PROGRESS (WM_APP + 16) /* wParam=当前集百分比 0-100 */
+#define WM_APP_SEARCH_DONE    (WM_APP + 17) /* lParam=SearchResult* */
 #define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
@@ -338,6 +340,9 @@ enum {
     TR_INPUT_TITLE, TR_INPUT_LABEL, TR_OK, TR_CANCEL, TR_IB_OPML,
     TR_BAD_URL, TR_DUP_FEED, TR_MAX_FEEDS,
     TR_M_OPEN_CACHE, TR_M_CHANGE_CACHE, TR_M_DEFAULT_CACHE,
+    TR_M_CACHE_CLEAN, TR_CC_OFF, TR_CC_DAYS_FMT, TR_CC_SET_FMT,
+    TR_SEARCH_HINT, TR_SEARCH_BTN, TR_SEARCHING, TR_SEARCH_NONE,
+    TR_SEARCH_FAIL,
     TR_M_NIGHT, TR_M_LANGUAGE, TR_LANG_ZH, TR_LANG_EN,
     TR_M_SHUTDOWN, TR_M_SHUT_CANCEL, TR_SHUT_IN_MINS_FMT,
     TR_M_CUSTOM, TR_CUSTOM_TITLE, TR_CUSTOM_LABEL, TR_CUSTOM_BAD,
@@ -399,6 +404,9 @@ static const wchar_t *tr(int id)
         L"地址无效，请输入以 http:// 或 https:// 开头的链接",
         L"该订阅地址已存在", L"订阅数量已达上限",
         L"打开缓存目录", L"更改缓存目录...", L"恢复默认目录",
+        L"自动清理缓存", L"关", L"%d 天", L"自动清理缓存：%ls",
+        L"输入关键词搜索 iTunes（或直接粘 RSS 地址）：", L"搜索", L"搜索中…",
+        L"没找到相关播客", L"搜索失败（网络问题？）",
         L"夜间模式", L"语言", L"简体中文", L"English",
         L"定时关机", L"取消定时关机", L"%d 分钟后关机",
         L"自定义分钟数...", L"自定义定时关机",
@@ -488,6 +496,9 @@ static const wchar_t *tr(int id)
         L"Invalid URL. Please enter a link starting with http:// or https://",
         L"This feed already exists", L"Maximum number of feeds reached",
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
+        L"Auto-Clean Cache", L"Off", L"%d days", L"Auto-clean cache: %ls",
+        L"Enter keyword to search iTunes (or paste an RSS URL):", L"Search", L"Searching...",
+        L"No podcasts found", L"Search failed (network issue?)",
         L"Night Mode", L"Language", L"简体中文", L"English",
         L"Sleep Timer", L"Cancel Sleep Timer", L"Shut down in %d min",
         L"Custom minutes...", L"Custom Sleep Timer",
@@ -496,7 +507,7 @@ static const wchar_t *tr(int id)
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
-        L"LiteTune  version 1.2\r\n\r\n"
+        L"LiteTune  version 1.3\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
             L"auto-cache episodes and listen offline.\r\n\r\n"
             L"Written in pure C with Win32 API. One portable executable,\r\n"
@@ -679,6 +690,12 @@ static int DarkDlgMsg(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
         *res = (LRESULT)DlgBgBrush();
         return 1;
     case WM_CTLCOLOREDIT:
+        if (!g_darkMode) return 0;
+        SetBkColor((HDC)wp, ThPanel());
+        SetTextColor((HDC)wp, ThText());
+        *res = (LRESULT)DlgPanelBrush();
+        return 1;
+    case WM_CTLCOLORLISTBOX:
         if (!g_darkMode) return 0;
         SetBkColor((HDC)wp, ThPanel());
         SetTextColor((HDC)wp, ThText());
@@ -1806,6 +1823,14 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
         WinHttpSetOption(hReq, WINHTTP_OPTION_DECOMPRESSION, &flags, sizeof(flags));
     }
 
+    /* 强制 TLS 1.2：部分现代 CDN（art19.com 等）拒绝 TLS 1.0/1.1。
+     * WINHTTP_OPTION_TLS_VERSION（=105）是 Win10+ SDK 引入的，MinGW 头里暂无定义 */
+    {
+        const DWORD WINHTTP_OPTION_TLS_VERSION = 105;
+        DWORD TLS1_2 = 0x0102;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_TLS_VERSION, &TLS1_2, sizeof(TLS1_2));
+    }
+
     if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto fail;
     if (!WinHttpReceiveResponse(hReq, NULL)) goto fail;
@@ -2303,6 +2328,49 @@ static void EnsureCacheDir(void)
     CacheDir(dir, MAX_PATH);
     dir[wcslen(dir) - 1] = 0;   /* 去掉末尾反斜杠 */
     CreateDirectoryW(dir, NULL);
+}
+
+/* 启动时清理 g_cacheDays 天前的旧缓存（0=关）。
+ * 只删符合程序命名规则（8 位十六进制 + .mp3）的文件，
+ * 因此自定义目录里有别的 mp3 也不会被误删 */
+static void CacheAutoClean(void)
+{
+    wchar_t cdir[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    FILETIME ftNow;
+    ULARGE_INTEGER ullNow, ullFile;
+    if (g_cacheDays <= 0) return;
+    CacheDir(cdir, MAX_PATH);
+    swprintf(pat, MAX_PATH, L"%ls????????.mp3", cdir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    GetSystemTimeAsFileTime(&ftNow);
+    ullNow.LowPart = ftNow.dwLowDateTime;
+    ullNow.HighPart = ftNow.dwHighDateTime;
+    ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
+    do {
+        const wchar_t *n;
+        int i, ok;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        /* 通配符 ? 匹配单字符，但还要确认确实是 8 个十六进制字符 */
+        n = fd.cFileName;
+        if (wcslen(n) != 12) continue;
+        ok = 1;
+        for (i = 0; i < 8; i++) {
+            wchar_t c = n[i];
+            if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (ullFile.QuadPart < ullNow.QuadPart) {
+            wchar_t fp[MAX_PATH];
+            swprintf(fp, MAX_PATH, L"%ls%ls", cdir, n);
+            DeleteFileW(fp);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
 }
 
 /* 剧集是否已缓存到本地 */
@@ -2854,6 +2922,10 @@ static void ParseConfigLine(char *line)
             wchar_t *w = U8ToW(val);
             if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
         }
+        else if (strcmp(s, "cachedays") == 0) {
+            g_cacheDays = atoi(val);
+            if (g_cacheDays < 0) g_cacheDays = 0;
+        }
     } else if (strstr(s, "://")) {
         AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
     }
@@ -3159,6 +3231,8 @@ static char *BuildConfigText(DWORD *lenOut)
         char *u8 = WToU8(g_cacheDir);
         if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
     }
+    if (g_cacheDays != 30)   /* 默认 30 天不写入，保持配置干净 */
+        SbAddf(&sb, "cachedays=%d\n", g_cacheDays);
     SbAddf(&sb, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         SbAddf(&sb, "%s\n", g_feedUrls[i]);
@@ -5616,16 +5690,36 @@ static void MovePodcastTo(int i, int j)
 #define ID_IB_OK     9002
 #define ID_IB_CANCEL 9003
 #define ID_IB_OPML   9004
+#define ID_IB_SEARCH 9005
+#define ID_IB_LIST   9006
+#define ID_IB_SB     9007   /* ListView 纵向自绘滚动条 */
+#define ID_IB_SBH    9008   /* ListView 水平自绘滚动条 */
+
+static HWND g_ibSb;
+static HWND g_ibSbH;
+static int  g_ibBorderDeltaX;   /* 窗口外宽 - 客户区宽 */
+static int  g_ibBorderDeltaY;   /* 窗口外高 - 客户区高 */
+static WNDPROC g_ibOrigHdrProc = NULL;
 
 static wchar_t g_ibBuf[2048];
 static int     g_ibResult = 0;
 static int     g_ibMode = 0;   /* 0=订阅 URL，1=定时关机分钟数 */
+
+/* iTunes 搜索结果（线程结束后 Post 给 UI，UI 负责 free） */
+#define MAX_SEARCH_RES 30
+typedef struct {
+    int count;
+    char *title[MAX_SEARCH_RES];     /* UTF-8 */
+    char *author[MAX_SEARCH_RES];    /* UTF-8 */
+    char *feedUrl[MAX_SEARCH_RES];   /* UTF-8 */
+} SearchResult;
 
 /* 前置声明（实现在导入导出段） */
 static BOOL FileDlg(int save, const wchar_t *title, const wchar_t *filter,
                     const wchar_t *defExt, wchar_t *path, int pathMax);
 static char *ReadFileAll(const wchar_t *path, DWORD *lenOut);
 static int ImportOpmlText(const char *buf);
+static int FeedUrlDup(const char *url);
 
 /* 添加订阅对话框内直接选 OPML 导入（与设置→导入同一套解析） */
 static void DoOpmlPickImport(HWND h)
@@ -5658,12 +5752,233 @@ static void DoOpmlPickImport(HWND h)
     }
 }
 
+/* ================= iTunes 播客搜索 ================= */
+
+/* URL 编码：只保留 ASCII 字母数字和 -_.~，其他转 %XX；空格 → + */
+static char *UrlEncode(const wchar_t *in)
+{
+    char *utf8 = WToU8(in);
+    char *out, *p, *r;
+    int n, sz;
+    if (!utf8) return NULL;
+    sz = 0;
+    for (p = utf8; *p; p++) sz += ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+                                    (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+                                    *p == '.' || *p == '~') ? 1 : 3;
+    out = (char *)malloc(sz + 1);
+    if (!out) { free(utf8); return NULL; }
+    r = out;
+    for (p = utf8; *p; p++) {
+        if (*p == ' ') { *r++ = '+'; continue; }
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            *r++ = *p;
+        } else {
+            n = (unsigned char)*p;
+            *r++ = '%';
+            *r++ = "0123456789ABCDEF"[n >> 4];
+            *r++ = "0123456789ABCDEF"[n & 15];
+        }
+    }
+    *r = 0;
+    free(utf8);
+    return out;
+}
+
+/* 从 JSON 字符串中提取指定 key 的字符串值。
+ * 只处理最朴素的 "key":"value" 形式，遇到转义反斜杠会正确处理；
+ * 不支持嵌套对象、数组、数字。找不到返回 NULL。 */
+/* 在 JSON 对象 buf 里提取 key 对应的字符串值。
+ * 返回 malloc 出来的独立副本（调用方负责 free），失败返回 NULL。 */
+static char *JsonStrVal(const char *buf, const char *key)
+{
+    char pat[64];
+    const char *p, *end;
+    int esc;
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    p = strstr(buf, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return NULL;
+    p++; /* 跳过起始引号，p 指向 value 首字符 */
+    end = p;
+    esc = 0;
+    while (*end) {
+        if (esc) { esc = 0; end++; continue; }
+        if (*end == '\\') { esc = 1; end++; continue; }
+        if (*end == '"') break;
+        end++;
+    }
+    if (*end != '"') return NULL;
+    /* [p, end) 是纯 value，拷贝成独立字符串
+     * （MinGW 未声明 strndup，就地实现） */
+    {
+        size_t n = (size_t)(end - p);
+        char *out = (char *)malloc(n + 1);
+        if (!out) return NULL;
+        memcpy(out, p, n);
+        out[n] = 0;
+        return out;
+    }
+}
+
+/* iTunes 搜索后台线程：抓 JSON → 解析 → Post 给调用者 */
+typedef struct { HWND hwnd; wchar_t kw[2048]; } SearchParam;
+
+static DWORD WINAPI ItunesSearchThread(LPVOID param)
+{
+    SearchParam *sp = (SearchParam *)param;
+    HWND dst = sp->hwnd;
+    wchar_t url[2048];
+    wchar_t *enc;
+    char *json;
+    DWORD len;
+    SearchResult *res;
+    char *p;
+
+    enc = U8ToW(UrlEncode(sp->kw));
+    free(sp);
+    if (!enc) { PostMessageW(dst, WM_APP_SEARCH_DONE, 0, 0); return 1; }
+    swprintf(url, 2048, L"https://itunes.apple.com/search?term=%ls&media=podcast&limit=20", enc);
+    free(enc);
+
+    json = HttpFetch(url, &len, 0, NULL, NULL);
+    if (!json) { PostMessageW(dst, WM_APP_SEARCH_DONE, 0, 0); return 1; }
+
+    res = (SearchResult *)calloc(1, sizeof(SearchResult));
+    if (!res) { free(json); PostMessageW(dst, WM_APP_SEARCH_DONE, 0, 0); return 1; }
+
+    /* 遍历 results 数组：按 { ... } 对象边界切，每个对象独立提取三个字段。
+     * count 只在成功提取后才自增，不在 for 里无条件自增 */
+    p = strstr(json, "\"results\"");
+    if (p) p = strchr(p, '[');
+    if (p) for (p++; *p && res->count < MAX_SEARCH_RES; ) {
+        char *ob, *cb, save;
+        int depth;
+        char *title, *author, *url2;
+        while (*p && *p != '{') p++;
+        if (*p != '{') break;
+        ob = p++;
+        depth = 1;
+        while (*p && depth > 0) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            if (depth > 0) p++;
+        }
+        cb = p;
+        save = *cb;
+        *cb = 0;
+        title = JsonStrVal(ob, "collectionName");
+        author = JsonStrVal(ob, "artistName");
+        url2 = JsonStrVal(ob, "feedUrl");
+        *cb = save;
+        p++;
+        if (title && url2) {
+            res->title[res->count] = title;
+            res->author[res->count] = author ? author : strdup("");
+            res->feedUrl[res->count] = url2;
+            res->count++;
+        } else {
+            /* 解析失败，释放 JsonStrVal 已分配的 */
+            free(title); free(author); free(url2);
+        }
+    }
+    free(json);
+    PostMessageW(dst, WM_APP_SEARCH_DONE, 0, (LPARAM)res);
+    return 0;
+}
+
+static void FreeSearchResult(SearchResult *r)
+{
+    int i;
+    if (!r) return;
+    for (i = 0; i < r->count; i++) {
+        free(r->title[i]); free(r->author[i]); free(r->feedUrl[i]);
+    }
+    free(r);
+}
+
+/* 搜索 ListView 表头子类化：暗色主题 gap 填黑 + 通过 NM_CUSTOMDRAW 改文字颜色 */
+static LRESULT CALLBACK IbHeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    LRESULT lr = CallWindowProcW(g_ibOrigHdrProc, hwnd, msg, wp, lp);
+    if (g_darkMode && msg == WM_NOTIFY) {
+        NMHDR *nm = (NMHDR *)lp;
+        if (nm->code == NM_CUSTOMDRAW) {
+            NMCUSTOMDRAW *cd = (NMCUSTOMDRAW *)lp;
+            if (cd->dwDrawStage == CDDS_PREPAINT) {
+                return CDRF_NOTIFYITEMDRAW;
+            } else if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                SetTextColor(cd->hdc, ThText());
+                SetBkColor(cd->hdc, RGB(46, 46, 52));
+                return CDRF_NEWFONT;
+            }
+        }
+    }
+    if (g_darkMode && msg == WM_PAINT) {
+        HDC hdc = GetDC(hwnd);
+        RECT rc, last;
+        int cols;
+        GetClientRect(hwnd, &rc);
+        cols = (int)SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0);
+        if (hdc && cols > 0 && SendMessageW(hwnd, HDM_GETITEMRECT, cols - 1, (LPARAM)&last)
+            && last.right < rc.right) {
+            RECT gap = { last.right, rc.top, rc.right, rc.bottom };
+            HBRUSH b = CreateSolidBrush(RGB(46, 46, 52));
+            HPEN pn = CreatePen(PS_SOLID, 1, RGB(28, 28, 32));
+            HGDIOBJ ob1 = SelectObject(hdc, b);
+            HGDIOBJ ob2 = SelectObject(hdc, pn);
+            FillRect(hdc, &gap, b);
+            MoveToEx(hdc, rc.left, rc.bottom - 1, NULL);
+            LineTo(hdc, rc.right, rc.bottom - 1);
+            SelectObject(hdc, ob1);
+            SelectObject(hdc, ob2);
+            DeleteObject(b);
+            DeleteObject(pn);
+        }
+        if (hdc) ReleaseDC(hwnd, hdc);
+    }
+    return lr;
+}
+
+/* 前向声明 —— 定义在主窗口 PanelProc 附近 */
+static void SubclassForFontWheel(HWND w);
+
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     LRESULT r;
     if (DarkDlgMsg(h, msg, wp, lp, &r)) return r;
 
     switch (msg) {
+    case WM_SIZE: {
+        /* 搜索后窗口尺寸变化，重排 ListView + 纵向 + 水平滚动条 */
+        HWND lv = GetDlgItem(h, ID_IB_LIST);
+        if (lv && IsWindowVisible(lv)) {
+            RECT rc;
+            GetClientRect(h, &rc);
+            int x0 = 12;
+            int y0 = 104;
+            int w  = rc.right - rc.left - 24;   /* 客户区总宽减去左右各 12px */
+            int hgt = rc.bottom - rc.top - 12 - y0;  /* ListView 可用高 */
+            int sbw = DSB_W, sbh = DSB_W;
+            MoveWindow(lv, x0, y0, w - sbw - 2, hgt - sbh - 2, TRUE);
+            if (g_ibSb) MoveWindow(g_ibSb, x0 + w - sbw - 2, y0 + 2, sbw, hgt - sbh - 6, TRUE);
+            if (g_ibSbH) MoveWindow(g_ibSbH, x0 + 2, y0 + hgt - sbh - 2, w - sbw - 6, sbh, TRUE);
+            if (g_ibSb) SyncScrollBar(g_ibSb);
+            if (g_ibSbH) SyncScrollBar(g_ibSbH);
+            /* 重排后把按钮提到顶层，防止被 ListView 盖住 */
+            {
+                HWND b1 = GetDlgItem(h, ID_IB_OPML);
+                HWND b2 = GetDlgItem(h, ID_IB_OK);
+                HWND b3 = GetDlgItem(h, ID_IB_CANCEL);
+                if (b1) SetWindowPos(b1, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                if (b2) SetWindowPos(b2, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                if (b3) SetWindowPos(b3, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            }
+        }
+        return 0;
+    }
     case WM_CREATE: {
         HWND e, lab;
         UINT btnStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
@@ -5672,24 +5987,92 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
             12, 36, 408, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
         lab = CreateWindowExW(0, L"STATIC",
-            g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_INPUT_LABEL),
+            g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_SEARCH_HINT),
             WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 12, 408, 18, h, NULL, NULL, NULL);
-        if (g_darkMode) btnStyle |= BS_OWNERDRAW;   /* 暗色按钮自绘 */
-        if (g_ibMode == 0)
+        if (g_darkMode) btnStyle |= BS_OWNERDRAW;
+        if (g_ibMode == 0) {
+            /* 客户区 432px，margin 12px 两边 → 可用 408px
+             * 3 按钮: OPML 160 + gap36 + OK 88 + gap36 + Cancel 88 = 408px（对称） */
             CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
                 btnStyle | BS_PUSHBUTTON,
-                12, 74, 168, 26, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
-        CreateWindowExW(0, L"BUTTON", tr(TR_OK),
-            btnStyle | BS_DEFPUSHBUTTON,
-            276, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
-        CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
-            btnStyle | BS_PUSHBUTTON,
-            348, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+                12, 70, 160, 24, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
+            CreateWindowExW(0, L"BUTTON", tr(TR_OK),
+                btnStyle | BS_DEFPUSHBUTTON,
+                208, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+            CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
+                btnStyle | BS_PUSHBUTTON,
+                332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+            /* ListView：两列标题+作者；保留原生滚动条，由自绘 DSB 覆盖 */
+            {
+                HWND lv, hdr;
+                lv = CreateWindowExW(0, WC_LISTVIEWW, NULL,
+                    WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                    12, 104, 408 - DSB_W - 2, 204, h,
+                    (HMENU)(INT_PTR)ID_IB_LIST, NULL, NULL);
+                {
+                    LVCOLUMNW col;
+                    ZeroMemory(&col, sizeof(col));
+                    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+                    col.cx = 260; col.iSubItem = 0;
+                    col.pszText = (wchar_t *)tr(TR_COL_TITLE);
+                    SendMessageW(lv, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+                    col.cx = 140; col.iSubItem = 1;
+                    col.pszText = (wchar_t *)tr(TR_F_AUTHOR);
+                    SendMessageW(lv, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
+                }
+                ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+                /* 条目颜色 */
+                SendMessageW(lv, LVM_SETBKCOLOR, 0, (LPARAM)ThPanel());
+                SendMessageW(lv, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
+                SendMessageW(lv, LVM_SETTEXTCOLOR, 0, (LPARAM)ThText());
+                /* 给 ListView 挂 PanelProc：WM_NCCALCSIZE 抑制原生滚动条，
+                 * WM_VSCROLL/WM_MOUSEWHEEL 同步 DSB。主界面 g_listEp 同一套。 */
+                SubclassForFontWheel(lv);
+                /* 表头子类化（暗色 gap 填充 + 文字颜色） */
+                hdr = (HWND)SendMessageW(lv, LVM_GETHEADER, 0, 0);
+                if (hdr && !g_ibOrigHdrProc)
+                    g_ibOrigHdrProc = (WNDPROC)SetWindowLongPtrW(hdr, GWLP_WNDPROC, (LONG_PTR)IbHeaderProc);
+                /* 自绘纵向滚动条，贴 ListView 右边 */
+                g_ibSb = CreateDarkScrollBar(h, lv, 1, 0, ID_IB_SB);
+                if (g_ibSb) MoveWindow(g_ibSb, 12 + 408 - DSB_W - 2, 104 + 2, DSB_W, 204 - 4, TRUE);
+                /* 自绘水平滚动条，初始隐藏，搜索后 ShowWindow */
+                g_ibSbH = CreateDarkScrollBar(h, lv, 1, 1, ID_IB_SBH);
+                if (g_ibSbH) {
+                    MoveWindow(g_ibSbH, 12 + 2, 104 + 204 - 12 - DSB_W, 408 - DSB_W - 4, DSB_W, TRUE);
+                    ShowWindow(g_ibSbH, SW_HIDE);
+                }
+            }
+            /* 创建顺序：按钮先→ListView后。把按钮 Z-order 提到 ListView 前面，
+             * 否则 ListView 显示后会盖住按钮行 */
+            {
+                HWND b1 = GetDlgItem(h, ID_IB_OPML);
+                HWND b2 = GetDlgItem(h, ID_IB_OK);
+                HWND b3 = GetDlgItem(h, ID_IB_CANCEL);
+                if (b1) SetWindowPos(b1, HWND_TOP, 0,0,0,0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (b2) SetWindowPos(b2, HWND_TOP, 0,0,0,0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (b3) SetWindowPos(b3, HWND_TOP, 0,0,0,0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        } else {
+            CreateWindowExW(0, L"BUTTON", tr(TR_OK),
+                btnStyle | BS_DEFPUSHBUTTON,
+                276, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+            CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
+                btnStyle | BS_PUSHBUTTON,
+                348, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+        }
         SendMessageW(e, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(lab, WM_SETFONT, (WPARAM)g_font, TRUE);
+        ApplyDarkTitlebar(h, g_darkMode);
         SetFocus(e);
         return 0;
     }
+    case WM_CHAR:
+        /* 自注册窗口类不是 DialogBox，DefaultButton 不会自动处理 VK_RETURN，手动转 */
+        if (wp == VK_RETURN) {
+            SendMessageW(h, WM_COMMAND, MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
+            return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
     case WM_COMMAND:
         if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_CANCEL) {
             g_ibResult = 0;
@@ -5699,7 +6082,6 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_OK) {
             wchar_t raw[2048];
             wchar_t *s, *e;
-            int k, dup = 0;
             GetDlgItemTextW(h, ID_IB_EDIT, raw, 2048);
             s = raw;
             while (*s == L' ' || *s == L'\t') s++;
@@ -5722,18 +6104,37 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             }
 
             if (!wcsstr(s, L"://")) {
-                MessageBoxTh(h, tr(TR_BAD_URL),
-                            L"LiteTune", MB_ICONWARNING);
+                /* 无协议头：关键词 → iTunes 搜索（而不是报 URL 错） */
+                HWND lb = GetDlgItem(h, ID_IB_LIST);
+                SendMessageW(lb, LVM_DELETEALLITEMS, 0, 0);
+                ShowWindow(lb, SW_SHOW);
+                if (g_ibSb) ShowWindow(g_ibSb, SW_SHOW);
+                if (g_ibSbH) ShowWindow(g_ibSbH, SW_SHOW);
+                { RECT rc; GetWindowRect(h, &rc);
+                  MoveWindow(h, rc.left, rc.top,
+                             432 + g_ibBorderDeltaX, 356 + g_ibBorderDeltaY, TRUE); }
+                {
+                    SearchParam *sp = (SearchParam *)malloc(sizeof(SearchParam));
+                    if (sp) {
+                        sp->hwnd = h;
+                        wcsncpy(sp->kw, s, 2047);
+                        sp->kw[2047] = 0;
+                        CreateThread(NULL, 0, ItunesSearchThread, sp, 0, NULL);
+                    }
+                }
                 return 0;
             }
-            for (k = 0; k < g_feedUrlCount; k++) {
-                wchar_t *w = U8ToW(g_feedUrls[k]);
-                if (w) { if (_wcsicmp(w, s) == 0) dup = 1; free(w); }
-                if (dup) break;
-            }
-            if (dup) {
-                MessageBoxTh(h, tr(TR_DUP_FEED), L"LiteTune", MB_ICONINFORMATION);
-                return 0;
+            /* 有协议头：直接添加 RSS */
+            {
+                char *u8 = WToU8(s);
+                if (u8) {
+                    if (FeedUrlDup(u8)) {
+                        free(u8);
+                        MessageBoxTh(h, tr(TR_DUP_FEED), L"LiteTune", MB_ICONINFORMATION);
+                        return 0;
+                    }
+                    free(u8);
+                }
             }
             if (g_feedUrlCount >= MAX_PODCASTS) {
                 MessageBoxTh(h, tr(TR_MAX_FEEDS), L"LiteTune", MB_ICONWARNING);
@@ -5745,10 +6146,108 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             DestroyWindow(h);
         }
         return 0;
+    case WM_APP_SEARCH_DONE: {
+        HWND lb = GetDlgItem(h, ID_IB_LIST);
+        SearchResult *res = (SearchResult *)lp;
+        if (!lb) { FreeSearchResult(res); return 0; }
+        SendMessageW(lb, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(lb, LVM_DELETEALLITEMS, 0, 0);
+        if (!res) {
+            /* 搜索失败，不往 ListView 填东西 */
+        } else if (res->count == 0) {
+            /* 搜索无结果 */
+        } else {
+            int i;
+            for (i = 0; i < res->count; i++) {
+                wchar_t *tw = U8ToW(res->title[i]);
+                wchar_t *aw = U8ToW(res->author[i]);
+                wchar_t *fu = U8ToW(res->feedUrl[i]);
+                LVITEMW li;
+                int idx;
+                ZeroMemory(&li, sizeof(li));
+                li.mask = LVIF_TEXT | LVIF_PARAM;
+                li.pszText = tw;
+                li.iItem = i;
+                li.lParam = (LPARAM)fu;   /* lParam 直接存 feedUrl 宽串指针 */
+                idx = (int)SendMessageW(lb, LVM_INSERTITEMW, 0, (LPARAM)&li);
+                if (idx >= 0 && aw && aw[0]) {
+                    li.mask = LVIF_TEXT;
+                    li.iItem = idx;
+                    li.iSubItem = 1;
+                    li.pszText = aw;
+                    SendMessageW(lb, LVM_SETITEMW, 0, (LPARAM)&li);
+                }
+                free(tw); free(aw);
+                /* fu 不 free，由 ListView 持有，WM_DESTROY 统一清理 */
+            }
+        }
+        SendMessageW(lb, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(lb, NULL, TRUE);
+        if (g_ibSb) SyncScrollBar(g_ibSb);
+        if (g_ibSbH) SyncScrollBar(g_ibSbH);
+        FreeSearchResult(res);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        NMHDR *nm = (NMHDR *)lp;
+        if (nm->idFrom == ID_IB_LIST) {
+            HWND lv = GetDlgItem(h, ID_IB_LIST);
+            if (nm->code == LVN_ITEMCHANGED) {
+                /* 选中搜索结果：把 feedUrl 自动填进输入框 */
+                int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                if (sel >= 0) {
+                    LVITEMW li;
+                    ZeroMemory(&li, sizeof(li));
+                    li.mask = LVIF_PARAM;
+                    li.iItem = sel;
+                    if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&li)) {
+                        wchar_t *url = (wchar_t *)li.lParam;
+                        if (url && *url) SetDlgItemTextW(h, ID_IB_EDIT, url);
+                    }
+                }
+                if (g_ibSb) SyncScrollBar(g_ibSb);
+            } else if (nm->code == LVN_ITEMACTIVATE) {
+                /* 双击/回车：取 feedUrl 直接添加 */
+                int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                if (sel >= 0) {
+                    LVITEMW li;
+                    ZeroMemory(&li, sizeof(li));
+                    li.mask = LVIF_PARAM;
+                    li.iItem = sel;
+                    if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&li)) {
+                        wchar_t *url = (wchar_t *)li.lParam;
+                        if (url && *url) SetDlgItemTextW(h, ID_IB_EDIT, url);
+                    }
+                }
+                SendMessageW(h, WM_COMMAND, MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
+            }
+        }
+        return 0;
+    }
     case WM_CLOSE:
         g_ibResult = 0;
         DestroyWindow(h);
         return 0;
+    case WM_DESTROY: {
+        /* 清理 ListView lParam 里的 feedUrl 宽串指针 */
+        HWND lb = GetDlgItem(h, ID_IB_LIST);
+        if (lb) {
+            int n = (int)SendMessageW(lb, LVM_GETITEMCOUNT, 0, 0);
+            int i;
+            for (i = 0; i < n; i++) {
+                LVITEMW li;
+                ZeroMemory(&li, sizeof(li));
+                li.mask = LVIF_PARAM;
+                li.iItem = i;
+                if (SendMessageW(lb, LVM_GETITEMW, 0, (LPARAM)&li))
+                    free((wchar_t *)li.lParam);
+            }
+        }
+        g_ibSb = NULL;
+        g_ibSbH = NULL;
+        g_ibOrigHdrProc = NULL;   /* 表头随窗口销毁，原 proc 指针失效 */
+        return 0;
+    }
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -5781,6 +6280,8 @@ static int AskInputBox(const wchar_t *title, int mode)
         RECT wr = { 0, 0, 432, 112 };
         AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU,
                            FALSE, WS_EX_DLGMODALFRAME);
+        g_ibBorderDeltaX = (wr.right - wr.left) - 432;   /* 外宽 - 客户区宽 */
+        g_ibBorderDeltaY = (wr.bottom - wr.top) - 112;   /* 外高 - 客户区高 */
         d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, IB_CLASS,
             title,
             WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -5801,6 +6302,35 @@ static int AskInputBox(const wchar_t *title, int mode)
     ShowWindow(d, SW_SHOW);
     UpdateWindow(d);
     while (IsWindow(d) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        HWND focus;
+        /* 自己拦截 VK_RETURN：IsDialogMessageW 对 BS_OWNERDRAW 的
+         * DefaultButton 识别不可靠，直接在消息循环层面处理。
+         * 焦点在 ListView 上取选中项直接添加；其他情况一律转 OK。 */
+        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) {
+            focus = GetFocus();
+            if (focus == d || IsChild(d, focus)) {
+                if (focus == GetDlgItem(d, ID_IB_LIST)) {
+                    /* ListView 上按回车 = 等价 LVN_ITEMACTIVATE */
+                    NMHDR nm;
+                    nm.code = LVN_ITEMACTIVATE;
+                    nm.idFrom = ID_IB_LIST;
+                    nm.hwndFrom = focus;
+                    SendMessageW(d, WM_NOTIFY, 0, (LPARAM)&nm);
+                } else {
+                    SendMessageW(d, WM_COMMAND,
+                        MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
+                }
+                continue;
+            }
+        }
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
+            focus = GetFocus();
+            if (focus == d || IsChild(d, focus)) {
+                SendMessageW(d, WM_COMMAND,
+                    MAKEWPARAM(ID_IB_CANCEL, BN_CLICKED), 0);
+                continue;
+            }
+        }
         if (!IsDialogMessageW(d, &m)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
@@ -7028,6 +7558,21 @@ static void OnSettingsButton(void)
     AppendMenuW(menu, MF_STRING, 1, tr(TR_M_OPEN_CACHE));
     AppendMenuW(menu, MF_STRING, 2, tr(TR_M_CHANGE_CACHE));
     AppendMenuW(menu, MF_STRING, 3, tr(TR_M_DEFAULT_CACHE));
+    {
+        /* 自动清理：关 / 7 / 30 / 90 天，单选勾选 */
+        static const int days[] = { 7, 30, 90 };
+        HMENU cl = CreatePopupMenu();
+        int di;
+        AppendMenuW(cl, MF_STRING | (g_cacheDays == 0 ? MF_CHECKED : 0),
+                    30, tr(TR_CC_OFF));
+        for (di = 0; di < 3; di++) {
+            wchar_t t[32];
+            swprintf(t, 32, tr(TR_CC_DAYS_FMT), days[di]);
+            AppendMenuW(cl, MF_STRING | (g_cacheDays == days[di] ? MF_CHECKED : 0),
+                        31 + di, t);
+        }
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)cl, tr(TR_M_CACHE_CLEAN));
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, 22, tr(TR_M_IMPORT));
     AppendMenuW(exp, MF_STRING, 23, tr(TR_M_EXP_OPML));
@@ -7070,6 +7615,16 @@ static void OnSettingsButton(void)
     if (cmd == 24) { DoExportIni(); return; }
     if (cmd == 25) { CfgSwitchMode(0); return; }
     if (cmd == 26) { CfgSwitchMode(1); return; }
+    if (cmd >= 30 && cmd <= 33) {   /* 自动清理缓存：关/7/30/90 天，退出时随配置保存 */
+        wchar_t t[64], d[32];
+        static const int vals[] = { 0, 7, 30, 90 };
+        g_cacheDays = vals[cmd - 30];
+        if (g_cacheDays > 0) swprintf(d, 32, tr(TR_CC_DAYS_FMT), g_cacheDays);
+        else wcscpy_s(d, 32, tr(TR_CC_OFF));
+        swprintf(t, 64, tr(TR_CC_SET_FMT), d);
+        SetStatusTemp(t);
+        return;
+    }
     if (cmd == 4) {
         g_darkMode = !g_darkMode;
         ApplyTheme();
@@ -7882,30 +8437,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(gp);
                 textLeft = rc.left + 56;
             } else if (!isCache && p->loadFailed) {
-                /* 加载失败占位：黄色警示三角（暗色下用亮黄）。背景整行已填充，直接画图标 */
-                COLORREF warn = g_darkMode ? RGB(255,200,60) : RGB(200,140,0);
-                HBRUSH wb = CreateSolidBrush(warn);
-                HPEN wp = CreatePen(PS_SOLID, 2, warn);
-                HGDIOBJ oldPen, oldBrush;
-                POINT tri[3] = {
-                    {rc.left + 26, rc.top + 8},
-                    {rc.left + 44, rc.top + 44},
-                    {rc.left + 8,  rc.top + 44} };
-                oldPen = SelectObject(di->hDC, wp);
-                oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
-                Polygon(di->hDC, tri, 3);
-                SelectObject(di->hDC, wb);
-                /* 感叹号：竖线 + 点 */
-                {
-                    RECT bar = { rc.left+24, rc.top+18, rc.left+28, rc.top+34 };
-                    RECT dot = { rc.left+24, rc.top+37, rc.left+28, rc.top+41 };
-                    FillRect(di->hDC, &bar, wb);
-                    FillRect(di->hDC, &dot, wb);
-                }
-                SelectObject(di->hDC, oldPen);
-                SelectObject(di->hDC, oldBrush);
-                DeleteObject(wb);
-                DeleteObject(wp);
+                /* 加载失败占位：灰色底 + 红色叉叉（与"已加载"占位统一视觉，仅颜色区分失败） */
+                RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
+                HPEN rp = CreatePen(PS_SOLID, 5, RGB(220, 60, 60));
+                HGDIOBJ oldp = SelectObject(di->hDC, rp);
+                FillRectColor(di->hDC, &xb, g_darkMode ? RGB(50,56,66) : RGB(240,240,240));
+                DrawEdge(di->hDC, &xb, EDGE_RAISED, BF_RECT);
+                MoveToEx(di->hDC, xb.left + 8, xb.top + 8, NULL);
+                LineTo(di->hDC, xb.right - 8, xb.bottom - 8);
+                MoveToEx(di->hDC, xb.right - 8, xb.top + 8, NULL);
+                LineTo(di->hDC, xb.left + 8, xb.bottom - 8);
+                SelectObject(di->hDC, oldp);
+                DeleteObject(rp);
                 textLeft = rc.left + 56;
             } else if (g_podMode == 1) {
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
@@ -8924,36 +9467,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     LoadConfig();
     if (g_skipStartup) return 0;   /* 首启弹窗被关闭：不建窗直接退出 */
     EnsureCacheDir();   /* 配置里可能有自定义缓存目录，先确保存在 */
-
-    /* 清理 30 天前的旧缓存（仅默认 %TEMP% 目录；自定义目录由用户自己管理） */
-    if (!g_cacheDir[0]) {
-        wchar_t cdir[MAX_PATH], pat[MAX_PATH];
-        WIN32_FIND_DATAW fd;
-        HANDLE h;
-        FILETIME ftNow;
-        ULARGE_INTEGER ullNow, ullFile;
-        CacheDir(cdir, MAX_PATH);
-        swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
-        h = FindFirstFileW(pat, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            GetSystemTimeAsFileTime(&ftNow);
-            ullNow.LowPart = ftNow.dwLowDateTime;
-            ullNow.HighPart = ftNow.dwHighDateTime;
-            /* 30 天 = 30*24*3600*10^7 个 100ns 间隔 */
-            ullNow.QuadPart -= 30ULL * 24 * 3600 * 10000000ULL;
-            do {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
-                ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
-                if (ullFile.QuadPart < ullNow.QuadPart) {
-                    wchar_t fp[MAX_PATH];
-                    swprintf(fp, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
-                    DeleteFileW(fp);
-                }
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    }
+    CacheAutoClean();   /* 按 cachedays 设置清理旧缓存 */
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);

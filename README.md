@@ -2,27 +2,27 @@
 
 [English](README_EN.md) | 简体中文
 
-**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 255 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 260 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![size](https://img.shields.io/badge/size-255%20KB-brightgreen?style=for-the-badge)
-![deps](https://img.shields.io/badge/deps-none-success?style=for-the-badge)
-![registry](https://img.shields.io/badge/registry-untouched-lightgrey?style=for-the-badge)
-![platform](https://img.shields.io/badge/platform-win%207--11%2032%2F64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
-![license](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+![version](https://img.shields.io/badge/Version-1.3-blue)
+![size](https://img.shields.io/badge/Size-260%20KB-brightgreen)
+![deps](https://img.shields.io/badge/Deps-none-success)
+![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
+![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
+![license](https://img.shields.io/badge/License-MIT-green)
 
-![language](https://img.shields.io/badge/language-pure%20C-00599C?style=for-the-badge&logo=c&logoColor=white)
-![ui](https://img.shields.io/badge/ui-native%20win32-0078D6?style=for-the-badge)
-![audio](https://img.shields.io/badge/audio-media%20foundation-7B2FBE?style=for-the-badge)
-![http](https://img.shields.io/badge/http-winhttp-0F7B6C?style=for-the-badge)
-![compiler](https://img.shields.io/badge/compiler-gcc%2015.2-FA7343?style=for-the-badge)
+![language](https://img.shields.io/badge/Language-pure%20C-00599C)
+![ui](https://img.shields.io/badge/UI-native%20Win32-0078D6)
+![audio](https://img.shields.io/badge/Audio-Media%20Foundation-7B2FBE)
+![http](https://img.shields.io/badge/HTTP-WinHTTP-0F7B6C)
+![compiler](https://img.shields.io/badge/Compiler-GCC%2015.2-FA7343)
 
-![feed](https://img.shields.io/badge/feed-rss%20subscribe-E34F26?style=for-the-badge)
-![play](https://img.shields.io/badge/play-offline%20cache-009688?style=for-the-badge)
-![resume](https://img.shields.io/badge/playback-resume-blueviolet?style=for-the-badge)
-![cache](https://img.shields.io/badge/cache-batch%20download-purple?style=for-the-badge)
-![remote](https://img.shields.io/badge/control-phone%20web-red?style=for-the-badge)
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
+![feed](https://img.shields.io/badge/Feed-RSS%20subscribe-E34F26)
+![search](https://img.shields.io/badge/Search-iTunes-orange)
+![cache](https://img.shields.io/badge/Cache-batch%20download-009688)
+![clean](https://img.shields.io/badge/Cache-auto%20clean-4B0082)
+![resume](https://img.shields.io/badge/Playback-resume-blueviolet)
+![remote](https://img.shields.io/badge/Control-phone%20web-red)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 
 [![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)
@@ -44,6 +44,7 @@
 - 每播客"上次听到"标记：每个订阅记住最近一集（列表橙色高亮），双击它直接从上次的位置接着听
 - **双击播客快速续播**：双击左侧播客，直接播放该播客的橙色剧集并从记录位置续播；没有橙色记录则自动从第 1 集开始
 - 订阅导入 / 导出：导出 OPML 订阅列表（与其它播客应用互通）；导入 / 导出完整配置（.ini），备份、换机一键恢复
+- **播客搜索**：在「添加订阅」框里输入关键词（不带 `://` 的普通文字），回车或点「确定」按钮即从 iTunes 查找，结果列表里单击即把 RSS 地址填回输入框（再按一次回车直接添加），双击也可一键添加
 - 播放控制：上一曲 / 播放暂停 / 下一曲 / 停止 / 静音 / 音量
 - 播放模式：顺序播放 / 随机播放 / 单曲循环 / 一次性播放（播完本集即停）
 - 倍速播放：0.5x–3.0x（0.75 / 1 / 1.25 / 1.5 / 2 快捷档）
@@ -55,7 +56,7 @@
 - 亮色 / 暗色主题（运行时即时切换）
 - 中英文双语界面（首次运行选择语言，设置菜单随时切换，自动记忆）
 - 定时关机（预设 15–120 分钟或自定义 1–600 分钟，标题栏显示倒计时；到点强制关机，系统提供 15 秒取消窗口）
-- 启动时自动清理 30 天前的旧缓存（仅默认 %TEMP% 目录，自定义目录不清理）
+- 启动时自动清理旧缓存：默认 30 天，设置菜单可改 关 / 7 / 30 / 90 天（只删程序自己生成的音频文件，自定义目录同样安全）
 - 三档字号调节（Ctrl + 鼠标滚轮）
 - 可自定义缓存目录（支持打开 / 更改 / 移动已有缓存）
 - **配置存储双模式**：可内嵌到 exe（单文件便携，复制即带走）或外挂为同目录 `feeds.ini`（便于升级 / 备份 / 手动编辑）；首次运行弹窗选择，设置菜单随时切换（详见「配置存储」）
@@ -118,6 +119,7 @@ lang=zh               ; 界面语言 zh/en
 winw=480              ; 窗口尺寸（客户区）
 winh=360
 cachedir=             ; 缓存目录（留空 = 默认 %TEMP%\LiteTune）
+cachedays=30          ; 缓存自动清理天数（0=关；默认 30，非默认才写入）
 resume=1234           ; 上次退出时的播放位置（秒，自动续播用）
 resumeplay=1          ; 退出时是否在播放（0=暂停，重开后定位到位但保持暂停）
 resumeurl=...         ; 上次退出时正在播的剧集 URL
