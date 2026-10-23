@@ -447,7 +447,7 @@ static const wchar_t *tr(int id)
         L"已取消批量下载", L"正在停止批量下载…",
         L"正在加载订阅 %d/%d ...",
         L"加载失败的订阅",
-        L"无法获取或解析，点「-」按钮可删除；刷新可重试",
+        L"无法获取或解析，按 × 按钮可删除；刷新可重试",
         L"导入...", L"导出", L"OPML 订阅列表", L"配置文件 (feeds.ini)",
         L"导入", L"导出 OPML", L"导出配置",
         L"已导出", L"无法写入文件",
@@ -545,7 +545,7 @@ static const wchar_t *tr(int id)
         L"Batch cache cancelled", L"Stopping batch cache…",
         L"Loading feeds %d/%d ...",
         L"Failed to load feed",
-        L"Cannot fetch or parse. Press \"-\" to remove, Refresh to retry",
+        L"Cannot fetch or parse. Click \u00d7 to remove, Refresh to retry",
         L"Import...", L"Export", L"OPML feed list", L"Configuration (feeds.ini)",
         L"Import", L"Export OPML", L"Export Configuration",
         L"Exported", L"Cannot write the file",
@@ -1587,8 +1587,8 @@ static int DrawHeaderItem(DRAWITEMSTRUCT *di)
     if (htext[0])
         DrawTextW(di->hDC, htext, -1, &tr,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    /* 当前排序列右侧画升降序小三角 */
-    if ((int)di->itemID == g_sortCol) {
+    /* 当前排序列右侧画升降序小三角（仅剧集列表有排序状态） */
+    if ((int)di->itemID == g_sortCol && GetParent(di->hwndItem) == g_listEp) {
         int cx = rc.right - 9, cy = rc.top + (rc.bottom - rc.top) / 2;
         HBRUSH ab = CreateSolidBrush(RGB(210, 210, 214));
         HGDIOBJ ob = SelectObject(di->hDC, ab);
@@ -5697,6 +5697,8 @@ static void MovePodcastTo(int i, int j)
 
 static HWND g_ibSb;
 static HWND g_ibSbH;
+static HWND g_ibList = NULL;   /* 搜索结果 ListView，供 PanelProc 识别（同 g_listEp 一套处理） */
+static HWND g_ibTip  = NULL;   /* 搜索结果悬停提示 */
 static int  g_ibBorderDeltaX;   /* 窗口外宽 - 客户区宽 */
 static int  g_ibBorderDeltaY;   /* 窗口外高 - 客户区高 */
 static WNDPROC g_ibOrigHdrProc = NULL;
@@ -6002,17 +6004,21 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
                 btnStyle | BS_PUSHBUTTON,
                 332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
-            /* ListView：两列标题+作者；保留原生滚动条，由自绘 DSB 覆盖 */
+            /* ListView：两列标题+作者；初始隐藏，仅在真正搜索后显示；
+             * 原生滚动条由 PanelProc 的 WM_NCCALCSIZE 并回客户区，
+             * 自绘 DSB 覆盖（与主界面 g_listEp 同一套） */
             {
                 HWND lv, hdr;
                 lv = CreateWindowExW(0, WC_LISTVIEWW, NULL,
-                    WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                    WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS,
                     12, 104, 408 - DSB_W - 2, 204, h,
                     (HMENU)(INT_PTR)ID_IB_LIST, NULL, NULL);
+                g_ibList = lv;
                 {
                     LVCOLUMNW col;
                     ZeroMemory(&col, sizeof(col));
-                    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+                    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT;
+                    col.fmt = LVCFMT_LEFT | (g_darkMode ? HDF_OWNERDRAW : 0);
                     col.cx = 260; col.iSubItem = 0;
                     col.pszText = (wchar_t *)tr(TR_COL_TITLE);
                     SendMessageW(lv, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
@@ -6028,18 +6034,54 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 /* 给 ListView 挂 PanelProc：WM_NCCALCSIZE 抑制原生滚动条，
                  * WM_VSCROLL/WM_MOUSEWHEEL 同步 DSB。主界面 g_listEp 同一套。 */
                 SubclassForFontWheel(lv);
-                /* 表头子类化（暗色 gap 填充 + 文字颜色） */
+                /* 表头：暗色下用 HDF_OWNERDRAW + WM_DRAWITEM（DrawHeaderItem）；
+                 * IbHeaderProc 仅负责最后一列右侧空白区的暗色填充。
+                 * 用 HDM_SETITEMW 显式打 HDF_OWNERDRAW（与主列表 ApplyHeaderTheme 同口径，
+                 * 经 LVCFMT 透传在部分 comctl32 版本上不可靠） */
                 hdr = (HWND)SendMessageW(lv, LVM_GETHEADER, 0, 0);
-                if (hdr && !g_ibOrigHdrProc)
-                    g_ibOrigHdrProc = (WNDPROC)SetWindowLongPtrW(hdr, GWLP_WNDPROC, (LONG_PTR)IbHeaderProc);
-                /* 自绘纵向滚动条，贴 ListView 右边 */
+                if (hdr) {
+                    int ci;
+                    for (ci = 0; ci < 2; ci++) {
+                        HDITEMW hi;
+                        ZeroMemory(&hi, sizeof(hi));
+                        hi.mask = HDI_FORMAT;
+                        if (SendMessageW(hdr, HDM_GETITEMW, ci, (LPARAM)&hi)) {
+                            if (g_darkMode) hi.fmt |= HDF_OWNERDRAW;
+                            else            hi.fmt &= ~HDF_OWNERDRAW;
+                            SendMessageW(hdr, HDM_SETITEMW, ci, (LPARAM)&hi);
+                        }
+                    }
+                    if (!g_ibOrigHdrProc)
+                        g_ibOrigHdrProc = (WNDPROC)SetWindowLongPtrW(hdr, GWLP_WNDPROC, (LONG_PTR)IbHeaderProc);
+                }
+                /* 自绘纵向滚动条，贴 ListView 右边；初始隐藏，搜索后由 SyncScrollBar 决定显隐 */
                 g_ibSb = CreateDarkScrollBar(h, lv, 1, 0, ID_IB_SB);
-                if (g_ibSb) MoveWindow(g_ibSb, 12 + 408 - DSB_W - 2, 104 + 2, DSB_W, 204 - 4, TRUE);
+                if (g_ibSb) {
+                    MoveWindow(g_ibSb, 12 + 408 - DSB_W - 2, 104 + 2, DSB_W, 204 - 4, TRUE);
+                    ShowWindow(g_ibSb, SW_HIDE);
+                }
                 /* 自绘水平滚动条，初始隐藏，搜索后 ShowWindow */
                 g_ibSbH = CreateDarkScrollBar(h, lv, 1, 1, ID_IB_SBH);
                 if (g_ibSbH) {
                     MoveWindow(g_ibSbH, 12 + 2, 104 + 204 - 12 - DSB_W, 408 - DSB_W - 4, DSB_W, TRUE);
                     ShowWindow(g_ibSbH, SW_HIDE);
+                }
+                /* 悬停提示：显示标题/作者/订阅地址 */
+                {
+                    TOOLINFOW ti;
+                    g_ibTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
+                        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                        0, 0, 0, 0, h, NULL, GetModuleHandleW(NULL), NULL);
+                    if (g_ibTip) {
+                        SendMessageW(g_ibTip, TTM_SETMAXTIPWIDTH, 0, 400);
+                        ZeroMemory(&ti, sizeof(ti));
+                        ti.cbSize = sizeof(ti);
+                        ti.uFlags = TTF_TRACK;
+                        ti.hwnd = lv;
+                        ti.uId = (UINT_PTR)lv;
+                        ti.lpszText = L"";
+                        SendMessageW(g_ibTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+                    }
                 }
             }
             /* 创建顺序：按钮先→ListView后。把按钮 Z-order 提到 ListView 前面，
@@ -6108,11 +6150,13 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 HWND lb = GetDlgItem(h, ID_IB_LIST);
                 SendMessageW(lb, LVM_DELETEALLITEMS, 0, 0);
                 ShowWindow(lb, SW_SHOW);
-                if (g_ibSb) ShowWindow(g_ibSb, SW_SHOW);
-                if (g_ibSbH) ShowWindow(g_ibSbH, SW_SHOW);
                 { RECT rc; GetWindowRect(h, &rc);
                   MoveWindow(h, rc.left, rc.top,
                              432 + g_ibBorderDeltaX, 356 + g_ibBorderDeltaY, TRUE); }
+                /* 结果回来前列表为空，先让 SyncScrollBar 隐藏空轨道；
+                 * WM_APP_SEARCH_DONE 里会根据实际条目数再决定显隐 */
+                if (g_ibSb) SyncScrollBar(g_ibSb);
+                if (g_ibSbH) SyncScrollBar(g_ibSbH);
                 {
                     SearchParam *sp = (SearchParam *)malloc(sizeof(SearchParam));
                     if (sp) {
@@ -6188,6 +6232,14 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         FreeSearchResult(res);
         return 0;
     }
+    case WM_DRAWITEM: {
+        /* 兜底：若表头的 WM_DRAWITEM 被 ListView 转发到对话框，也走自绘深色表头 */
+        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
+        if (g_darkMode && di->CtlType == ODT_HEADER &&
+            GetParent(di->hwndItem) == GetDlgItem(h, ID_IB_LIST))
+            return DrawHeaderItem(di) ? TRUE : FALSE;
+        break;
+    }
     case WM_NOTIFY: {
         NMHDR *nm = (NMHDR *)lp;
         if (nm->idFrom == ID_IB_LIST) {
@@ -6245,6 +6297,8 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         g_ibSb = NULL;
         g_ibSbH = NULL;
+        g_ibList = NULL;
+        g_ibTip = NULL;
         g_ibOrigHdrProc = NULL;   /* 表头随窗口销毁，原 proc 指针失效 */
         return 0;
     }
@@ -6452,7 +6506,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
     /* 暗色表头：ODT_HEADER 的 WM_DRAWITEM 发给表头的父窗口 ListView */
-    if (g_darkMode && msg == WM_DRAWITEM && hwnd == g_listEp) {
+    if (g_darkMode && msg == WM_DRAWITEM &&
+        (hwnd == g_listEp || hwnd == g_ibList)) {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lp;
         if (di->CtlType == ODT_HEADER)
             return DrawHeaderItem(di) ? TRUE : FALSE;
@@ -6590,6 +6645,63 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageW(g_hwndEpTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
         }
     }
+    /* 搜索结果列表：悬停显示标题 / 作者 / 订阅地址 */
+    if (hwnd == g_ibList && g_ibTip) {
+        if (msg == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_HOVER | TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            tme.dwHoverTime = HOVER_DEFAULT;
+            TrackMouseEvent(&tme);
+        } else if (msg == WM_MOUSEHOVER) {
+            LVHITTESTINFO ht;
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ht.pt = pt;
+            int idx = (int)SendMessageW(hwnd, LVM_HITTEST, 0, (LPARAM)&ht);
+            if (idx >= 0) {
+                wchar_t title[512] = L"", author[512] = L"";
+                wchar_t *url = NULL;
+                wchar_t tip[2048];
+                LVITEMW li;
+                TOOLINFOW ti;
+                POINT scr = pt;
+                ZeroMemory(&li, sizeof(li));
+                li.mask = LVIF_TEXT | LVIF_PARAM;
+                li.iItem = idx;
+                li.iSubItem = 0;
+                li.pszText = title;
+                li.cchTextMax = 512;
+                SendMessageW(hwnd, LVM_GETITEMW, 0, (LPARAM)&li);
+                url = (wchar_t *)li.lParam;
+                li.mask = LVIF_TEXT;
+                li.iSubItem = 1;
+                li.pszText = author;
+                li.cchTextMax = 512;
+                SendMessageW(hwnd, LVM_GETITEMW, 0, (LPARAM)&li);
+                swprintf(tip, 2048, L"%ls\r\n%ls\r\n%ls",
+                         title, author, url ? url : L"");
+                ClientToScreen(hwnd, &scr);
+                ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                ti.hwnd = hwnd;
+                ti.uId = (UINT_PTR)hwnd;
+                ti.lpszText = tip;
+                SendMessageW(g_ibTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+                SendMessageW(g_ibTip, TTM_TRACKPOSITION, 0,
+                    MAKELPARAM(scr.x + 12, scr.y + 18));
+                SendMessageW(g_ibTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+            }
+            return 0;
+        } else if (msg == WM_MOUSELEAVE) {
+            TOOLINFOW ti;
+            ZeroMemory(&ti, sizeof(ti));
+            ti.cbSize = sizeof(ti);
+            ti.hwnd = hwnd;
+            ti.uId = (UINT_PTR)hwnd;
+            SendMessageW(g_ibTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+        }
+    }
     if (msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)) {
         ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1));
         return 0;
@@ -6614,8 +6726,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     /* ListView 会自动显示自带滚动条：在 WM_NCCALCSIZE 里把条带并回
-     * 客户区（永不显示白条，内容宽度也不抖动） */
-    if (msg == WM_NCCALCSIZE && wp && hwnd == g_listEp) {
+     * 客户区（永不显示白条，内容宽度也不抖动）。剧集列表与搜索结果列表通用 */
+    if (msg == WM_NCCALCSIZE && wp &&
+        (hwnd == g_listEp || hwnd == g_ibList)) {
         WNDPROC oldp = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         LRESULT lr = CallWindowProcW(oldp, hwnd, msg, wp, lp);
         SCROLLBARINFO sb;
@@ -6637,6 +6750,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
         if (hwnd == g_listPod)       SyncScrollBar(g_vsPod);
         else if (hwnd == g_listEp) { SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp); }
+        else if (hwnd == g_ibList) { if (g_ibSb) SyncScrollBar(g_ibSb);
+                                     if (g_ibSbH) SyncScrollBar(g_ibSbH); }
         else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
         return lr;
     }
@@ -8437,18 +8552,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(gp);
                 textLeft = rc.left + 56;
             } else if (!isCache && p->loadFailed) {
-                /* 加载失败占位：灰色底 + 红色叉叉（与"已加载"占位统一视觉，仅颜色区分失败） */
+                /* 加载失败占位：灰色圆角底 + 琥珀色警告三角（与"已缓存"占位统一造型） */
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
-                HPEN rp = CreatePen(PS_SOLID, 5, RGB(220, 60, 60));
-                HGDIOBJ oldp = SelectObject(di->hDC, rp);
+                HPEN gp = CreatePen(PS_SOLID, 2, g_darkMode ? RGB(200,160,60) : RGB(210,160,40));
+                HBRUSH ab = CreateSolidBrush(g_darkMode ? RGB(220,170,70) : RGB(230,175,50));
+                HGDIOBJ oldPen, oldBrush;
                 FillRectColor(di->hDC, &xb, g_darkMode ? RGB(50,56,66) : RGB(240,240,240));
-                DrawEdge(di->hDC, &xb, EDGE_RAISED, BF_RECT);
-                MoveToEx(di->hDC, xb.left + 8, xb.top + 8, NULL);
-                LineTo(di->hDC, xb.right - 8, xb.bottom - 8);
-                MoveToEx(di->hDC, xb.right - 8, xb.top + 8, NULL);
-                LineTo(di->hDC, xb.left + 8, xb.bottom - 8);
-                SelectObject(di->hDC, oldp);
-                DeleteObject(rp);
+                oldPen = SelectObject(di->hDC, gp);
+                oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                RoundRect(di->hDC, xb.left+3, xb.top+3, xb.right-3, xb.bottom-3, 8, 8);
+                /* 警告三角 */
+                SelectObject(di->hDC, ab);
+                {
+                    POINT tri[3] = {
+                        {rc.left+16, rc.top+36}, {rc.left+34, rc.top+36},
+                        {rc.left+25, rc.top+14} };
+                    Polygon(di->hDC, tri, 3);
+                }
+                /* 感叹号 */
+                SelectObject(di->hDC, GetStockObject(NULL_PEN));
+                {
+                    RECT tb = { rc.left+23, rc.top+19, rc.left+27, rc.top+28 };
+                    Rectangle(di->hDC, tb.left, tb.top, tb.right, tb.bottom);
+                }
+                {
+                    RECT td = { rc.left+23, rc.top+30, rc.left+27, rc.top+33 };
+                    Rectangle(di->hDC, td.left, td.top, td.right, td.bottom);
+                }
+                SelectObject(di->hDC, oldPen);
+                SelectObject(di->hDC, oldBrush);
+                DeleteObject(ab);
+                DeleteObject(gp);
                 textLeft = rc.left + 56;
             } else if (g_podMode == 1) {
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
@@ -8496,7 +8630,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     tp = tr(TR_FEED_FAIL_TITLE);
                 } else tp = p->title;
                 SetTextColor(di->hDC,
-                    p->loadFailed ? ThDim() : (isPlaying ? ThGreen() : ThText()));
+                    p->loadFailed ? RGB(230,175,50) : (isPlaying ? ThGreen() : ThText()));
                 SelectObject(di->hDC, g_fontBold);
                 DrawTextW(di->hDC, tp, -1, &rct,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
