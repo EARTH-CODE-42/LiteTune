@@ -1839,7 +1839,7 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
         DWORD status = 0, sz = sizeof(status);
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             NULL, &status, &sz, NULL);
-        if (status != 200) goto fail;
+        if (status < 200 || status >= 300) goto fail;
         sz = sizeof(contentLen);
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
             NULL, &contentLen, &sz, NULL);
@@ -5628,6 +5628,93 @@ static void RemovePodcast(int i)
     InvalidateRect(g_listPod, NULL, TRUE);
 }
 
+/* 刷新单条播客：保留订阅链接，删掉旧条目后用单条加载线程重拉 */
+static void RefreshSinglePodcast(int i)
+{
+    char *url;
+    if (i < 0 || i >= g_podCount || !g_pods[i].feedUrl) return;
+    url = _strdup(g_pods[i].feedUrl);
+    if (!url) return;
+    RemovePodcast(i);
+    AddFeedUrl(url);           /* RemovePodcast 已从 g_feedUrls 移除，补回 */
+    /* 清掉 RSS 缓存，强制联网取最新 */
+    {
+        wchar_t cp[MAX_PATH];
+        UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
+        DeleteFileW(cp);
+    }
+    AddSingleFeed(url);
+    free(url);
+}
+
+/* 删除某播客全部已缓存的音频文件 */
+static void DeletePodcastCache(int i)
+{
+    int j;
+    if (i < 0 || i >= g_podCount) return;
+    for (j = 0; j < g_pods[i].epCount; j++) {
+        Episode *e = &g_pods[i].eps[j];
+        if (e && e->url) {
+            wchar_t path[MAX_PATH];
+            CachePathFor(e->url, path, MAX_PATH);
+            DeleteFileW(path);
+        }
+    }
+    RefreshCachedEntry();
+    InvalidateRect(g_listEp, NULL, TRUE);
+}
+
+/* 删除单集缓存文件 */
+static void DeleteEpisodeCache(int pod, int ep)
+{
+    Episode *e;
+    if (pod < 0 || ep < 0) return;
+    if (pod == g_podCount) {
+        if (ep >= g_cachePod.epCount) return;
+        e = &g_cachePod.eps[ep];
+    } else {
+        if (pod >= g_podCount || ep >= g_pods[pod].epCount) return;
+        e = &g_pods[pod].eps[ep];
+    }
+    if (e && e->url) {
+        wchar_t path[MAX_PATH];
+        CachePathFor(e->url, path, MAX_PATH);
+        DeleteFileW(path);
+    }
+    RefreshCachedEntry();
+    InvalidateRect(g_listEp, NULL, TRUE);
+}
+
+/* 用资源管理器打开缓存目录 */
+static void OpenCacheFolder(void)
+{
+    wchar_t dir[MAX_PATH];
+    CacheDir(dir, MAX_PATH);
+    EnsureCacheDir();
+    ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* 下载单集到缓存（复用批量下载队列，避免与播放下载互斥逻辑重复造轮子） */
+static void DownloadSingleEpisode(int pod, int ep)
+{
+    Episode *e;
+    LVITEMW lvi;
+    if (pod < 0 || pod >= g_podCount || ep < 0 || ep >= g_pods[pod].epCount) return;
+    e = &g_pods[pod].eps[ep];
+    if (!e->url) return;
+    if (EpisodeIsCached(e)) return;
+    /* 临时切到该播客并选中这一集，复用 StartBatchCache */
+    SendMessageW(g_listPod, LB_SETCURSEL, pod, 0);
+    SelectPodcast(pod);
+    ZeroMemory(&lvi, sizeof(lvi));
+    lvi.stateMask = LVIS_SELECTED;
+    lvi.state = 0;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
+    lvi.state = LVIS_SELECTED;
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
+    StartBatchCache();
+}
+
 /* 把播客从位置 i 搬到位置 j（任意距离）。
  * feedUrls 一并重排：按 pods 顺序重建，没挂到任何播客的 URL
  * （加载失败的订阅）保持相对顺序追加在末尾——比旧的相邻交换
@@ -8525,26 +8612,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
              * 删除模式 → 大红叉按钮
              * "已缓存"虚拟行画一个下载缓存图标 */
             if (isCache) {
+                /* "已缓存"虚拟行：柔和底色 + 下载箭头图标 */
                 RECT ib = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
-                HPEN gp = CreatePen(PS_SOLID, 2, g_darkMode ? RGB(130,150,180) : RGB(120,140,170));
-                HBRUSH ab = CreateSolidBrush(g_darkMode ? RGB(130,150,180) : RGB(120,140,170));
+                COLORREF bg = g_darkMode ? RGB(48,54,64) : RGB(236,241,248);
+                COLORREF fg = g_darkMode ? RGB(120,170,230) : RGB(70,120,200);
+                HPEN gp = CreatePen(PS_SOLID, 1, fg);
+                HBRUSH ab = CreateSolidBrush(fg);
                 HGDIOBJ oldPen, oldBrush;
-                FillRectColor(di->hDC, &ib, g_darkMode ? RGB(50,56,66) : RGB(238,242,248));
+                FillRectColor(di->hDC, &ib, bg);
                 oldPen = SelectObject(di->hDC, gp);
                 oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
-                RoundRect(di->hDC, ib.left+3, ib.top+3, ib.right-3, ib.bottom-3, 8, 8);
+                RoundRect(di->hDC, ib.left+2, ib.top+2, ib.right-2, ib.bottom-2, 10, 10);
                 /* 向下箭头（表示缓存到本地） */
                 SelectObject(di->hDC, ab);
-                {
-                    POINT tri[3] = {
-                        {rc.left+17, rc.top+22}, {rc.left+33, rc.top+22},
-                        {rc.left+25, rc.top+33} };
-                    Polygon(di->hDC, tri, 3);
-                }
                 SelectObject(di->hDC, GetStockObject(NULL_PEN));
                 {
-                    RECT tb = { rc.left+22, rc.top+12, rc.left+29, rc.top+24 };
+                    POINT tri[3] = {
+                        {rc.left+18, rc.top+24}, {rc.left+34, rc.top+24},
+                        {rc.left+26, rc.top+36} };
+                    Polygon(di->hDC, tri, 3);
+                }
+                /* 箭头上方的竖线（下载中） */
+                {
+                    RECT tb = { rc.left+24, rc.top+14, rc.left+28, rc.top+25 };
                     Rectangle(di->hDC, tb.left, tb.top, tb.right, tb.bottom);
+                }
+                /* 底部托盘横线 */
+                {
+                    RECT bt = { rc.left+16, rc.top+38, rc.left+36, rc.top+41 };
+                    Rectangle(di->hDC, bt.left, bt.top, bt.right, bt.bottom);
                 }
                 SelectObject(di->hDC, oldPen);
                 SelectObject(di->hDC, oldBrush);
@@ -8552,37 +8648,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DeleteObject(gp);
                 textLeft = rc.left + 56;
             } else if (!isCache && p->loadFailed) {
-                /* 加载失败占位：灰色圆角底 + 琥珀色警告三角（与"已缓存"占位统一造型） */
-                RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
-                HPEN gp = CreatePen(PS_SOLID, 2, g_darkMode ? RGB(200,160,60) : RGB(210,160,40));
-                HBRUSH ab = CreateSolidBrush(g_darkMode ? RGB(220,170,70) : RGB(230,175,50));
+                /* 加载失败占位：琥珀色警告三角（无灰色底框，直接画在面板上） */
+                COLORREF warn = g_darkMode ? RGB(255,200,60) : RGB(200,140,0);
+                HPEN wp = CreatePen(PS_SOLID, 2, warn);
+                HBRUSH wb = CreateSolidBrush(warn);
                 HGDIOBJ oldPen, oldBrush;
-                FillRectColor(di->hDC, &xb, g_darkMode ? RGB(50,56,66) : RGB(240,240,240));
-                oldPen = SelectObject(di->hDC, gp);
+                oldPen = SelectObject(di->hDC, wp);
                 oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
-                RoundRect(di->hDC, xb.left+3, xb.top+3, xb.right-3, xb.bottom-3, 8, 8);
-                /* 警告三角 */
-                SelectObject(di->hDC, ab);
                 {
                     POINT tri[3] = {
-                        {rc.left+16, rc.top+36}, {rc.left+34, rc.top+36},
-                        {rc.left+25, rc.top+14} };
+                        {rc.left+26, rc.top+8},
+                        {rc.left+44, rc.top+44},
+                        {rc.left+8,  rc.top+44} };
                     Polygon(di->hDC, tri, 3);
                 }
-                /* 感叹号 */
+                /* 感叹号：竖条 + 圆点 */
+                SelectObject(di->hDC, wb);
                 SelectObject(di->hDC, GetStockObject(NULL_PEN));
                 {
-                    RECT tb = { rc.left+23, rc.top+19, rc.left+27, rc.top+28 };
+                    RECT tb = { rc.left+24, rc.top+20, rc.left+28, rc.top+33 };
                     Rectangle(di->hDC, tb.left, tb.top, tb.right, tb.bottom);
                 }
                 {
-                    RECT td = { rc.left+23, rc.top+30, rc.left+27, rc.top+33 };
-                    Rectangle(di->hDC, td.left, td.top, td.right, td.bottom);
+                    RECT td = { rc.left+23, rc.top+36, rc.left+29, rc.top+42 };
+                    Ellipse(di->hDC, td.left, td.top, td.right, td.bottom);
                 }
                 SelectObject(di->hDC, oldPen);
                 SelectObject(di->hDC, oldBrush);
-                DeleteObject(ab);
-                DeleteObject(gp);
+                DeleteObject(wb);
+                DeleteObject(wp);
                 textLeft = rc.left + 56;
             } else if (g_podMode == 1) {
                 RECT xb = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
@@ -8867,6 +8961,117 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         break;
+    }
+
+    case WM_CONTEXTMENU: {
+        HWND src = (HWND)wParam;
+        POINT pt;
+        pt.x = GET_X_LPARAM(lParam);
+        pt.y = GET_Y_LPARAM(lParam);
+
+        if (src == g_listPod) {
+            /* 播客列表右键 */
+            POINT cl = pt;
+            int item;
+            DWORD v;
+            ScreenToClient(g_listPod, &cl);
+            v = (DWORD)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0,
+                                    MAKELPARAM(cl.x, cl.y));
+            if (HIWORD(v)) break;            /* 点在空白处 */
+            item = (int)LOWORD(v);
+            if (item < 0 || item > g_podCount) break;
+            {
+                HMENU m = CreatePopupMenu();
+                int cmd;
+                if (item < g_podCount) {
+                    /* 真实播客条目 */
+                    AppendMenuW(m, MF_STRING, 1, L"刷新该播客");
+                    AppendMenuW(m, MF_STRING, 2, L"删除播客条目");
+                    AppendMenuW(m, MF_STRING, 3, L"删除该播客已缓存的文件");
+                } else {
+                    /* “已缓存”虚拟行 */
+                    AppendMenuW(m, MF_STRING, 4, L"删除全部缓存");
+                    AppendMenuW(m, MF_STRING, 5, L"打开文件夹");
+                }
+                SetForegroundWindow(hwnd);
+                cmd = TrackPopupMenu(m,
+                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(m);
+                if (item < g_podCount) {
+                    if (cmd == 1) RefreshSinglePodcast(item);
+                    else if (cmd == 2) RemovePodcast(item);
+                    else if (cmd == 3) DeletePodcastCache(item);
+                } else {
+                    if (cmd == 4) {
+                        /* 删除缓存目录下所有 mp3 */
+                        wchar_t cdir[MAX_PATH], pat[MAX_PATH];
+                        WIN32_FIND_DATAW fd;
+                        HANDLE h;
+                        CacheDir(cdir, MAX_PATH);
+                        swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
+                        h = FindFirstFileW(pat, &fd);
+                        if (h != INVALID_HANDLE_VALUE) {
+                            do {
+                                wchar_t full[MAX_PATH];
+                                swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+                                DeleteFileW(full);
+                            } while (FindNextFileW(h, &fd));
+                            FindClose(h);
+                        }
+                        FreeCachePodcast();
+                        g_cacheRowHere = 0;
+                        SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
+                        for (int ri = 0; ri < g_podCount; ri++) {
+                            Podcast *rp = &g_pods[ri];
+                            SendMessageW(g_listPod, LB_ADDSTRING, 0,
+                                (LPARAM)(rp->loadFailed ? tr(TR_FEED_FAIL_TITLE)
+                                          : (rp->title ? rp->title : L"")));
+                        }
+                        RefreshCachedEntry();
+                        if (g_curPod >= 0) {
+                            SendMessageW(g_listPod, LB_SETCURSEL, g_curPod, 0);
+                            SelectPodcast(g_curPod);
+                        }
+                        SetStatus(tr(TR_READY));
+                    } else if (cmd == 5) {
+                        OpenCacheFolder();
+                    }
+                }
+            }
+        } else if (src == g_listEp) {
+            /* 剧集列表右键 */
+            LVHITTESTINFO hti;
+            int ep;
+            ZeroMemory(&hti, sizeof(hti));
+            hti.pt = pt;
+            ScreenToClient(g_listEp, &hti.pt);
+            ep = (int)SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hti);
+            if (ep < 0) break;
+            {
+                HMENU m = CreatePopupMenu();
+                int cmd, cached;
+                int pod = g_curPod;
+                Episode *e = NULL;
+                if (pod >= 0 && pod < g_podCount && ep < g_pods[pod].epCount)
+                    e = &g_pods[pod].eps[ep];
+                else if (pod == g_podCount && ep < g_cachePod.epCount)
+                    e = &g_cachePod.eps[ep];
+                cached = e ? (e->localFile || EpisodeIsCached(e)) : 0;
+                AppendMenuW(m, cached ? MF_GRAYED : MF_STRING, 1, L"下载");
+                AppendMenuW(m, cached ? MF_STRING : MF_GRAYED, 2, L"删除该缓存");
+                SetForegroundWindow(hwnd);
+                cmd = TrackPopupMenu(m,
+                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(m);
+                if (cmd == 1 && pod >= 0 && pod < g_podCount)
+                    DownloadSingleEpisode(pod, ep);
+                else if (cmd == 2)
+                    DeleteEpisodeCache(pod, ep);
+            }
+        }
+        return 0;
     }
 
     case WM_COMMAND:
