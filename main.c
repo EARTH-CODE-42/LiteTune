@@ -373,6 +373,9 @@ enum {
     TR_CFGMODE_CAP, TR_CFGMODE_BODY, TR_CFGMODE_DELINI_Q,
     TR_M_CFGMODE, TR_M_CFG_EMB, TR_M_CFG_EXT,
     TR_CFGMODE_EMB_DONE, TR_CFGMODE_EXT_DONE, TR_CFGMODE_FAIL,
+    TR_CTX_REFRESH, TR_CTX_DELETE_POD, TR_CTX_DEL_POD_CACHE,
+    TR_CTX_DEL_ALL_CACHE, TR_CTX_OPEN_FOLDER, TR_CTX_DOWNLOAD,
+    TR_CTX_DEL_EP_CACHE, TR_REFRESH_QUEUED,
     TR_N
 };
 
@@ -464,7 +467,10 @@ static const wchar_t *tr(int id)
         L"切换到内嵌会删除同目录的 feeds.ini。\r\n是否继续？",
         L"配置存储位置", L"内嵌到程序内", L"外挂 feeds.ini",
         L"配置已切换为内嵌", L"配置已切换为外挂 feeds.ini",
-        L"切换配置存储方式失败（exe 被占用或只读？）"
+        L"切换配置存储方式失败（exe 被占用或只读？）",
+        L"刷新播客", L"删除播客", L"删除缓存文件",
+        L"清空全部缓存", L"打开文件夹", L"下载", L"删除缓存",
+        L"已加入刷新队列，稍后自动开始"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -568,7 +574,10 @@ static const wchar_t *tr(int id)
         L"Config Storage", L"Embedded in program", L"External feeds.ini",
         L"Configuration is now embedded",
         L"Configuration is now external (feeds.ini)",
-        L"Failed to change config storage (exe in use or read-only?)"
+        L"Failed to change config storage (exe in use or read-only?)",
+        L"Refresh podcast", L"Delete podcast", L"Delete cached files",
+        L"Clear all cache", L"Open folder", L"Download", L"Delete cache",
+        L"Added to refresh queue"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -1782,6 +1791,29 @@ static wchar_t* U8ToW(const char *src)
 /* pReqSlot：调用方提供的槽位，函数把请求句柄放进去，外部线程可关闭它来中止下载；
  * 传 NULL 表示不可取消（RSS/封面图）。句柄归还用 Interlocked 交换，避免双重关闭。
  * pProgGen：进度消息 lParam 带上该代号，主线程据此丢弃过期任务的进度。 */
+/* 打开 WinHTTP 会话：优先使用当前用户的 IE/系统代理设置。
+ * WINHTTP_ACCESS_TYPE_DEFAULT_PROXY 只读机器级 WinHTTP 代理（通常是直连），
+ * 会让 Clash 等用户级代理软件的用户无法访问被墙的订阅源（SendRequest 超时） */
+static HINTERNET WinHttpOpenUser(void)
+{
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ie;
+    HINTERNET s = NULL;
+    ZeroMemory(&ie, sizeof(ie));
+    if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
+        if (ie.lpszProxy && ie.lpszProxy[0]) {
+            s = WinHttpOpen(L"LiteTune/1.2", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                ie.lpszProxy, ie.lpszProxyBypass, 0);
+        }
+        if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl);
+        if (ie.lpszProxy) GlobalFree(ie.lpszProxy);
+        if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass);
+    }
+    if (s) return s;
+    return WinHttpOpen(L"LiteTune/1.2",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+}
+
 static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
                        void * volatile *pReqSlot, volatile long *pProgGen)
 {
@@ -1798,9 +1830,7 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
     uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
     if (!WinHttpCrackUrl(url, 0, 0, &uc)) return NULL;
 
-    hSes = WinHttpOpen(L"LiteTune/1.2",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    hSes = WinHttpOpenUser();
     if (!hSes) return NULL;
     WinHttpSetTimeouts(hSes, 30000, 30000, 60000, 60000);
 
@@ -1821,14 +1851,6 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
     {
         DWORD flags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
         WinHttpSetOption(hReq, WINHTTP_OPTION_DECOMPRESSION, &flags, sizeof(flags));
-    }
-
-    /* 强制 TLS 1.2：部分现代 CDN（art19.com 等）拒绝 TLS 1.0/1.1。
-     * WINHTTP_OPTION_TLS_VERSION（=105）是 Win10+ SDK 引入的，MinGW 头里暂无定义 */
-    {
-        const DWORD WINHTTP_OPTION_TLS_VERSION = 105;
-        DWORD TLS1_2 = 0x0102;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_TLS_VERSION, &TLS1_2, sizeof(TLS1_2));
     }
 
     if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -3445,17 +3467,19 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
     return 0;
 }
 
-/* 单条订阅加载线程参数 */
-typedef struct { char *url; } SingleFeedArg;
+/* 单条订阅加载线程参数。replace=1 表示刷新：按 feedUrl 原位替换 */
+typedef struct { char *url; int replace; } SingleFeedArg;
 
 static DWORD WINAPI SingleFeedLoaderThread(LPVOID param)
 {
     SingleFeedArg *a = (SingleFeedArg*)param;
-    Podcast *pod = LoadOneFeed(a->url, 1);   /* 新添加的订阅强制联网取最新 */
+    Podcast *pod = LoadOneFeed(a->url, 1);   /* 强制联网取最新 */
+    int replace = a->replace;
     free(a->url);
     free(a);
     if (pod) {
-        PostMessageW(g_hwnd, WM_APP_FEED_ADDED, 1, (LPARAM)pod);   /* wParam=1 表示增量添加 */
+        /* wParam=1 增量添加；wParam=2 原位替换（刷新） */
+        PostMessageW(g_hwnd, WM_APP_FEED_ADDED, replace ? 2 : 1, (LPARAM)pod);
         PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 1, 0);
     } else {
         PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, 0, 0);
@@ -3463,12 +3487,13 @@ static DWORD WINAPI SingleFeedLoaderThread(LPVOID param)
     return 0;
 }
 
-/* 添加单条订阅（不刷新全部） */
-static void AddSingleFeed(const char *url)
+/* 添加单条订阅（不刷新全部）；replace=1 时刷新已有条目（原位替换） */
+static void AddSingleFeedEx(const char *url, int replace)
 {
     SingleFeedArg *a = (SingleFeedArg*)malloc(sizeof(SingleFeedArg));
     if (!a) return;
     a->url = _strdup(url);
+    a->replace = replace;
     if (!a->url) { free(a); return; }
     SetStatus(tr(TR_LOADING_FEEDS));
     g_feedsLoading = 1;
@@ -3483,6 +3508,11 @@ static void AddSingleFeed(const char *url)
         }
         CloseHandle(th);   /* 线程句柄无需保留：不等待不查询 */
     }
+}
+
+static void AddSingleFeed(const char *url)
+{
+    AddSingleFeedEx(url, 0);
 }
 
 /* ============ 下载目标互斥锁（单集播放下载 × 批量下载） ============ */
@@ -5628,23 +5658,44 @@ static void RemovePodcast(int i)
     InvalidateRect(g_listPod, NULL, TRUE);
 }
 
-/* 刷新单条播客：保留订阅链接，删掉旧条目后用单条加载线程重拉 */
+/* ================= 单播客刷新队列 =================
+ * 连续右键刷新多个播客时串行执行：入队 + FEEDS_DONE 接续，
+ * 避免并发加载线程与主线程状态竞争。 */
+static char *g_refreshQ[32];
+static int   g_refreshQN = 0;
+
+static void PumpRefreshQueue(void)
+{
+    char *url;
+    wchar_t cp[MAX_PATH];
+    if (g_refreshQN == 0 || g_feedsLoading) return;
+    url = g_refreshQ[0];
+    memmove(&g_refreshQ[0], &g_refreshQ[1], (g_refreshQN - 1) * sizeof(char*));
+    g_refreshQN--;
+    /* 清掉 RSS 缓存，强制联网取最新 */
+    UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
+    DeleteFileW(cp);
+    AddSingleFeedEx(url, 1);   /* 原位替换，不改变订阅顺序 */
+    free(url);
+}
+
+/* 右键"刷新播客"：入队，串行原位刷新 */
 static void RefreshSinglePodcast(int i)
 {
     char *url;
+    int q;
     if (i < 0 || i >= g_podCount || !g_pods[i].feedUrl) return;
+    if (g_refreshQN >= 32) return;
+    for (q = 0; q < g_refreshQN; q++)   /* 已在队列：不重复排 */
+        if (strcmp(g_refreshQ[q], g_pods[i].feedUrl) == 0) {
+            SetStatusTemp(tr(TR_REFRESH_QUEUED));
+            return;
+        }
     url = _strdup(g_pods[i].feedUrl);
     if (!url) return;
-    RemovePodcast(i);
-    AddFeedUrl(url);           /* RemovePodcast 已从 g_feedUrls 移除，补回 */
-    /* 清掉 RSS 缓存，强制联网取最新 */
-    {
-        wchar_t cp[MAX_PATH];
-        UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
-        DeleteFileW(cp);
-    }
-    AddSingleFeed(url);
-    free(url);
+    g_refreshQ[g_refreshQN++] = url;
+    if (g_refreshQN == 1) PumpRefreshQueue();
+    else SetStatusTemp(tr(TR_REFRESH_QUEUED));
 }
 
 /* 删除某播客全部已缓存的音频文件 */
@@ -5664,7 +5715,7 @@ static void DeletePodcastCache(int i)
     InvalidateRect(g_listEp, NULL, TRUE);
 }
 
-/* 删除单集缓存文件 */
+/* 删除单集缓存文件。pod==g_podCount 表示离线视图：url 即本地文件路径 */
 static void DeleteEpisodeCache(int pod, int ep)
 {
     Episode *e;
@@ -5677,12 +5728,18 @@ static void DeleteEpisodeCache(int pod, int ep)
         e = &g_pods[pod].eps[ep];
     }
     if (e && e->url) {
-        wchar_t path[MAX_PATH];
-        CachePathFor(e->url, path, MAX_PATH);
-        DeleteFileW(path);
+        if (g_playPod == pod && g_playEp == ep) PlayerStop();   /* 正在播这集：先停 */
+        if (pod == g_podCount) {
+            DeleteFileW(e->url);
+        } else {
+            wchar_t path[MAX_PATH];
+            CachePathFor(e->url, path, MAX_PATH);
+            DeleteFileW(path);
+        }
     }
     RefreshCachedEntry();
-    InvalidateRect(g_listEp, NULL, TRUE);
+    if (g_viewCached) SelectPodcast(g_podCount);   /* 重建离线列表 */
+    else InvalidateRect(g_listEp, NULL, TRUE);
 }
 
 /* 用资源管理器打开缓存目录 */
@@ -5694,18 +5751,54 @@ static void OpenCacheFolder(void)
     ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
-/* 下载单集到缓存（复用批量下载队列，避免与播放下载互斥逻辑重复造轮子） */
+/* 右键"已缓存"行 → 清空全部缓存 mp3 */
+static void DeleteAllCacheFiles(void)
+{
+    wchar_t cdir[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    CacheDir(cdir, MAX_PATH);
+    swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
+    h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t full[MAX_PATH];
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+            DeleteFileW(full);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (g_playPod == g_podCount) PlayerStop();   /* 正在离线播放：停掉 */
+    RefreshCachedEntry();                        /* 缓存清空会自动撤掉虚拟行 */
+    if (g_viewCached) {
+        if (g_cacheRowHere) {
+            SelectPodcast(g_podCount);           /* 重建离线列表 */
+        } else {
+            g_viewCached = 0;
+            SetEpisodeColumns(0);
+            if (g_podCount > 0) {
+                SendMessageW(g_listPod, LB_SETCURSEL, 0, 0);
+                SelectPodcast(0);
+            } else {
+                g_curPod = -1; g_curEp = -1;
+                SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
+                SetWindowTextW(g_editDesc, L"");
+            }
+        }
+    } else {
+        InvalidateRect(g_listPod, NULL, TRUE);
+    }
+}
+
+/* 下载单集到缓存：选中该行后走批量缓存队列（StartBatchCache 读列表选中） */
 static void DownloadSingleEpisode(int pod, int ep)
 {
-    Episode *e;
     LVITEMW lvi;
-    if (pod < 0 || pod >= g_podCount || ep < 0 || ep >= g_pods[pod].epCount) return;
-    e = &g_pods[pod].eps[ep];
-    if (!e->url) return;
-    if (EpisodeIsCached(e)) return;
-    /* 临时切到该播客并选中这一集，复用 StartBatchCache */
-    SendMessageW(g_listPod, LB_SETCURSEL, pod, 0);
-    SelectPodcast(pod);
+    if (pod < 0 || pod != g_curPod || pod >= g_podCount) return;
+    if (ep < 0 || ep >= g_pods[pod].epCount) return;
+    if (!g_pods[pod].eps[ep].url) return;
+    if (EpisodeIsCached(&g_pods[pod].eps[ep])) return;
     ZeroMemory(&lvi, sizeof(lvi));
     lvi.stateMask = LVIS_SELECTED;
     lvi.state = 0;
@@ -8970,106 +9063,71 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         pt.y = GET_Y_LPARAM(lParam);
 
         if (src == g_listPod) {
-            /* 播客列表右键 */
+            /* 播客列表右键：先选中该行，让用户看清正在操作谁 */
             POINT cl = pt;
-            int item;
+            int item, cmd;
             DWORD v;
+            HMENU m;
             ScreenToClient(g_listPod, &cl);
             v = (DWORD)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0,
                                     MAKELPARAM(cl.x, cl.y));
             if (HIWORD(v)) break;            /* 点在空白处 */
             item = (int)LOWORD(v);
             if (item < 0 || item > g_podCount) break;
-            {
-                HMENU m = CreatePopupMenu();
-                int cmd;
-                if (item < g_podCount) {
-                    /* 真实播客条目 */
-                    AppendMenuW(m, MF_STRING, 1, L"刷新该播客");
-                    AppendMenuW(m, MF_STRING, 2, L"删除播客条目");
-                    AppendMenuW(m, MF_STRING, 3, L"删除该播客已缓存的文件");
-                } else {
-                    /* “已缓存”虚拟行 */
-                    AppendMenuW(m, MF_STRING, 4, L"删除全部缓存");
-                    AppendMenuW(m, MF_STRING, 5, L"打开文件夹");
-                }
-                SetForegroundWindow(hwnd);
-                cmd = TrackPopupMenu(m,
-                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(m);
-                if (item < g_podCount) {
-                    if (cmd == 1) RefreshSinglePodcast(item);
-                    else if (cmd == 2) RemovePodcast(item);
-                    else if (cmd == 3) DeletePodcastCache(item);
-                } else {
-                    if (cmd == 4) {
-                        /* 删除缓存目录下所有 mp3 */
-                        wchar_t cdir[MAX_PATH], pat[MAX_PATH];
-                        WIN32_FIND_DATAW fd;
-                        HANDLE h;
-                        CacheDir(cdir, MAX_PATH);
-                        swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
-                        h = FindFirstFileW(pat, &fd);
-                        if (h != INVALID_HANDLE_VALUE) {
-                            do {
-                                wchar_t full[MAX_PATH];
-                                swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
-                                DeleteFileW(full);
-                            } while (FindNextFileW(h, &fd));
-                            FindClose(h);
-                        }
-                        FreeCachePodcast();
-                        g_cacheRowHere = 0;
-                        SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
-                        for (int ri = 0; ri < g_podCount; ri++) {
-                            Podcast *rp = &g_pods[ri];
-                            SendMessageW(g_listPod, LB_ADDSTRING, 0,
-                                (LPARAM)(rp->loadFailed ? tr(TR_FEED_FAIL_TITLE)
-                                          : (rp->title ? rp->title : L"")));
-                        }
-                        RefreshCachedEntry();
-                        if (g_curPod >= 0) {
-                            SendMessageW(g_listPod, LB_SETCURSEL, g_curPod, 0);
-                            SelectPodcast(g_curPod);
-                        }
-                        SetStatus(tr(TR_READY));
-                    } else if (cmd == 5) {
-                        OpenCacheFolder();
-                    }
-                }
+            SendMessageW(g_listPod, LB_SETCURSEL, item, 0);
+            SelectPodcast(item);
+            m = CreatePopupMenu();
+            if (item < g_podCount) {
+                AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_REFRESH));
+                AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DELETE_POD));
+                AppendMenuW(m, MF_STRING, 3, tr(TR_CTX_DEL_POD_CACHE));
+            } else {
+                AppendMenuW(m, MF_STRING, 4, tr(TR_CTX_DEL_ALL_CACHE));
+                AppendMenuW(m, MF_STRING, 5, tr(TR_CTX_OPEN_FOLDER));
+            }
+            SetForegroundWindow(hwnd);
+            cmd = TrackPopupMenu(m,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (item < g_podCount) {
+                if (cmd == 1) RefreshSinglePodcast(item);
+                else if (cmd == 2) RemovePodcast(item);
+                else if (cmd == 3) DeletePodcastCache(item);
+            } else {
+                if (cmd == 4) DeleteAllCacheFiles();
+                else if (cmd == 5) OpenCacheFolder();
             }
         } else if (src == g_listEp) {
-            /* 剧集列表右键 */
+            /* 剧集列表右键：已缓存→删除缓存；未缓存→下载（二选一显示） */
             LVHITTESTINFO hti;
-            int ep;
+            HMENU m;
+            int cmd, ep, cached;
+            Episode *e = NULL;
             ZeroMemory(&hti, sizeof(hti));
             hti.pt = pt;
             ScreenToClient(g_listEp, &hti.pt);
             ep = (int)SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hti);
-            if (ep < 0) break;
-            {
-                HMENU m = CreatePopupMenu();
-                int cmd, cached;
-                int pod = g_curPod;
-                Episode *e = NULL;
-                if (pod >= 0 && pod < g_podCount && ep < g_pods[pod].epCount)
-                    e = &g_pods[pod].eps[ep];
-                else if (pod == g_podCount && ep < g_cachePod.epCount)
-                    e = &g_cachePod.eps[ep];
-                cached = e ? (e->localFile || EpisodeIsCached(e)) : 0;
-                AppendMenuW(m, cached ? MF_GRAYED : MF_STRING, 1, L"下载");
-                AppendMenuW(m, cached ? MF_STRING : MF_GRAYED, 2, L"删除该缓存");
-                SetForegroundWindow(hwnd);
-                cmd = TrackPopupMenu(m,
-                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(m);
-                if (cmd == 1 && pod >= 0 && pod < g_podCount)
-                    DownloadSingleEpisode(pod, ep);
-                else if (cmd == 2)
-                    DeleteEpisodeCache(pod, ep);
+            if (ep < 0 || g_curPod < 0 || g_curPod > g_podCount) break;
+            if (g_curPod == g_podCount) {
+                if (ep >= g_cachePod.epCount) break;
+                e = &g_cachePod.eps[ep];
+            } else {
+                if (ep >= g_pods[g_curPod].epCount) break;
+                e = &g_pods[g_curPod].eps[ep];
             }
+            if (!e || !e->url) break;
+            cached = e->localFile || EpisodeIsCached(e);
+            m = CreatePopupMenu();
+            if (cached) AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DEL_EP_CACHE));
+            else        AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_DOWNLOAD));
+            SetForegroundWindow(hwnd);
+            cmd = TrackPopupMenu(m,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
+            else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
         }
         return 0;
     }
@@ -9423,7 +9481,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_APP_FEED_ADDED: {
         Podcast *pod = (Podcast*)lParam;
-        int incremental = (int)wParam;   /* 1=单条添加，0=全量刷新 */
+        int incremental = (int)wParam;   /* 0=全量刷新 1=单条添加 2=原位替换 */
+        if (pod && incremental == 2) {
+            /* 右键"刷新播客"：按 feedUrl 原位替换，列表顺序不变 */
+            int idx = -1, x;
+            for (x = 0; x < g_podCount; x++)
+                if (g_pods[x].feedUrl && pod->feedUrl &&
+                    strcmp(g_pods[x].feedUrl, pod->feedUrl) == 0) { idx = x; break; }
+            if (idx >= 0) {
+                Podcast old = g_pods[idx];
+                g_pods[idx] = *pod;      /* 接管新数据（含封面句柄） */
+                FreePodcast(&old);       /* 释放旧数据 */
+                free(pod);
+                pod = NULL;
+                if (g_playPod == idx && g_playEp >= g_pods[idx].epCount)
+                    g_playEp = -1;
+                if (g_curPod == idx) SelectPodcast(idx);
+                else InvalidateRect(g_listPod, NULL, TRUE);
+                if (g_playPod == idx && g_playEp >= 0)
+                    HighlightEpisodeRow(g_playEp);
+            } else {
+                incremental = 1;   /* 旧条目已被删除：按普通新增处理 */
+            }
+        }
         if (pod) {
             if (g_podCount < MAX_PODCASTS) {
                 int newIdx = g_podCount;
@@ -9477,6 +9557,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         TryResumePlayback();   /* 启动续播：有记忆位置时自动恢复上次播放 */
         LastEpPurgeOrphans();  /* 清掉对不上现有订阅的“上次听到”记录 */
         g_fullReload = 0;
+        PumpRefreshQueue();    /* 单播客刷新队列：接续下一条 */
         return 0;
 
     case WM_APP_EP_READY: {
