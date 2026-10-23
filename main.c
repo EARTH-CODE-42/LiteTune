@@ -144,7 +144,7 @@ typedef struct {
 } EpReady;
 
 /* 排序列 */
-enum { SORT_TITLE = 0, SORT_DATE = 1, SORT_DUR = 2 };
+enum { SORT_TITLE = 0, SORT_DATE = 1, SORT_DUR = 2, SORT_PODCAST = 3 };
 
 /* ================= 控件 ID ================= */
 enum {
@@ -418,7 +418,7 @@ static const wchar_t *tr(int id)
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
-        L"LiteTune  版本 1.2\r\n\r\n"
+        L"LiteTune  版本 1.3\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
             L"纯 C + Win32 API 编写，单文件绿色便携，\r\n不依赖任何第三方 DLL。",
         L"夜间模式已开启", L"夜间模式已关闭", L"字号已切换",
@@ -875,6 +875,55 @@ static void ApplyDarkMenus(HWND hwnd, int dark)
     if (pFlush) pFlush();
 }
 
+/* Tooltip 自绘子类：完全控制背景/文字色，绕过视觉样式下 TTM_SETTIPTEXTCOLOR 失效问题。
+ * 对 g_hwndTip / g_hwndEpTip / g_ibTip 通用。 */
+static LRESULT CALLBACK TipSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+    UINT_PTR id, DWORD_PTR ref)
+{
+    (void)id; (void)ref;
+    if (msg == WM_ERASEBKGND) {
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH bg = CreateSolidBrush(ThPanel());
+        FillRect((HDC)wp, &rc, bg);
+        DeleteObject(bg);
+        return 1;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH bg = CreateSolidBrush(ThPanel());
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+        /* 取当前工具的文字 */
+        wchar_t txt[2048] = {0};
+        TOOLINFOW ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        ti.lpszText = txt;
+        if (SendMessageW(h, TTM_GETCURRENTTOOL, 0, (LPARAM)&ti)) {
+            SetTextColor(hdc, ThText());
+            SetBkMode(hdc, TRANSPARENT);
+            HFONT old = (HFONT)SelectObject(hdc, g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT));
+            RECT trc = rc;
+            trc.left += 6; trc.right -= 6; trc.top += 4; trc.bottom -= 4;
+            DrawTextW(hdc, txt, -1, &trc, DT_LEFT | DT_WORDBREAK);
+            SelectObject(hdc, old);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+/* 给 tooltip 挂上自绘子类（重复调用安全，同 id 重装即更新） */
+static void ThemeTipSubclass(HWND tip)
+{
+    if (tip) SetWindowSubclass(tip, TipSubProc, 1, 0);
+}
+
 /* 给剧集表头的 3 列设置/取消自绘格式（选中播客会重建列，必须重新应用） */
 static void SubclassHeader(void);
 static void ApplyHeaderTheme(void)
@@ -1075,6 +1124,13 @@ static void ApplyTheme(void)
     }
     ApplyDarkTitlebar(g_hwnd, g_darkMode);
     ApplyDarkMenus(g_hwnd, g_darkMode);   /* 菜单/非客户区走系统原生暗色渲染 */
+    /* 系统 tooltip 统一主题色（g_ibTip 在 InputBox 初始化处设置，因为定义在本函数之后） */
+    {
+        HWND tips[] = { g_hwndTip, g_hwndEpTip };
+        int k;
+        for (k = 0; k < 2; k++)
+            ThemeTipSubclass(tips[k]);
+    }
     if (g_hwnd) {
         /* DWM 暗色标题栏属性运行期切换后，需重算非客户区并模拟一次
          * 激活同步，标题栏才会立即按新属性重绘 */
@@ -1596,24 +1652,39 @@ static int DrawHeaderItem(DRAWITEMSTRUCT *di)
     if (htext[0])
         DrawTextW(di->hDC, htext, -1, &tr,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    /* 当前排序列右侧画升降序小三角（仅剧集列表有排序状态） */
-    if ((int)di->itemID == g_sortCol && GetParent(di->hwndItem) == g_listEp) {
-        int cx = rc.right - 9, cy = rc.top + (rc.bottom - rc.top) / 2;
-        HBRUSH ab = CreateSolidBrush(RGB(210, 210, 214));
-        HGDIOBJ ob = SelectObject(di->hDC, ab);
-        POINT tri[3];
-        if (g_sortDir < 0) {  /* 降序 ▼ */
-            tri[0].x=cx-3; tri[0].y=cy-1;
-            tri[1].x=cx+3; tri[1].y=cy-1;
-            tri[2].x=cx;   tri[2].y=cy+4;
-        } else {             /* 升序 ▲ */
-            tri[0].x=cx-3; tri[0].y=cy+2;
-            tri[1].x=cx+3; tri[1].y=cy+2;
-            tri[2].x=cx;   tri[2].y=cy-3;
+    /* 当前排序列右侧画升降序小三角（仅剧集列表有排序状态）。
+     * di->itemID 是列索引，g_sortCol 是排序枚举值，需按视图映射回来：
+     *   普通视图：0=标题 1=日期 2=时长
+     *   缓存视图：0=播客 1=标题 2=时长 */
+    {
+        int sortColIdx = -1;
+        if (g_viewCached) {
+            if (g_sortCol == SORT_PODCAST) sortColIdx = 0;
+            else if (g_sortCol == SORT_TITLE) sortColIdx = 1;
+            else if (g_sortCol == SORT_DUR) sortColIdx = 2;
+        } else {
+            if (g_sortCol == SORT_TITLE) sortColIdx = 0;
+            else if (g_sortCol == SORT_DATE) sortColIdx = 1;
+            else if (g_sortCol == SORT_DUR) sortColIdx = 2;
         }
-        Polygon(di->hDC, tri, 3);
-        SelectObject(di->hDC, ob);
-        DeleteObject(ab);
+        if ((int)di->itemID == sortColIdx && GetParent(di->hwndItem) == g_listEp) {
+            int cx = rc.right - 9, cy = rc.top + (rc.bottom - rc.top) / 2;
+            HBRUSH ab = CreateSolidBrush(RGB(210, 210, 214));
+            HGDIOBJ ob = SelectObject(di->hDC, ab);
+            POINT tri[3];
+            if (g_sortDir < 0) {  /* 降序 ▼ */
+                tri[0].x=cx-3; tri[0].y=cy-1;
+                tri[1].x=cx+3; tri[1].y=cy-1;
+                tri[2].x=cx;   tri[2].y=cy+4;
+            } else {             /* 升序 ▲ */
+                tri[0].x=cx-3; tri[0].y=cy+2;
+                tri[1].x=cx+3; tri[1].y=cy+2;
+                tri[2].x=cx;   tri[2].y=cy-3;
+            }
+            Polygon(di->hDC, tri, 3);
+            SelectObject(di->hDC, ob);
+            DeleteObject(ab);
+        }
     }
     return 1;
 }
@@ -1801,7 +1872,7 @@ static HINTERNET WinHttpOpenUser(void)
     ZeroMemory(&ie, sizeof(ie));
     if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
         if (ie.lpszProxy && ie.lpszProxy[0]) {
-            s = WinHttpOpen(L"LiteTune/1.2", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            s = WinHttpOpen(L"LiteTune/1.3", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
                 ie.lpszProxy, ie.lpszProxyBypass, 0);
         }
         if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl);
@@ -1809,7 +1880,7 @@ static HINTERNET WinHttpOpenUser(void)
         if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass);
     }
     if (s) return s;
-    return WinHttpOpen(L"LiteTune/1.2",
+    return WinHttpOpen(L"LiteTune/1.3",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 }
@@ -3318,6 +3389,9 @@ static int EpCmp(const void *pa, const void *pb)
     case SORT_DATE:
         /* dateKey 是 long long，直接相减截断成 int 会溢出翻转 */
         r = (a->dateKey > b->dateKey) - (a->dateKey < b->dateKey);
+        break;
+    case SORT_PODCAST:
+        r = lstrcmpiW(a->author ? a->author : L"", b->author ? b->author : L"");
         break;
     default:         r = a->durationSec - b->durationSec; break;
     }
@@ -5246,8 +5320,9 @@ static void ChangeSort(int col)
     int sortCol;
 
     if (g_viewCached) {
-        /* 缓存视图列：0=播客(不支持排序) 1=标题 2=时长 */
-        if (col == 1) sortCol = SORT_TITLE;
+        /* 缓存视图列：0=播客 1=标题 2=时长 */
+        if (col == 0) sortCol = SORT_PODCAST;
+        else if (col == 1) sortCol = SORT_TITLE;
         else if (col == 2) sortCol = SORT_DUR;
         else return;
         col = sortCol;
@@ -5255,7 +5330,7 @@ static void ChangeSort(int col)
     if (g_sortCol == col) g_sortDir = -g_sortDir;
     else {
         g_sortCol = col;
-        g_sortDir = (col == SORT_TITLE) ? 1 : -1;
+        g_sortDir = (col == SORT_TITLE || col == SORT_PODCAST) ? 1 : -1;
     }
     /* 排序只更新内存，退出时统一保存 */
 
@@ -6254,6 +6329,7 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                         0, 0, 0, 0, h, NULL, GetModuleHandleW(NULL), NULL);
                     if (g_ibTip) {
                         SendMessageW(g_ibTip, TTM_SETMAXTIPWIDTH, 0, 400);
+                        ThemeTipSubclass(g_ibTip);
                         ZeroMemory(&ti, sizeof(ti));
                         ti.cbSize = sizeof(ti);
                         ti.uFlags = TTF_TRACK;
@@ -7834,6 +7910,72 @@ static void CfgSwitchMode(int external)
     }
 }
 
+/* 递归释放 dwItemData 字符串（自绘菜单文字副本） */
+static void ThemeMenuCleanup(HMENU m)
+{
+    int i, n;
+    n = GetMenuItemCount(m);
+    for (i = 0; i < n; i++) {
+        MENUITEMINFOW mi;
+        ZeroMemory(&mi, sizeof(mi));
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIIM_DATA | MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(m, i, TRUE, &mi)) continue;
+        if (mi.dwItemData) free((void*)(ULONG_PTR)mi.dwItemData);
+        if (mi.hSubMenu) ThemeMenuCleanup(mi.hSubMenu);
+    }
+}
+
+/* 递归给菜单树所有 item 设 MFT_OWNERDRAW，文字存 dwItemData */
+static void ThemeMenuRecurse(HMENU m)
+{
+    int i, n = GetMenuItemCount(m);
+    for (i = 0; i < n; i++) {
+        MENUITEMINFOW it;
+        HMENU sub = NULL;
+        ZeroMemory(&it, sizeof(it));
+        it.cbSize = sizeof(it);
+        it.fMask = MIIM_FTYPE | MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(m, i, TRUE, &it)) continue;
+        sub = it.hSubMenu;
+        if (it.fType & MFT_SEPARATOR) {
+            it.fMask = MIIM_FTYPE;
+            it.fType |= MFT_OWNERDRAW;
+            SetMenuItemInfoW(m, i, TRUE, &it);
+        } else {
+            wchar_t buf[256];
+            it.fMask = MIIM_TYPE | MIIM_DATA;
+            it.fType = MFT_STRING;
+            it.dwTypeData = buf; it.cch = 256;
+            if (GetMenuItemInfoW(m, i, TRUE, &it)) {
+                it.fMask = MIIM_FTYPE | MIIM_DATA;
+                it.fType |= MFT_OWNERDRAW;
+                it.dwItemData = (ULONG_PTR)_wcsdup(buf);
+                SetMenuItemInfoW(m, i, TRUE, &it);
+            }
+        }
+        if (sub) ThemeMenuRecurse(sub);
+    }
+}
+
+/* 深色模式下给菜单树开启自绘。返回 MIM_BACKGROUND brush 供调用方释放（仅一个）。
+ * 浅色模式直接返回 NULL，使用系统原生菜单。 */
+static HBRUSH ApplyMenuTheme(HMENU m)
+{
+    HBRUSH bg;
+    MENUINFO mi;
+    if (!g_darkMode) return NULL;
+    /* 菜单窗口背景：填满菜单项之间的间隙，MIM_APPLYTOSUBMENUS 同时应用到子菜单 */
+    bg = CreateSolidBrush(ThPanel());
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+    mi.hbrBack = bg;
+    SetMenuInfo(m, &mi);
+    ThemeMenuRecurse(m);
+    return bg;
+}
+
 static void OnSettingsButton(void)
 {
     HMENU menu = CreatePopupMenu();
@@ -7899,8 +8041,13 @@ static void OnSettingsButton(void)
     AppendMenuW(menu, MF_STRING, 7, tr(TR_M_ABOUT));
 
     GetCursorPos(&pt);
-    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
-        pt.x, pt.y, 0, g_hwnd, NULL);
+    {
+        HBRUSH bg = ApplyMenuTheme(menu);
+        cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x, pt.y, 0, g_hwnd, NULL);
+        ThemeMenuCleanup(menu);
+        if (bg) DeleteObject(bg);
+    }
     DestroyMenu(menu);   /* 级联销毁子菜单 */
     if (cmd == 0) return;
 
@@ -8362,46 +8509,61 @@ static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(h, &ps);
         RECT rc;
+        int coverW = 128;
         GetClientRect(h, &rc);
-        FillRect(hdc, &rc, GetSysColorBrush(COLOR_INFOBK));
-        DrawEdge(hdc, &rc, EDGE_RAISED, BF_RECT);
+        /* 深色主题：自绘背景/边框/文字，不再用系统 COLOR_INFOBK */
+        {
+            HBRUSH bg = CreateSolidBrush(ThPanel());
+            HPEN bp = CreatePen(PS_SOLID, 1, ThDim());
+            FillRect(hdc, &rc, bg);
+            SelectObject(hdc, bp);
+            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+            DeleteObject(bg); DeleteObject(bp);
+        }
         if (g_tipPodIdx >= 0 && g_tipPodIdx < g_podCount) {
             Podcast *p = &g_pods[g_tipPodIdx];
-            int pad = 8;
-            RECT rci = { pad, pad, pad + 96, pad + 96 };
-            RECT rct = { pad + 96 + 12, pad + 4, rc.right - pad, pad + 28 };
-            RECT rca = { pad + 96 + 12, pad + 30, rc.right - pad, pad + 56 };
-            RECT rcd = { pad + 96 + 12, pad + 58, rc.right - pad, rc.bottom - pad };
-            /* 封面：保持比例绘制，黑底占位 */
+            int pad = 10;
+            int coverH = coverW;
+            int textX  = pad + coverW + 14;
+            int maxR   = rc.right - pad;
+            RECT rci = { pad, pad, pad + coverW, pad + coverH };
+            RECT rct = { textX, pad + 4, maxR, pad + 32 };
+            RECT rca = { textX, pad + 34, maxR, pad + 60 };
+            RECT rcd = { textX, pad + 62, maxR, rc.bottom - pad };
+            /* 封面：保持比例绘制 */
             if (p->hImage) {
                 BITMAP bm;
                 HDC mem = CreateCompatibleDC(hdc);
                 HBITMAP old = (HBITMAP)SelectObject(mem, p->hImage);
                 GetObject(p->hImage, sizeof(bm), &bm);
                 if (bm.bmWidth > 0 && bm.bmHeight > 0) {
-                    double r1 = 96.0 / bm.bmWidth, r2 = 96.0 / bm.bmHeight;
+                    double r1 = (double)coverW / bm.bmWidth;
+                    double r2 = (double)coverW / bm.bmHeight;
                     double r = r1 < r2 ? r1 : r2;
                     int dw = (int)(bm.bmWidth * r + 0.5);
                     int dh = (int)(bm.bmHeight * r + 0.5);
-                    int dx = rci.left + (96 - dw) / 2;
-                    int dy = rci.top + (96 - dh) / 2;
-                    FillRectColor(hdc, &rci, ThPanel());
+                    int dx = rci.left + (coverW - dw) / 2;
+                    int dy = rci.top + (coverW - dh) / 2;
+                    FillRectColor(hdc, &rci, g_darkMode ? RGB(24,24,28) : RGB(245,245,245));
                     SetStretchBltMode(hdc, HALFTONE);
                     StretchBlt(hdc, dx, dy, dw, dh, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
                 }
                 SelectObject(mem, old);
                 DeleteDC(mem);
             } else {
-                FillRectColor(hdc, &rci, ThPanel());
+                FillRectColor(hdc, &rci, g_darkMode ? RGB(24,24,28) : RGB(245,245,245));
             }
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, GetSysColor(COLOR_INFOTEXT));
+            SetTextColor(hdc, ThText());
             SelectObject(hdc, g_fontBold);
             DrawTextW(hdc, p->title ? p->title : tr(TR_UNTITLED), -1, &rct,
                 DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            SetTextColor(hdc, ThDim());
             SelectObject(hdc, g_fontSmall);
             DrawTextW(hdc, p->author ? p->author : L"", -1, &rca,
                 DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            SetTextColor(hdc, ThDim());
             if (p->desc)
                 DrawTextW(hdc, p->desc, -1, &rcd,
                     DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -8606,6 +8768,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_hwndTip) {
             SetWindowPos(g_hwndTip, HWND_TOPMOST, 0,0,0,0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            ThemeTipSubclass(g_hwndTip);
             AddButtonTip(g_btnPrev,   tr(TR_TIP_PREV));
             AddButtonTip(g_btnPlay,   tr(TR_TIP_PLAYPAUSE));
             AddButtonTip(g_btnNext,   tr(TR_TIP_NEXT));
@@ -8634,7 +8797,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ti.uId = (UINT_PTR)g_listEp;
                 ti.lpszText = L"";
                 SendMessageW(g_hwndEpTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
-                SendMessageW(g_hwndEpTip, TTM_SETTIPBKCOLOR, 0, 0);  /* default */
+                ThemeTipSubclass(g_hwndEpTip);
             }
         }
 
@@ -8649,13 +8812,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             wc.hbrBackground = (HBRUSH)(COLOR_INFOBK + 1);
             RegisterClassExW(&wc);
             g_hwndPodTip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-                L"LpPodTip", NULL, WS_POPUP, 0,0, 320, 140, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+                L"LpPodTip", NULL, WS_POPUP, 0,0, 440, 160, hwnd, NULL, GetModuleHandleW(NULL), NULL);
         }
         return 0;
     }
 
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT *mi = (MEASUREITEMSTRUCT*)lParam;
+        if (mi->CtlType == ODT_MENU) {
+            /* 自绘菜单项高度：分隔线用小高度，普通项按 g_font */
+            HDC hdc = GetDC(hwnd);
+            HFONT old = (HFONT)SelectObject(hdc, g_font);
+            if (mi->itemData) {
+                TEXTMETRICW tm;
+                SIZE sz;
+                GetTextMetricsW(hdc, &tm);
+                mi->itemHeight = tm.tmHeight + 6;
+                GetTextExtentPoint32W(hdc, (const wchar_t*)mi->itemData,
+                    (int)wcslen((const wchar_t*)mi->itemData), &sz);
+                mi->itemWidth = sz.cx + 40;  /* 左侧勾选区 + padding */
+            } else {
+                mi->itemHeight = 8;   /* 分隔线 */
+                mi->itemWidth  = 0;
+            }
+            SelectObject(hdc, old);
+            ReleaseDC(hwnd, hdc);
+            return TRUE;
+        }
         if (mi->CtlID == IDC_LIST_POD) {
             mi->itemHeight = 54;
             return TRUE;
@@ -8665,6 +8848,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lParam;
+        if (di->CtlType == ODT_MENU) {
+            /* 深色模式自绘菜单项（含分隔线） */
+            RECT rc = di->rcItem;
+            const wchar_t *txt = di->itemData ? (const wchar_t*)di->itemData : NULL;
+            int isSel = (di->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
+            int isGray = (di->itemState & ODS_GRAYED) != 0;
+            int isChk  = (di->itemState & ODS_CHECKED) != 0;
+            int isSep  = (txt == NULL);   /* 分隔线无 dwItemData */
+            FillRectColor(di->hDC, &rc, isSel ? ThSel() : ThPanel());
+            if (isSep) {
+                HPEN p = CreatePen(PS_SOLID, 1, ThDim());
+                HGDIOBJ op = SelectObject(di->hDC, p);
+                MoveToEx(di->hDC, rc.left + 4, (rc.top + rc.bottom)/2, NULL);
+                LineTo(di->hDC, rc.right - 4, (rc.top + rc.bottom)/2);
+                SelectObject(di->hDC, op);
+                DeleteObject(p);
+            } else {
+                int chkW = 0;
+                SetBkMode(di->hDC, TRANSPARENT);
+                if (isChk) {
+                    RECT ck = { rc.left + 4, rc.top + 2, rc.left + 16, rc.top + 14 };
+                    HBRUSH bh = CreateSolidBrush(ThBlue());
+                    HPEN cp = CreatePen(PS_SOLID, 1, ThDim());
+                    SelectObject(di->hDC, cp);
+                    SelectObject(di->hDC, bh);
+                    Rectangle(di->hDC, ck.left, ck.top, ck.right, ck.bottom);
+                    SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                    {
+                        HPEN gp = CreatePen(PS_SOLID, 2, RGB(255,255,255));
+                        SelectObject(di->hDC, gp);
+                        MoveToEx(di->hDC, ck.left+3, ck.top+5, NULL);
+                        LineTo(di->hDC,   ck.left+7, ck.top+9);
+                        LineTo(di->hDC,   ck.left+12, ck.top+3);
+                        DeleteObject(gp);
+                    }
+                    DeleteObject(bh); DeleteObject(cp);
+                    chkW = 16;
+                }
+                SetTextColor(di->hDC, isGray ? ThDim() : ThText());
+                SetBkMode(di->hDC, TRANSPARENT);
+                {
+                    RECT trc = { rc.left + 4 + chkW + 8, rc.top, rc.right - 4, rc.bottom };
+                    SelectObject(di->hDC, g_font);
+                    DrawTextW(di->hDC, txt, -1, &trc,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                }
+            }
+            return TRUE;
+        }
         if (di->CtlType == ODT_BUTTON) {
             /* 倍速按钮：文字按钮，显示 "1.0x" 等 */
             if (di->CtlID == IDC_BTN_SPEED) {
@@ -9086,9 +9318,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 AppendMenuW(m, MF_STRING, 5, tr(TR_CTX_OPEN_FOLDER));
             }
             SetForegroundWindow(hwnd);
-            cmd = TrackPopupMenu(m,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                pt.x, pt.y, 0, hwnd, NULL);
+            {
+                HBRUSH bg = ApplyMenuTheme(m);
+                cmd = TrackPopupMenu(m,
+                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, NULL);
+                ThemeMenuCleanup(m);
+                if (bg) DeleteObject(bg);
+            }
             DestroyMenu(m);
             if (item < g_podCount) {
                 if (cmd == 1) RefreshSinglePodcast(item);
@@ -9122,9 +9359,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (cached) AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DEL_EP_CACHE));
             else        AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_DOWNLOAD));
             SetForegroundWindow(hwnd);
-            cmd = TrackPopupMenu(m,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                pt.x, pt.y, 0, hwnd, NULL);
+            {
+                HBRUSH bg = ApplyMenuTheme(m);
+                cmd = TrackPopupMenu(m,
+                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, NULL);
+                ThemeMenuCleanup(m);
+                if (bg) DeleteObject(bg);
+            }
             DestroyMenu(m);
             if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
@@ -9744,11 +9986,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             GetCursorPos(&pt);
             SetForegroundWindow(hwnd);   /* 让菜单能正常消失 */
             {
-                int cmd = TrackPopupMenu(m,
-                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, NULL);
-                if (cmd == 1) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
-                else if (cmd == 2) DestroyWindow(hwnd);
+                HBRUSH bg = ApplyMenuTheme(m);
+                {
+                    int cmd = TrackPopupMenu(m,
+                        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                        pt.x, pt.y, 0, hwnd, NULL);
+                    if (cmd == 1) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+                    else if (cmd == 2) DestroyWindow(hwnd);
+                }
+                ThemeMenuCleanup(m);
+                if (bg) DeleteObject(bg);
             }
             DestroyMenu(m);
         }
