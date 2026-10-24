@@ -376,6 +376,8 @@ enum {
     TR_CTX_REFRESH, TR_CTX_DELETE_POD, TR_CTX_DEL_POD_CACHE,
     TR_CTX_DEL_ALL_CACHE, TR_CTX_OPEN_FOLDER, TR_CTX_DOWNLOAD,
     TR_CTX_DEL_EP_CACHE, TR_REFRESH_QUEUED,
+    TR_CTX_COPY_EP_URL, TR_CTX_COPY_FEED_URL,
+    TR_CLIP_OK, TR_CLIP_FAIL,
     TR_N
 };
 
@@ -470,7 +472,9 @@ static const wchar_t *tr(int id)
         L"切换配置存储方式失败（exe 被占用或只读？）",
         L"刷新播客", L"删除播客", L"删除缓存文件",
         L"清空全部缓存", L"打开文件夹", L"下载", L"删除缓存",
-        L"已加入刷新队列，稍后自动开始"
+        L"已加入刷新队列，稍后自动开始",
+        L"复制剧集链接", L"复制 Feed URL",
+        L"已复制到剪贴板", L"复制失败"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -577,7 +581,9 @@ static const wchar_t *tr(int id)
         L"Failed to change config storage (exe in use or read-only?)",
         L"Refresh podcast", L"Delete podcast", L"Delete cached files",
         L"Clear all cache", L"Open folder", L"Download", L"Delete cache",
-        L"Added to refresh queue"
+        L"Added to refresh queue",
+        L"Copy episode URL", L"Copy feed URL",
+        L"Copied to clipboard", L"Copy failed"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -620,6 +626,27 @@ static void FillRectColor(HDC dc, const RECT *rc, COLORREF col)
     HBRUSH b = CreateSolidBrush(col);
     FillRect(dc, rc, b);
     DeleteObject(b);
+}
+
+/* 把一个 Unicode 字符串复制到系统剪贴板。成功返回 1，失败返回 0。 */
+static int CopyToClipboardW(const wchar_t *text)
+{
+    size_t n; HGLOBAL hMem; wchar_t *dst;
+    if (!text || !*text) return 0;
+    n = (wcslen(text) + 1) * sizeof(wchar_t);
+    hMem = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!hMem) return 0;
+    dst = (wchar_t*)GlobalLock(hMem);
+    if (!dst) { GlobalFree(hMem); return 0; }
+    memcpy(dst, text, n);
+    GlobalUnlock(hMem);
+    if (!OpenClipboard(NULL)) { GlobalFree(hMem); return 0; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+        CloseClipboard(); GlobalFree(hMem); return 0;
+    }
+    CloseClipboard();
+    return 1;
 }
 
 /* ---- 暗色弹窗（MessageBox / InputBox 共用） ----
@@ -7951,7 +7978,8 @@ static void ThemeMenuRecurse(HMENU m)
                 it.fMask = MIIM_FTYPE | MIIM_DATA;
                 it.fType |= MFT_OWNERDRAW;
                 it.dwItemData = (ULONG_PTR)_wcsdup(buf);
-                SetMenuItemInfoW(m, i, TRUE, &it);
+                if (it.dwItemData)
+                    SetMenuItemInfoW(m, i, TRUE, &it);
             }
         }
         if (sub) ThemeMenuRecurse(sub);
@@ -9313,8 +9341,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_REFRESH));
                 AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DELETE_POD));
                 AppendMenuW(m, MF_STRING, 3, tr(TR_CTX_DEL_POD_CACHE));
+                AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(m, MF_STRING, 6, tr(TR_CTX_COPY_FEED_URL));
             } else {
-                AppendMenuW(m, MF_STRING, 4, tr(TR_CTX_DEL_ALL_CACHE));
+                int cacheN = g_cachePod.epCount;
+                AppendMenuW(m, MF_STRING | (cacheN ? 0 : MF_GRAYED), 4, tr(TR_CTX_DEL_ALL_CACHE));
                 AppendMenuW(m, MF_STRING, 5, tr(TR_CTX_OPEN_FOLDER));
             }
             SetForegroundWindow(hwnd);
@@ -9331,12 +9362,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (cmd == 1) RefreshSinglePodcast(item);
                 else if (cmd == 2) RemovePodcast(item);
                 else if (cmd == 3) DeletePodcastCache(item);
+                else if (cmd == 6) {
+                    wchar_t *fu = U8ToW(g_pods[item].feedUrl);
+                    if (fu) {
+                        if (CopyToClipboardW(fu)) SetStatusTemp(tr(TR_CLIP_OK));
+                        else SetStatusTemp(tr(TR_CLIP_FAIL));
+                        free(fu);
+                    }
+                }
             } else {
                 if (cmd == 4) DeleteAllCacheFiles();
                 else if (cmd == 5) OpenCacheFolder();
             }
         } else if (src == g_listEp) {
-            /* 剧集列表右键：已缓存→删除缓存；未缓存→下载（二选一显示） */
+            /* 剧集列表右键：已缓存→删除缓存；未缓存→下载；恒有复制剧集链接 */
             LVHITTESTINFO hti;
             HMENU m;
             int cmd, ep, cached;
@@ -9358,6 +9397,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             m = CreatePopupMenu();
             if (cached) AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DEL_EP_CACHE));
             else        AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_DOWNLOAD));
+            AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(m, MF_STRING, 3, tr(TR_CTX_COPY_EP_URL));
             SetForegroundWindow(hwnd);
             {
                 HBRUSH bg = ApplyMenuTheme(m);
@@ -9370,6 +9411,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyMenu(m);
             if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
+            else if (cmd == 3) {
+                if (CopyToClipboardW(e->url)) SetStatusTemp(tr(TR_CLIP_OK));
+                else SetStatusTemp(tr(TR_CLIP_FAIL));
+            }
         }
         return 0;
     }
