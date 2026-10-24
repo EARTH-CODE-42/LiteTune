@@ -243,7 +243,8 @@ static int      g_sortDir = -1;          /* -1=降序 1=升序 */
 static int      g_w1perm = 323;          /* 播客列宽，千分比 */
 static int      g_w2perm = 383;          /* 剧集列宽，千分比 */
 static int      g_volume = 80;           /* 音量 0-100 */
-static int      g_winW = 480, g_winH = 360;  /* 窗口尺寸（默认=最小 4:3） */
+static int      g_winW = 480, g_winH = 360;  /* 窗口外框尺寸（含标题栏边框），用于保存/恢复 */
+static int      g_winX = CW_USEDEFAULT, g_winY = CW_USEDEFAULT;  /* 窗口左上角，CW_USEDEFAULT=首次运行 */
 static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
 static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
 static int      g_cfgExternal = 0;       /* 配置存储模式：1=外挂同目录 feeds.ini 0=内嵌 exe 尾部。
@@ -3009,6 +3010,8 @@ static void ParseConfigLine(char *line)
         else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
         else if (strcmp(s, "winw") == 0) g_winW = atoi(val);
         else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
+        else if (strcmp(s, "winx") == 0) g_winX = atoi(val);
+        else if (strcmp(s, "winy") == 0) g_winY = atoi(val);
         else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
         else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
         else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
@@ -3281,6 +3284,17 @@ static void LoadConfig(void)
     if (g_winW > 4000) g_winW = 4000;
     if (g_winH > 2400) g_winH = 2400;
     {
+        /* 多显示器安全：如果保存的窗口位置完全在主屏幕外，放弃用它 */
+        int scrW = GetSystemMetrics(SM_CXSCREEN);
+        int scrH = GetSystemMetrics(SM_CYSCREEN);
+        if (g_winX != CW_USEDEFAULT && g_winY != CW_USEDEFAULT) {
+            if (g_winX < -g_winW + 40 || g_winX > scrW - 40 ||
+                g_winY < -g_winH + 40 || g_winY > scrH - 40) {
+                g_winX = CW_USEDEFAULT; g_winY = CW_USEDEFAULT;
+            }
+        }
+    }
+    {
         static const int defCw[3] = { 110, 88, 44 };
         int ci;
         for (ci = 0; ci < 3; ci++)
@@ -3318,6 +3332,8 @@ static char *BuildConfigText(DWORD *lenOut)
     SbAddf(&sb, "speed=%d\n", g_speed);
     SbAddf(&sb, "winw=%d\n", g_winW);
     SbAddf(&sb, "winh=%d\n", g_winH);
+    SbAddf(&sb, "winx=%d\n", g_winX);
+    SbAddf(&sb, "winy=%d\n", g_winY);
     /* 续播记忆：正在播放/暂停时记住剧集与位置；已手动停止则不写（下次不续播） */
     if (g_playUrl && g_playState != 0) {
         long long pos = PlayerGet100ns(0);
@@ -3372,6 +3388,16 @@ static void SaveConfig(void)
     if (g_skipSave) return;   /* 导入配置后退出：不能让旧内存状态覆盖刚导入的配置 */
 
     CfgExternalPath(iniPath, MAX_PATH);
+
+    /* 退出前抓取当前窗口外框矩形（最大化/最小化时跳过，保留上次的尺寸位置） */
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        RECT wr;
+        int st = IsIconic(g_hwnd) ? SW_MINIMIZE : IsZoomed(g_hwnd) ? SW_MAXIMIZE : SW_RESTORE;
+        if (st == SW_RESTORE && GetWindowRect(g_hwnd, &wr)) {
+            g_winX = wr.left;  g_winY = wr.top;
+            g_winW = wr.right - wr.left;  g_winH = wr.bottom - wr.top;
+        }
+    }
 
     /* 退出前回收剧集三列的实际宽度 */
     if (g_listEp) {
@@ -9129,8 +9155,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ShowWindow(hwnd, SW_HIDE);
             return 0;
         }
-        g_winW = LOWORD(lParam);
-        g_winH = HIWORD(lParam);
+        /* 这里不再写 g_winW/g_winH——SaveConfig 统一用 GetWindowRect 抓外框矩形 */
         ApplyLayout(hwnd, IsWindowVisible(hwnd));
         UpdateMarquee();   /* 可用宽度变化，重算跑马灯 */
         return 0;
@@ -10224,16 +10249,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
     g_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
 
-    /* 保存的是客户区尺寸，换算成含边框标题栏的窗口外尺寸 */
-    {
-        RECT wr = { 0, 0, g_winW, g_winH };
-        AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
-        hwnd = CreateWindowExW(0, CLASS_NAME, L"LiteTune",
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            wr.right - wr.left, wr.bottom - wr.top,
-            NULL, NULL, hInst, NULL);
-    }
+    /* 直接用保存的外框矩形（含标题栏边框）创建窗口，不走 AdjustWindowRectEx
+     * 避免不同会话边框像素差异导致每次启动窗口变大。首次无保存时 CW_USEDEFAULT */
+    hwnd = CreateWindowExW(0, CLASS_NAME, L"LiteTune",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        g_winX, g_winY,
+        g_winW, g_winH,
+        NULL, NULL, hInst, NULL);
     if (!hwnd) return 1;
     g_hwnd = hwnd;
 
