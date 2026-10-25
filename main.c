@@ -186,7 +186,8 @@ static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
 static HWND g_btnCache;        /* 批量缓存：Ctrl+多选剧集后点击下载 */
-static HWND     g_btnDescTab;      /* 简介折叠/展开小按钮（自绘，悬停才显示） */
+/* 简介折叠/展开小按钮（自绘，悬停才显示） */
+static HWND     g_btnDescTab;
 static int      g_descHidden;      /* 1=简介区隐藏，剧集占满右侧 */
 static int      g_descTabShown;    /* 小按钮当前是否已显示（避免反复 ShowWindow） */
 static RECT     g_rcDescTab;       /* 小按钮矩形（LayoutControls 写入） */
@@ -6347,6 +6348,8 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                     SendMessageW(lv, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
                 }
                 ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+                /* 搜索结果列表也用应用字体，和标签/按钮/编辑框保持一致 */
+                SendMessageW(lv, WM_SETFONT, (WPARAM)g_font, TRUE);
                 /* 条目颜色 */
                 SendMessageW(lv, LVM_SETBKCOLOR, 0, (LPARAM)ThPanel());
                 SendMessageW(lv, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
@@ -6373,6 +6376,7 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                     }
                     if (!g_ibOrigHdrProc)
                         g_ibOrigHdrProc = (WNDPROC)SetWindowLongPtrW(hdr, GWLP_WNDPROC, (LONG_PTR)IbHeaderProc);
+                    SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font, TRUE);
                 }
                 /* 自绘纵向滚动条，贴 ListView 右边；初始隐藏，搜索后由 SyncScrollBar 决定显隐 */
                 g_ibSb = CreateDarkScrollBar(h, lv, 1, 0, ID_IB_SB);
@@ -6422,6 +6426,17 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
                 btnStyle | BS_PUSHBUTTON,
                 348, 74, 72, 26, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+        }
+        /* 弹窗里的按钮必须显式设字体：不设时亮色用系统主题按钮字体，
+         * 暗色自绘回落到 DEFAULT_GUI_FONT（中文系统是宋体 9pt），
+         * 两种模式字号、字形都不同，看着像两套 UI */
+        {
+            static const int kBtnIds[] = { ID_IB_OPML, ID_IB_OK, ID_IB_CANCEL };
+            int bi;
+            for (bi = 0; bi < 3; bi++) {
+                HWND b = GetDlgItem(h, kBtnIds[bi]);
+                if (b) SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
+            }
         }
         SendMessageW(e, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(lab, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -7205,7 +7220,8 @@ static void LayoutControls(HWND hwnd)
         MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
         if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
         /* 缓存按钮：剧集面板内右上、竖向滚条带左侧，边框内侧 */
-        MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by + 2, 24, 24, TRUE);
+        if (g_btnCache)
+            MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by + 2, 24, 24, TRUE);
         x += w1 + GAP_W;
         g_rcPanel[1].left = x;           g_rcPanel[1].top = by;
         g_rcPanel[1].right = x + w2;     g_rcPanel[1].bottom = by + bh;
@@ -7305,6 +7321,16 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         /* 走 ApplyLayout：见/隐简介区会牵动父窗口背景与边框，必须整体重绘，
          * 否则旧滚动条、旧边框会以像素残留的形式留在界面上 */
         ApplyLayout(g_hwnd, 1);
+        /* 折叠/恢复后把剧集列表连同表头（主窗口的孙窗口）整体强制重绘：
+         * 悬浮控件盖过的区域平时画不进去，布局一变会露出旧像素，
+         * 与标题栏换色同理——触发一次完整重绘即可 */
+        if (g_listEp) {
+            HWND hdr = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
+            RedrawWindow(g_listEp, NULL, NULL,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+            if (hdr) RedrawWindow(hdr, NULL, NULL,
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+        }
         DescTabShow(0);   /* 按钮已贴到另一侧，光标不在附近 → 收起 */
         return 0;
 
@@ -7312,7 +7338,7 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         RECT rc;
-        int cx, cy, dx;
+        int cx, cy;
         HBRUSH br = CreateSolidBrush(ThPanel());
         HPEN pn = CreatePen(PS_SOLID, 1, ThDim());
         HBRUSH obr = (HBRUSH)SelectObject(dc, br);
@@ -7324,18 +7350,20 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         DeleteObject(br);
         DeleteObject(pn);
 
-        /* 1px 细 chevron：› 收起 / ‹ 展开（与菜单子项同一画法） */
+        /* 1px 细 chevron：› 收起 / ‹ 展开。从顶点向外逐点镜像铺两条臂，
+         * SetPixel 保证上下严格对称（LineTo 端点排他 + GDI 斜线方向归一化，
+         * 一条线拐着画两臂像素集必然不对称） */
         cx = (rc.left + rc.right) / 2;
         cy = (rc.top + rc.bottom) / 2;
-        dx = g_descHidden ? -3 : 3;
         {
-            HPEN lp = CreatePen(PS_SOLID, 1, ThText());
-            HPEN olp = (HPEN)SelectObject(dc, lp);
-            MoveToEx(dc, cx - dx, cy - 4, NULL);
-            LineTo(dc, cx + dx, cy);
-            LineTo(dc, cx - dx, cy + 4);
-            SelectObject(dc, olp);
-            DeleteObject(lp);
+            COLORREF col = ThText();
+            int vx = cx + (g_descHidden ? -2 : 2);  /* 顶点：‹ 偏左 / › 偏右 */
+            int sx = g_descHidden ? 1 : -1;         /* 臂自顶点向外延伸的方向 */
+            int i;
+            for (i = 0; i <= 4; i++) {
+                SetPixel(dc, vx + sx * i, cy - i, col);
+                SetPixel(dc, vx + sx * i, cy + i, col);
+            }
         }
         EndPaint(h, &ps);
         return 0;
