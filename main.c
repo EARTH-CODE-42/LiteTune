@@ -6269,7 +6269,10 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE: {
         HWND e, lab;
         UINT btnStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-        e = CreateWindowExW(g_darkMode ? 0 : WS_EX_CLIENTEDGE, L"EDIT", L"",
+        /* 只用 WS_BORDER，不加 WS_EX_CLIENTEDGE：Win11 会给带 client edge
+         * 的编辑框在聚焦时补画一条主题色下划线（亮色下就是输入框底部的
+         * 蓝色横条），且与暗色模式的朴素 1px 边框不一致 */
+        e = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
             12, 36, 408, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
