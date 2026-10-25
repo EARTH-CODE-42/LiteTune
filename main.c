@@ -172,6 +172,7 @@ static HWND     g_hwnd;   /* 主窗口句柄 */
 static HFONT    g_font;          /* 8pt+级别 常规 */
 static HFONT    g_fontBold;      /* 8pt+级别 加粗（播客标题） */
 static HFONT    g_fontSmall;     /* 7pt+级别 灰色小字（副标题/格式串） */
+static HFONT    g_menuFont;      /* 系统标准菜单字体（SPI_GETNONCLIENTMETRICS.lfMenuFont） */
 static HBRUSH   g_whiteBrush = NULL;
 static HWND     g_sldSeek, g_stTime;
 static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
@@ -378,6 +379,7 @@ enum {
     TR_CTX_DEL_ALL_CACHE, TR_CTX_OPEN_FOLDER, TR_CTX_DOWNLOAD,
     TR_CTX_DEL_EP_CACHE, TR_REFRESH_QUEUED,
     TR_CTX_COPY_EP_URL, TR_CTX_COPY_FEED_URL,
+    TR_CTX_ADD_POD,
     TR_CLIP_OK, TR_CLIP_FAIL,
     TR_N
 };
@@ -421,7 +423,7 @@ static const wchar_t *tr(int id)
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
-        L"LiteTune  版本 1.3\r\n\r\n"
+        L"LiteTune  版本 1.4\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
             L"纯 C + Win32 API 编写，单文件绿色便携，\r\n不依赖任何第三方 DLL。",
         L"夜间模式已开启", L"夜间模式已关闭", L"字号已切换",
@@ -475,6 +477,7 @@ static const wchar_t *tr(int id)
         L"清空全部缓存", L"打开文件夹", L"下载", L"删除缓存",
         L"已加入刷新队列，稍后自动开始",
         L"复制剧集链接", L"复制 Feed URL",
+        L"添加订阅...",
         L"已复制到剪贴板", L"复制失败"
     };
     static const wchar_t *const en[TR_N] = {
@@ -518,7 +521,7 @@ static const wchar_t *tr(int id)
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
-        L"LiteTune  version 1.3\r\n\r\n"
+        L"LiteTune  version 1.4\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
             L"auto-cache episodes and listen offline.\r\n\r\n"
             L"Written in pure C with Win32 API. One portable executable,\r\n"
@@ -584,6 +587,7 @@ static const wchar_t *tr(int id)
         L"Clear all cache", L"Open folder", L"Download", L"Delete cache",
         L"Added to refresh queue",
         L"Copy episode URL", L"Copy feed URL",
+        L"Add subscription...",
         L"Copied to clipboard", L"Copy failed"
     };
     return (g_lang ? en : zh)[id];
@@ -757,7 +761,6 @@ static int DarkDlgMsg(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
 static LRESULT CALLBACK MsgBoxSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR id, DWORD_PTR ref);
 static void ApplyDarkTitlebar(HWND hwnd, int dark);
-static void ApplyDarkMenus(HWND hwnd, int dark);
 
 static BOOL CALLBACK MsgBoxBtnEnum(HWND btn, LPARAM lp)
 {
@@ -811,7 +814,7 @@ static LRESULT CALLBACK MsgBoxHookProc(int code, WPARAM wp, LPARAM lp)
         SetWindowSubclass(h, MsgBoxSubProc, 1, 0);   /* 同 id 重装即更新 */
         EnumChildWindows(h, MsgBoxBtnEnum, 0);
         ApplyDarkTitlebar(h, g_darkMode);   /* 弹窗标题栏跟随暗色（Win10 1809+） */
-        ApplyDarkMenus(h, g_darkMode);      /* 原生暗色主题（按钮/标题栏由系统渲染） */
+        /* ApplyDarkMenus 已废弃：弹窗菜单很少，且有 ApplyMenuTheme 在 TrackPopupMenu 时处理 */
         /* 子类化前弹窗可能已按系统配色画过一遍（底部按钮区尤甚），
          * 强制整窗按暗色重画 */
         InvalidateRect(h, NULL, TRUE);
@@ -850,57 +853,31 @@ static void UpdateWindowTitle(void)
     SetWindowTextW(g_hwnd, t);
 }
 
-/* Win10 1809+ 暗色标题栏（运行时加载 dwmapi，Win7 上静默失败，无副作用） */
+/* Win10 1809+ 暗色标题栏：DWMWA_USE_IMMERSIVE_DARK_MODE（20H1+ 属性值为 20，
+ * 1809~1903 为 19）。运行时加载 dwmapi，Win7 上静默失败，无副作用。
+ * Win10 的 DWM 收到属性后不会马上重画非客户区（要切一次窗口焦点才刷新），
+ * 因此设完属性后主动模拟一次激活/取消激活，逼 DWM 立即重绘标题栏。 */
 typedef HRESULT (WINAPI *DwmSetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
 static void ApplyDarkTitlebar(HWND hwnd, int dark)
 {
-    HMODULE m = LoadLibraryW(L"dwmapi.dll");
-    if (m) {
-        DwmSetAttrFn p = NULL;
-        *(void**)&p = (void*)GetProcAddress(m, "DwmSetWindowAttribute");
-        if (p) {
-            BOOL on = dark ? TRUE : FALSE;
-            /* 20=DWMWA_USE_IMMERSIVE_DARK_MODE（20H1+），旧版 1903-2004 为 19 */
-            p(hwnd, 20, &on, sizeof(on));
-            p(hwnd, 19, &on, sizeof(on));
-        }
-        FreeLibrary(m);
-    }
-}
+    HMODULE m;
+    DwmSetAttrFn p;
+    BOOL on = dark ? TRUE : FALSE;
+    HRESULT hr;
 
-/* Win10 1809+ 原生暗色菜单/非客户区：uxtheme 未公开接口。
- * 低版本（含 Win7）按序号取不到函数指针 → 全部跳过，回落系统亮色外观；
- * 版本号先放行再按序号取值，避免旧版误取到序号 133/135/136 对应的其它函数 */
-typedef int  (WINAPI *SetPreferredAppModeFn)(int);
-typedef void (WINAPI *FlushMenuThemesFn)(void);
-typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
-static void ApplyDarkMenus(HWND hwnd, int dark)
-{
-    static int inited = 0;
-    static AllowDarkModeForWindowFn pAllow = NULL;
-    static FlushMenuThemesFn pFlush = NULL;
-    if (!inited) {
-        LONG (WINAPI *pRtlGetVersion)(void*);
-        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-        struct { ULONG sz, major, minor, build, plat; WCHAR csd[128]; } vi;
-        inited = 1;
-        pRtlGetVersion = NULL;
-        *(void**)&pRtlGetVersion = nt ? (void*)GetProcAddress(nt, "RtlGetVersion") : NULL;
-        vi.sz = sizeof(vi); vi.major = 0; vi.minor = 0; vi.build = 0; vi.plat = 0; vi.csd[0] = 0;
-        if (pRtlGetVersion && pRtlGetVersion(&vi) == 0
-            && (vi.major > 10 || (vi.major == 10 && vi.build >= 17763))) {
-            HMODULE ux = LoadLibraryW(L"uxtheme.dll");
-            if (ux) {
-                SetPreferredAppModeFn pMode = NULL;
-                *(void**)&pMode = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(135));
-                if (pMode) pMode(1);   /* 1 = AllowDark，菜单跟随本程序自己的夜间开关 */
-                *(void**)&pFlush = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(136));
-                *(void**)&pAllow = (void*)GetProcAddress(ux, MAKEINTRESOURCEA(133));
-            }
+    if (!hwnd) return;
+    m = LoadLibraryW(L"dwmapi.dll");
+    if (!m) return;
+    *(void**)&p = (void*)GetProcAddress(m, "DwmSetWindowAttribute");
+    if (p) {
+        hr = p(hwnd, 20, &on, sizeof(on));
+        if (FAILED(hr)) hr = p(hwnd, 19, &on, sizeof(on));
+        if (SUCCEEDED(hr)) {
+            SendMessageW(hwnd, WM_NCACTIVATE, FALSE, 0);
+            SendMessageW(hwnd, WM_NCACTIVATE, TRUE, 0);
         }
     }
-    if (pAllow) pAllow(hwnd, dark ? TRUE : FALSE);
-    if (pFlush) pFlush();
+    FreeLibrary(m);
 }
 
 /* Tooltip 自绘子类：完全控制背景/文字色，绕过视觉样式下 TTM_SETTIPTEXTCOLOR 失效问题。
@@ -1151,7 +1128,7 @@ static void ApplyTheme(void)
         LayoutControls(g_hwnd);
     }
     ApplyDarkTitlebar(g_hwnd, g_darkMode);
-    ApplyDarkMenus(g_hwnd, g_darkMode);   /* 菜单/非客户区走系统原生暗色渲染 */
+    /* ApplyMenuTheme 在 TrackPopupMenu 调用点才应用（需要具体 HMENU） */
     /* 系统 tooltip 统一主题色（g_ibTip 在 InputBox 初始化处设置，因为定义在本函数之后） */
     {
         HWND tips[] = { g_hwndTip, g_hwndEpTip };
@@ -1900,7 +1877,7 @@ static HINTERNET WinHttpOpenUser(void)
     ZeroMemory(&ie, sizeof(ie));
     if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
         if (ie.lpszProxy && ie.lpszProxy[0]) {
-            s = WinHttpOpen(L"LiteTune/1.3", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            s = WinHttpOpen(L"LiteTune/1.4", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
                 ie.lpszProxy, ie.lpszProxyBypass, 0);
         }
         if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl);
@@ -1908,7 +1885,7 @@ static HINTERNET WinHttpOpenUser(void)
         if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass);
     }
     if (s) return s;
-    return WinHttpOpen(L"LiteTune/1.3",
+    return WinHttpOpen(L"LiteTune/1.4",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 }
@@ -5092,7 +5069,7 @@ static int PhoneServerStart(void)
     for (i = 0; i < nPorts; i++) {
         addr.sin_port = htons(PHONE_PORTS[i]);
         if (bind(g_httpSock, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
-            listen(g_httpSock, 8) == 0) {
+            listen(g_httpSock, 32) == 0) {
             g_httpPort = PHONE_PORTS[i];
             break;
         }
@@ -7963,7 +7940,64 @@ static void CfgSwitchMode(int external)
     }
 }
 
-/* 递归释放 dwItemData 字符串（自绘菜单文字副本） */
+/* ================= 下拉菜单（亮色原生 / 暗色全自绘） ================= */
+/* 暗色模式下所有菜单项（含子菜单）都用 MF_OWNERDRAW，由 MenuMeasureItem /
+ * MenuDrawItem 统一绘制。这样文字颜色、勾选符号、子菜单箭头完全可控，
+ * 不会出现系统在深色底上叠黑字、彩色 ✓ emoji、或无法染色的 ▶ 三角。 */
+typedef struct MenuItemDataS {
+    wchar_t *text;      /* 纯文本（自绘项不使用系统存储的文本） */
+    int isPopup;        /* MF_POPUP：右侧画 chevron */
+    int isChecked;      /* 创建时的 MF_CHECKED：左侧画 √ */
+} MenuItemData;
+
+/* 与系统浅色菜单对齐的列宽：左勾选栏 / 右箭头栏 / 右内边距 */
+#define MENU_CHECK_COL_W  28
+#define MENU_ARROW_COL_W  22
+#define MENU_RIGHT_PAD     6
+
+/* 系统标准菜单字体（懒创建，全程序复用） */
+static HFONT MenuFont(void)
+{
+    if (!g_menuFont) {
+        NONCLIENTMETRICSW ncm;
+        ncm.cbSize = sizeof(ncm);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+            g_menuFont = CreateFontIndirectW(&ncm.lfMenuFont);
+        if (!g_menuFont) g_menuFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    }
+    return g_menuFont;
+}
+
+/* 追加普通项/子菜单项：暗色转成自绘项，亮色保持系统原生 */
+static void MenuAdd(HMENU m, UINT flags, UINT_PTR id, const wchar_t *text)
+{
+    MenuItemData *md;
+    if (!g_darkMode) {
+        AppendMenuW(m, flags | MF_STRING, id, text);
+        return;
+    }
+    md = calloc(1, sizeof(*md));
+    if (!md) {
+        AppendMenuW(m, flags | MF_STRING, id, text);   /* 极端情况退回原生项 */
+        return;
+    }
+    md->text = _wcsdup(text ? text : L"");
+    md->isPopup = (flags & MF_POPUP) != 0;
+    md->isChecked = (flags & MF_CHECKED) != 0;
+    AppendMenuW(m, flags | MF_OWNERDRAW, id, (const wchar_t*)md);
+}
+
+static void MenuAddPopup(HMENU m, HMENU sub, const wchar_t *text, UINT flags)
+{
+    MenuAdd(m, MF_POPUP | (flags & (MF_CHECKED | MF_GRAYED)), (UINT_PTR)sub, text);
+}
+
+static void MenuAddSep(HMENU m)
+{
+    AppendMenuW(m, MF_SEPARATOR | (g_darkMode ? MF_OWNERDRAW : 0), 0, NULL);
+}
+
+/* 递归释放自绘项数据 */
 static void ThemeMenuCleanup(HMENU m)
 {
     int i, n;
@@ -7974,60 +8008,117 @@ static void ThemeMenuCleanup(HMENU m)
         mi.cbSize = sizeof(mi);
         mi.fMask = MIIM_DATA | MIIM_SUBMENU;
         if (!GetMenuItemInfoW(m, i, TRUE, &mi)) continue;
-        if (mi.dwItemData) free((void*)(ULONG_PTR)mi.dwItemData);
+        if (mi.dwItemData) {
+            MenuItemData *md = (MenuItemData*)(ULONG_PTR)mi.dwItemData;
+            free(md->text);
+            free(md);
+        }
         if (mi.hSubMenu) ThemeMenuCleanup(mi.hSubMenu);
     }
 }
 
-/* 递归给菜单树所有 item 设 MFT_OWNERDRAW，文字存 dwItemData */
-static void ThemeMenuRecurse(HMENU m)
-{
-    int i, n = GetMenuItemCount(m);
-    for (i = 0; i < n; i++) {
-        MENUITEMINFOW it;
-        HMENU sub = NULL;
-        ZeroMemory(&it, sizeof(it));
-        it.cbSize = sizeof(it);
-        it.fMask = MIIM_FTYPE | MIIM_SUBMENU;
-        if (!GetMenuItemInfoW(m, i, TRUE, &it)) continue;
-        sub = it.hSubMenu;
-        if (it.fType & MFT_SEPARATOR) {
-            it.fMask = MIIM_FTYPE;
-            it.fType |= MFT_OWNERDRAW;
-            SetMenuItemInfoW(m, i, TRUE, &it);
-        } else {
-            wchar_t buf[256];
-            it.fMask = MIIM_TYPE | MIIM_DATA;
-            it.fType = MFT_STRING;
-            it.dwTypeData = buf; it.cch = 256;
-            if (GetMenuItemInfoW(m, i, TRUE, &it)) {
-                it.fMask = MIIM_FTYPE | MIIM_DATA;
-                it.fType |= MFT_OWNERDRAW;
-                it.dwItemData = (ULONG_PTR)_wcsdup(buf);
-                if (it.dwItemData)
-                    SetMenuItemInfoW(m, i, TRUE, &it);
-            }
-        }
-        if (sub) ThemeMenuRecurse(sub);
-    }
-}
-
-/* 深色模式下给菜单树开启自绘。返回 MIM_BACKGROUND brush 供调用方释放（仅一个）。
- * 浅色模式直接返回 NULL，使用系统原生菜单。 */
+/* 暗色菜单背景：填满菜单窗口和项之间的间隙，MIM_APPLYTOSUBMENUS 同时作用于子菜单 */
 static HBRUSH ApplyMenuTheme(HMENU m)
 {
     HBRUSH bg;
     MENUINFO mi;
     if (!g_darkMode) return NULL;
-    /* 菜单窗口背景：填满菜单项之间的间隙，MIM_APPLYTOSUBMENUS 同时应用到子菜单 */
     bg = CreateSolidBrush(ThPanel());
     ZeroMemory(&mi, sizeof(mi));
     mi.cbSize = sizeof(mi);
     mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
     mi.hbrBack = bg;
     SetMenuInfo(m, &mi);
-    ThemeMenuRecurse(m);
     return bg;
+}
+
+/* 自绘菜单项尺寸：行高与浅色系统菜单一致（更紧凑），列宽留足勾选/箭头 */
+static void MenuMeasureItem(HWND owner, MEASUREITEMSTRUCT *mi)
+{
+    HDC hdc;
+    HFONT old;
+    MenuItemData *md;
+    TEXTMETRICW tm;
+    SIZE sz;
+
+    if (!mi->itemData) {          /* 分隔线 */
+        mi->itemHeight = 8;
+        mi->itemWidth  = 0;
+        return;
+    }
+    md = (MenuItemData*)(ULONG_PTR)mi->itemData;
+    hdc = GetDC(owner);
+    old = (HFONT)SelectObject(hdc, MenuFont());
+    GetTextMetricsW(hdc, &tm);
+    GetTextExtentPoint32W(hdc, md->text, (int)wcslen(md->text), &sz);
+    mi->itemHeight = tm.tmHeight + 6;
+    mi->itemWidth  = sz.cx + MENU_CHECK_COL_W + MENU_ARROW_COL_W + MENU_RIGHT_PAD;
+    SelectObject(hdc, old);
+    ReleaseDC(owner, hdc);
+}
+
+/* 勾选符号：两笔细线组成的简单 √（不使用彩色 emoji/方框） */
+static void MenuDrawCheck(HDC hdc, int cx, int cy, COLORREF clr)
+{
+    HPEN p = CreatePen(PS_SOLID, 2, clr);
+    HGDIOBJ old = SelectObject(hdc, p);
+    MoveToEx(hdc, cx - 5, cy, NULL);
+    LineTo(hdc, cx - 1, cy + 4);
+    LineTo(hdc, cx + 6, cy - 5);
+    SelectObject(hdc, old);
+    DeleteObject(p);
+}
+
+/* 子菜单箭头：细笔画 chevron（›），不是实心三角 */
+static void MenuDrawChevron(HDC hdc, int x, int cy, COLORREF clr)
+{
+    HPEN p = CreatePen(PS_SOLID, 1, clr);
+    HGDIOBJ old = SelectObject(hdc, p);
+    MoveToEx(hdc, x, cy - 5, NULL);
+    LineTo(hdc, x + 4, cy);
+    LineTo(hdc, x, cy + 5);
+    SelectObject(hdc, old);
+    DeleteObject(p);
+}
+
+static void MenuDrawItem(const DRAWITEMSTRUCT *di)
+{
+    RECT rc = di->rcItem;
+    MenuItemData *md = di->itemData ? (MenuItemData*)(ULONG_PTR)di->itemData : NULL;
+    int isSel  = (di->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
+    int isGray = (di->itemState & ODS_GRAYED) != 0;
+    int isChk  = (md && md->isChecked) || (di->itemState & ODS_CHECKED) != 0;
+    int cy = (rc.top + rc.bottom) / 2;
+    COLORREF fg = isGray ? ThDim() : ThText();
+
+    FillRectColor(di->hDC, &rc, isSel ? ThSel() : ThPanel());
+    if (!md) {   /* 分隔线 */
+        HPEN p = CreatePen(PS_SOLID, 1, ThDim());
+        HGDIOBJ old = SelectObject(di->hDC, p);
+        MoveToEx(di->hDC, rc.left + MENU_RIGHT_PAD, cy, NULL);
+        LineTo(di->hDC, rc.right - MENU_RIGHT_PAD, cy);
+        SelectObject(di->hDC, old);
+        DeleteObject(p);
+        return;
+    }
+    if (isChk) MenuDrawCheck(di->hDC, rc.left + MENU_CHECK_COL_W / 2, cy, fg);
+    if (md->isPopup) MenuDrawChevron(di->hDC, rc.right - MENU_RIGHT_PAD - 9, cy, fg);
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, fg);
+    {
+        RECT trc = { rc.left + MENU_CHECK_COL_W, rc.top,
+                     rc.right - MENU_ARROW_COL_W, rc.bottom };
+        HFONT old = (HFONT)SelectObject(di->hDC, MenuFont());
+        DrawTextW(di->hDC, md->text, -1, &trc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(di->hDC, old);
+    }
+    if (md->isPopup) {
+        /* 系统会在 WM_DRAWITEM 返回后再补画一个原生 ▶ 箭头（颜色不可控）：
+         * 画完后把右缘区域从裁剪区排除，系统箭头就被裁掉，只留我们的 chevron */
+        ExcludeClipRect(di->hDC, rc.right - MENU_ARROW_COL_W, rc.top,
+                        rc.right + 32, rc.bottom);
+    }
 }
 
 static void OnSettingsButton(void)
@@ -8046,53 +8137,52 @@ static void OnSettingsButton(void)
     static const int nMins = sizeof(mins) / sizeof(mins[0]);
     int i;
 
-    AppendMenuW(menu, MF_STRING, 1, tr(TR_M_OPEN_CACHE));
-    AppendMenuW(menu, MF_STRING, 2, tr(TR_M_CHANGE_CACHE));
-    AppendMenuW(menu, MF_STRING, 3, tr(TR_M_DEFAULT_CACHE));
+    MenuAdd(menu, 0, 1, tr(TR_M_OPEN_CACHE));
+    MenuAdd(menu, 0, 2, tr(TR_M_CHANGE_CACHE));
+    MenuAdd(menu, 0, 3, tr(TR_M_DEFAULT_CACHE));
     {
         /* 自动清理：关 / 7 / 30 / 90 天，单选勾选 */
         static const int days[] = { 7, 30, 90 };
         HMENU cl = CreatePopupMenu();
         int di;
-        AppendMenuW(cl, MF_STRING | (g_cacheDays == 0 ? MF_CHECKED : 0),
-                    30, tr(TR_CC_OFF));
+        MenuAdd(cl, g_cacheDays == 0 ? MF_CHECKED : 0, 30, tr(TR_CC_OFF));
         for (di = 0; di < 3; di++) {
             wchar_t t[32];
             swprintf(t, 32, tr(TR_CC_DAYS_FMT), days[di]);
-            AppendMenuW(cl, MF_STRING | (g_cacheDays == days[di] ? MF_CHECKED : 0),
-                        31 + di, t);
+            MenuAdd(cl, g_cacheDays == days[di] ? MF_CHECKED : 0, 31 + di, t);
         }
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)cl, tr(TR_M_CACHE_CLEAN));
+        MenuAddPopup(menu, cl, tr(TR_M_CACHE_CLEAN), 0);
     }
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, 22, tr(TR_M_IMPORT));
-    AppendMenuW(exp, MF_STRING, 23, tr(TR_M_EXP_OPML));
-    AppendMenuW(exp, MF_STRING, 24, tr(TR_M_EXP_INI));
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)exp, tr(TR_M_EXPORT));
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_darkMode ? MF_CHECKED : 0), 4, tr(TR_M_NIGHT));
-    AppendMenuW(lang, MF_STRING | (g_lang == 0 ? MF_CHECKED : 0), 20, tr(TR_LANG_ZH));
-    AppendMenuW(lang, MF_STRING | (g_lang == 1 ? MF_CHECKED : 0), 21, tr(TR_LANG_EN));
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)lang, tr(TR_M_LANGUAGE));
-    AppendMenuW(cm, MF_STRING | (g_cfgExternal ? 0 : MF_CHECKED), 25, tr(TR_M_CFG_EMB));
-    AppendMenuW(cm, MF_STRING | (g_cfgExternal ? MF_CHECKED : 0), 26, tr(TR_M_CFG_EXT));
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)cm, tr(TR_M_CFGMODE));
+    MenuAddSep(menu);
+    MenuAdd(menu, 0, 22, tr(TR_M_IMPORT));
+    MenuAdd(exp, 0, 23, tr(TR_M_EXP_OPML));
+    MenuAdd(exp, 0, 24, tr(TR_M_EXP_INI));
+    MenuAddPopup(menu, exp, tr(TR_M_EXPORT), 0);
+    MenuAddSep(menu);
+    MenuAdd(menu, g_darkMode ? MF_CHECKED : 0, 4, tr(TR_M_NIGHT));
+    MenuAdd(lang, g_lang == 0 ? MF_CHECKED : 0, 20, tr(TR_LANG_ZH));
+    MenuAdd(lang, g_lang == 1 ? MF_CHECKED : 0, 21, tr(TR_LANG_EN));
+    MenuAddPopup(menu, lang, tr(TR_M_LANGUAGE), 0);
+    MenuAdd(cm, g_cfgExternal ? 0 : MF_CHECKED, 25, tr(TR_M_CFG_EMB));
+    MenuAdd(cm, g_cfgExternal ? MF_CHECKED : 0, 26, tr(TR_M_CFG_EXT));
+    MenuAddPopup(menu, cm, tr(TR_M_CFGMODE), 0);
     for (i = 0; i < nMins; i++) {
         wchar_t t[32];
         swprintf(t, 32, tr(TR_SHUT_IN_MINS_FMT), mins[i]);
-        AppendMenuW(sub, MF_STRING, 100 + mins[i], t);
+        MenuAdd(sub, 0, 100 + mins[i], t);
     }
-    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(sub, MF_STRING, 8, tr(TR_M_CUSTOM));
-    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(sub, MF_STRING | (g_shutdownAt ? 0 : MF_GRAYED), 5, tr(TR_M_SHUT_CANCEL));
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, tr(TR_M_SHUTDOWN));
+    MenuAddSep(sub);
+    MenuAdd(sub, 0, 8, tr(TR_M_CUSTOM));
+    MenuAddSep(sub);
+    MenuAdd(sub, g_shutdownAt ? MF_CHECKED : (MF_GRAYED | MF_CHECKED), 5, tr(TR_M_SHUT_CANCEL));
+    /* 定时关机生效时，父项左侧也显示 √（与其它多选项一致） */
+    MenuAddPopup(menu, sub, tr(TR_M_SHUTDOWN), g_shutdownAt ? MF_CHECKED : 0);
     swprintf(fontItem, 32, tr(TR_M_FONT_FMT),
         g_fontLevel == 0 ? tr(TR_FONT_S) : g_fontLevel == 1 ? tr(TR_FONT_M) : tr(TR_FONT_L));
-    AppendMenuW(menu, MF_STRING, 6, fontItem);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_httpThread ? MF_CHECKED : 0), 9, tr(TR_M_PHONE));
-    AppendMenuW(menu, MF_STRING, 7, tr(TR_M_ABOUT));
+    MenuAdd(menu, 0, 6, fontItem);
+    MenuAddSep(menu);
+    MenuAdd(menu, g_httpThread ? MF_CHECKED : 0, 9, tr(TR_M_PHONE));
+    MenuAdd(menu, 0, 7, tr(TR_M_ABOUT));
 
     GetCursorPos(&pt);
     {
@@ -8874,23 +8964,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT *mi = (MEASUREITEMSTRUCT*)lParam;
         if (mi->CtlType == ODT_MENU) {
-            /* 自绘菜单项高度：分隔线用小高度，普通项按 g_font */
-            HDC hdc = GetDC(hwnd);
-            HFONT old = (HFONT)SelectObject(hdc, g_font);
-            if (mi->itemData) {
-                TEXTMETRICW tm;
-                SIZE sz;
-                GetTextMetricsW(hdc, &tm);
-                mi->itemHeight = tm.tmHeight + 6;
-                GetTextExtentPoint32W(hdc, (const wchar_t*)mi->itemData,
-                    (int)wcslen((const wchar_t*)mi->itemData), &sz);
-                mi->itemWidth = sz.cx + 40;  /* 左侧勾选区 + padding */
-            } else {
-                mi->itemHeight = 8;   /* 分隔线 */
-                mi->itemWidth  = 0;
-            }
-            SelectObject(hdc, old);
-            ReleaseDC(hwnd, hdc);
+            MenuMeasureItem(hwnd, mi);
             return TRUE;
         }
         if (mi->CtlID == IDC_LIST_POD) {
@@ -8903,52 +8977,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT*)lParam;
         if (di->CtlType == ODT_MENU) {
-            /* 深色模式自绘菜单项（含分隔线） */
-            RECT rc = di->rcItem;
-            const wchar_t *txt = di->itemData ? (const wchar_t*)di->itemData : NULL;
-            int isSel = (di->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
-            int isGray = (di->itemState & ODS_GRAYED) != 0;
-            int isChk  = (di->itemState & ODS_CHECKED) != 0;
-            int isSep  = (txt == NULL);   /* 分隔线无 dwItemData */
-            FillRectColor(di->hDC, &rc, isSel ? ThSel() : ThPanel());
-            if (isSep) {
-                HPEN p = CreatePen(PS_SOLID, 1, ThDim());
-                HGDIOBJ op = SelectObject(di->hDC, p);
-                MoveToEx(di->hDC, rc.left + 4, (rc.top + rc.bottom)/2, NULL);
-                LineTo(di->hDC, rc.right - 4, (rc.top + rc.bottom)/2);
-                SelectObject(di->hDC, op);
-                DeleteObject(p);
-            } else {
-                int chkW = 0;
-                SetBkMode(di->hDC, TRANSPARENT);
-                if (isChk) {
-                    RECT ck = { rc.left + 4, rc.top + 2, rc.left + 16, rc.top + 14 };
-                    HBRUSH bh = CreateSolidBrush(ThBlue());
-                    HPEN cp = CreatePen(PS_SOLID, 1, ThDim());
-                    SelectObject(di->hDC, cp);
-                    SelectObject(di->hDC, bh);
-                    Rectangle(di->hDC, ck.left, ck.top, ck.right, ck.bottom);
-                    SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
-                    {
-                        HPEN gp = CreatePen(PS_SOLID, 2, RGB(255,255,255));
-                        SelectObject(di->hDC, gp);
-                        MoveToEx(di->hDC, ck.left+3, ck.top+5, NULL);
-                        LineTo(di->hDC,   ck.left+7, ck.top+9);
-                        LineTo(di->hDC,   ck.left+12, ck.top+3);
-                        DeleteObject(gp);
-                    }
-                    DeleteObject(bh); DeleteObject(cp);
-                    chkW = 16;
-                }
-                SetTextColor(di->hDC, isGray ? ThDim() : ThText());
-                SetBkMode(di->hDC, TRANSPARENT);
-                {
-                    RECT trc = { rc.left + 4 + chkW + 8, rc.top, rc.right - 4, rc.bottom };
-                    SelectObject(di->hDC, g_font);
-                    DrawTextW(di->hDC, txt, -1, &trc,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                }
-            }
+            MenuDrawItem(di);
             return TRUE;
         }
         if (di->CtlType == ODT_BUTTON) {
@@ -9348,7 +9377,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         pt.y = GET_Y_LPARAM(lParam);
 
         if (src == g_listPod) {
-            /* 播客列表右键：先选中该行，让用户看清正在操作谁 */
+            /* 播客列表右键：先选中该行，让用户看清正在操作谁；空白处弹添加订阅菜单 */
             POINT cl = pt;
             int item, cmd;
             DWORD v;
@@ -9356,22 +9385,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ScreenToClient(g_listPod, &cl);
             v = (DWORD)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0,
                                     MAKELPARAM(cl.x, cl.y));
-            if (HIWORD(v)) break;            /* 点在空白处 */
+            if (HIWORD(v)) {
+                /* 点在空白处：弹极简菜单 */
+                m = CreatePopupMenu();
+                MenuAdd(m, 0, 100, tr(TR_CTX_ADD_POD));
+                SetForegroundWindow(hwnd);
+                {
+                    HBRUSH bg = ApplyMenuTheme(m);
+                    cmd = TrackPopupMenu(m,
+                        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                        pt.x, pt.y, 0, hwnd, NULL);
+                    ThemeMenuCleanup(m);
+                    if (bg) DeleteObject(bg);
+                }
+                DestroyMenu(m);
+                if (cmd == 100) AskAddFeed();
+                break;
+            }
             item = (int)LOWORD(v);
             if (item < 0 || item > g_podCount) break;
             SendMessageW(g_listPod, LB_SETCURSEL, item, 0);
             SelectPodcast(item);
             m = CreatePopupMenu();
             if (item < g_podCount) {
-                AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_REFRESH));
-                AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DELETE_POD));
-                AppendMenuW(m, MF_STRING, 3, tr(TR_CTX_DEL_POD_CACHE));
-                AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(m, MF_STRING, 6, tr(TR_CTX_COPY_FEED_URL));
+                MenuAdd(m, 0, 1, tr(TR_CTX_REFRESH));
+                MenuAdd(m, 0, 2, tr(TR_CTX_DELETE_POD));
+                MenuAdd(m, 0, 3, tr(TR_CTX_DEL_POD_CACHE));
+                MenuAddSep(m);
+                MenuAdd(m, 0, 6, tr(TR_CTX_COPY_FEED_URL));
             } else {
                 int cacheN = g_cachePod.epCount;
-                AppendMenuW(m, MF_STRING | (cacheN ? 0 : MF_GRAYED), 4, tr(TR_CTX_DEL_ALL_CACHE));
-                AppendMenuW(m, MF_STRING, 5, tr(TR_CTX_OPEN_FOLDER));
+                MenuAdd(m, cacheN ? 0 : MF_GRAYED, 4, tr(TR_CTX_DEL_ALL_CACHE));
+                MenuAdd(m, 0, 5, tr(TR_CTX_OPEN_FOLDER));
             }
             SetForegroundWindow(hwnd);
             {
@@ -9420,10 +9465,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (!e || !e->url) break;
             cached = e->localFile || EpisodeIsCached(e);
             m = CreatePopupMenu();
-            if (cached) AppendMenuW(m, MF_STRING, 2, tr(TR_CTX_DEL_EP_CACHE));
-            else        AppendMenuW(m, MF_STRING, 1, tr(TR_CTX_DOWNLOAD));
-            AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(m, MF_STRING, 3, tr(TR_CTX_COPY_EP_URL));
+            if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
+            else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
+            MenuAddSep(m);
+            MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
             SetForegroundWindow(hwnd);
             {
                 HBRUSH bg = ApplyMenuTheme(m);
@@ -10051,8 +10096,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (LOWORD(lParam) == WM_RBUTTONUP) {
             POINT pt;
             HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, 1, tr(TR_TRAY_SHOW));
-            AppendMenuW(m, MF_STRING, 2, tr(TR_TRAY_EXIT));
+            MenuAdd(m, 0, 1, tr(TR_TRAY_SHOW));
+            MenuAdd(m, 0, 2, tr(TR_TRAY_EXIT));
             GetCursorPos(&pt);
             SetForegroundWindow(hwnd);   /* 让菜单能正常消失 */
             {
@@ -10166,6 +10211,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     INITCOMMONCONTROLSEX icc;
 
     (void)hPrev; (void)lpCmdLine;
+
+    /* DPI 感知（Per-Monitor V2）— Win10+ 动态调用，Win7 上静默失败
+     * 修复高 DPI 缩放下界面模糊、配置弹窗文字被截断的问题。
+     * 注意：启用后所有 GetSystemMetrics / CreateWindow 的尺寸都是物理像素，
+     * 不再有虚拟化补偿；本程序所有硬编码像素值在当前 100% 设计尺度下没问题。 */
+    {
+        typedef BOOL (WINAPI *SetDpiAwareCtxFn)(int);
+        HMODULE us = GetModuleHandleW(L"user32.dll");
+        if (us) {
+            SetDpiAwareCtxFn p = NULL;
+            *(void**)&p = (void*)GetProcAddress(us, "SetProcessDpiAwarenessContext");
+            if (p) p(0xFFFFFFFE);   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+        }
+    }
 
     /* 单实例：重复启动时把已运行的窗口带到前台后退出，避免双开互相干扰（配置内嵌 exe 尾部） */
     {
