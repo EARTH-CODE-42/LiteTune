@@ -36,6 +36,7 @@ English | [简体中文](README.md)
 - RSS podcast subscription management (add / delete / reorder / refresh), single-instance
 - **Context menus**: right-click a podcast to refresh / delete / clear its cache; right-click the Cached row to clear all cache or open the folder; right-click an episode to download or delete its cache (right-click also selects the row)
 - Episode list (title, date, duration; sortable by column headers); the cached view adds a sortable Podcast column
+- **Collapsible description pane**: a slim floating handle appears at the middle of the pane's left edge only on hover — click it to hide the description on the right and let the episode list fill the space; once hidden, the handle moves to the episode list's right edge (its arrow flips to `‹`) to bring it back. The collapsed state is remembered in the config, with matching handles in both light and dark themes
 - Online playback and local caching: audio auto-downloads to the cache folder, listen offline without network
 - **Local cache view**: the last row of the podcast list, “Cached (N)”, opens a browsable list of every downloaded episode — no network involved, ideal offline
 - **Feed cache**: RSS and cover art cached locally — instant startup from cache (no network needed), browse feeds offline; manual refresh fetches the latest and falls back to cache on failure (list is never cleared)
@@ -110,6 +111,7 @@ Both modes use exactly the same config format (identical to the legacy `feeds.in
 sort=date:desc        ; sort column: title/date/duration, direction: asc/desc
 w1=323                ; podcast column width (per-mille)
 w2=383                ; episode column width (per-mille)
+deschide=1            ; description pane collapsed (1 = hidden, written only when collapsed)
 cw0=110               ; episode list column widths in pixels
 cw1=88
 cw2=44

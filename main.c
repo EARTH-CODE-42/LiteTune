@@ -34,6 +34,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <winhttp.h>
 #include <propidl.h>
 #include <propsys.h>
@@ -154,7 +155,8 @@ enum {
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
     IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
-    IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H
+    IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
+    IDC_TAB_DESC
 };
 
 /* ================= 全局状态 ================= */
@@ -183,7 +185,11 @@ static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAIN
 static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
-static HWND     g_btnCache;        /* 批量缓存：Ctrl+多选剧集后点击下载 */
+static HWND g_btnCache;        /* 批量缓存：Ctrl+多选剧集后点击下载 */
+static HWND     g_btnDescTab;      /* 简介折叠/展开小按钮（自绘，悬停才显示） */
+static int      g_descHidden;      /* 1=简介区隐藏，剧集占满右侧 */
+static int      g_descTabShown;    /* 小按钮当前是否已显示（避免反复 ShowWindow） */
+static RECT     g_rcDescTab;       /* 小按钮矩形（LayoutControls 写入） */
 
 /* 倍速：整数存 100 倍，避免浮点；默认 100=1.0x */
 static int      g_speed = 100;
@@ -1099,7 +1105,8 @@ static void ApplyTheme(void)
         g_sldSeek, g_sldVol, g_stTime, g_stVol, g_stFormat,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
-        g_listPod, g_listEp, g_editDesc, g_vsPod, g_vsEp, g_vsDesc
+        g_listPod, g_listEp, g_editDesc, g_vsPod, g_vsEp, g_vsDesc,
+        g_btnDescTab
     };
     int i;
     if (g_hwnd) {
@@ -1245,6 +1252,7 @@ static void DrawScrollArrow(HDC hdc, const RECT *r, int dir, COLORREF col)
 /* ================= 自绘滚动条控件 ================= */
 /* 真正的子窗口，不是事后覆盖。直接画暗色，永不闪白。 */
 #define DSB_CLASS L"LiteTuneScrollBar"
+#define DESC_TAB_CLASS L"LiteTuneDescTab"
 /* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
 #define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
 
@@ -1618,6 +1626,13 @@ static void SyncScrollBar(HWND hbar)
     ShowWindow(hbar, scrollable ? SW_SHOW : SW_HIDE);
     if (dsb->thumbLen != oldLen || dsb->thumbPos != oldPos)
         InvalidateRect(hbar, NULL, FALSE);
+}
+
+/* 简介区的滚条只在简介可见时同步：SyncScrollBar 会按内容重新 ShowWindow，
+ * 简介关闭后若还调它，会把条弹回旧位置，屏幕上就像留了一条残影 */
+static void SyncDescScrollBar(void)
+{
+    if (!g_descHidden) SyncScrollBar(g_vsDesc);
 }
 
 /* 暗色表头自绘（WM_DRAWITEM/ODT_HEADER 由表头的父窗口 ListView 接收） */
@@ -2984,6 +2999,7 @@ static void ParseConfigLine(char *line)
         if (strcmp(s, "sort") == 0) ParseSortValue(val);
         else if (strcmp(s, "w1") == 0) g_w1perm = atoi(val);
         else if (strcmp(s, "w2") == 0) g_w2perm = atoi(val);
+        else if (strcmp(s, "deschide") == 0) g_descHidden = (atoi(val) != 0);
         else if (strcmp(s, "vol") == 0) { g_volume = atoi(val); if (g_volume < 0) g_volume = 0; if (g_volume > 100) g_volume = 100; }
         else if (strcmp(s, "winw") == 0) g_winW = atoi(val);
         else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
@@ -3299,6 +3315,7 @@ static char *BuildConfigText(DWORD *lenOut)
     SbAddf(&sb, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
     SbAddf(&sb, "w1=%d\n", g_w1perm);
     SbAddf(&sb, "w2=%d\n", g_w2perm);
+    if (g_descHidden) SbAddf(&sb, "deschide=1\n");
     SbAddf(&sb, "cw0=%d\n", g_colW[0]);
     SbAddf(&sb, "cw1=%d\n", g_colW[1]);
     SbAddf(&sb, "cw2=%d\n", g_colW[2]);
@@ -4976,7 +4993,13 @@ static DWORD WINAPI PhoneServerThread(LPVOID p)
     while (!g_httpStop) {
         SOCKET c = accept(g_httpSock, NULL, NULL);
         HANDLE th;
-        if (c == INVALID_SOCKET) break;   /* 监听 socket 被关闭 → 退出 */
+        if (c == INVALID_SOCKET) {
+            /* 监听 socket 被关闭 → 退场退出；其它瞬时错误（如 WSAENOBUFS）
+             * 只歇一下继续，不能让服务线程悄悄死掉（表现为手机一直超时） */
+            if (g_httpStop || g_httpSock == INVALID_SOCKET) break;
+            Sleep(100);
+            continue;
+        }
         th = CreateThread(NULL, 0, PhoneClientThread, (LPVOID)(UINT_PTR)c, 0, NULL);
         if (th) CloseHandle(th);
         else closesocket(c);
@@ -4984,10 +5007,14 @@ static DWORD WINAPI PhoneServerThread(LPVOID p)
     return 0;
 }
 
-/* 防火墙里是否已有 LiteTune 的入站规则（netsh 输出含规则名即存在；无需管理员） */
+/* 防火墙规则是否存在，且指向当前 exe。
+ * 只按规则名判断不够：复制或移动过 exe 时，旧规则指向别的路径，本机浏览器
+ * 能打开页面，局域网却会被防火墙直接拦掉（手机一直转圈/超时）。
+ * netsh verbose 输出带 Program: 完整路径，按路径再校验一次。 */
 static int FirewallRuleExists(void)
 {
-    char tmp[MAX_PATH], cmd[700], buf[3000];
+    char tmp[MAX_PATH], cmd[760], buf[4096], exeA[MAX_PATH * 2];
+    wchar_t exeW[MAX_PATH];
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     HANDLE hf;
@@ -4997,7 +5024,7 @@ static int FirewallRuleExists(void)
     strncat(tmp, "ltfw.txt", sizeof(tmp) - strlen(tmp) - 1);
     DeleteFileA(tmp);
     snprintf(cmd, sizeof(cmd),
-        "cmd /c netsh advfirewall firewall show rule name=\"LiteTune Phone\" "
+        "cmd /c netsh advfirewall firewall show rule name=\"LiteTune Phone\" verbose "
         "> \"%s\" 2>&1", tmp);
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -5015,7 +5042,12 @@ static int FirewallRuleExists(void)
     if (hf != INVALID_HANDLE_VALUE) {
         if (ReadFile(hf, buf, sizeof(buf) - 1, &got, NULL) && got > 0) {
             buf[got] = 0;
-            if (strstr(buf, "LiteTune Phone")) found = 1;
+            /* 重定向文件由 cmd 按控制台 OEM 编码写入，路径也按 OEM 编码比较 */
+            if (GetModuleFileNameW(NULL, exeW, MAX_PATH) &&
+                WideCharToMultiByte(CP_OEMCP, 0, exeW, -1, exeA, sizeof(exeA),
+                                    NULL, NULL) > 0 &&
+                StrStrIA(buf, "LiteTune Phone") && StrStrIA(buf, exeA))
+                found = 1;
         }
         CloseHandle(hf);
     }
@@ -5322,7 +5354,7 @@ static void SelectPodcast(int idx)
         }
         SyncScrollBar(g_vsEp);
         SyncScrollBar(g_hsEp);
-        SyncScrollBar(g_vsDesc);
+        SyncDescScrollBar();
         return;
     }
     SortPodcast(&g_pods[idx]);
@@ -5330,7 +5362,7 @@ static void SelectPodcast(int idx)
     ShowPodcastDetail(idx);
     SyncScrollBar(g_vsEp);
     SyncScrollBar(g_hsEp);
-    SyncScrollBar(g_vsDesc);
+    SyncDescScrollBar();
 }
 
 static void SelectEpisode(int idx)
@@ -5339,7 +5371,7 @@ static void SelectEpisode(int idx)
     if (!p || idx < 0 || idx >= p->epCount) return;
     g_curEp = idx;
     ShowEpisodeDetail(g_curPod, idx);
-    SyncScrollBar(g_vsDesc);
+    SyncDescScrollBar();
 }
 
 /* 点击列头：同列切换方向，换列用默认方向（日期/时长降序，标题升序） */
@@ -6282,13 +6314,13 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (g_darkMode) btnStyle |= BS_OWNERDRAW;
         if (g_ibMode == 0) {
             /* 客户区 432px，margin 12px 两边 → 可用 408px
-             * 3 按钮: OPML 160 + gap36 + OK 88 + gap36 + Cancel 88 = 408px（对称） */
+             * OPML 160 靠左，确定/取消靠右成对：OK 88 + gap 8 + Cancel 88 */
             CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
                 btnStyle | BS_PUSHBUTTON,
                 12, 70, 160, 24, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
             CreateWindowExW(0, L"BUTTON", tr(TR_OK),
                 btnStyle | BS_DEFPUSHBUTTON,
-                208, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+                236, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
             CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
                 btnStyle | BS_PUSHBUTTON,
                 332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
@@ -7057,15 +7089,32 @@ static void SubclassForFontWheel(HWND w)
 
 /* ================= 可拖动分隔条 ================= */
 #define SPLIT_MINPX  90    /* 每列最小像素宽 */
+#define DESC_TAB_W   14    /* 简介折叠按钮宽（跨在面板边界上，一半在缝里） */
+#define DESC_TAB_H   40    /* 简介折叠按钮高 */
 static int g_dragSplit = -1;   /* -1=无 0=第一根 1=第二根 */
 
 static void LayoutControls(HWND hwnd);   /* 前置声明 */
+
+/* 三面板像素宽度：简介隐藏时剧集吃掉简介那份宽度 */
+static void PanelWidthsPx(int totalW, int *w1, int *w2, int *w3)
+{
+    *w1 = totalW * g_w1perm / 1000;
+    if (g_descHidden) {
+        /* 简介隐藏：剧集占据简介那份宽度，并连同原第二道缝隙一起占满，
+         * 面板右缘与窗口右边距对齐（否则右侧会留下一条空白带） */
+        *w2 = totalW - *w1 + GAP_W;
+        *w3 = 0;
+    } else {
+        *w2 = totalW * g_w2perm / 1000;
+        *w3 = totalW - *w1 - *w2;
+    }
+}
 
 /* 返回 (x,y) 命中的分隔条；-1=未命中 */
 static int SplitterHitTest(HWND hwnd, int x, int y)
 {
     RECT rc;
-    int W, H, totalW, w1, w2, by, bh;
+    int W, H, totalW, w1, w2, w3, by, bh;
     int s1, s2;
     GetClientRect(hwnd, &rc);
     W = rc.right; H = rc.bottom;
@@ -7074,12 +7123,11 @@ static int SplitterHitTest(HWND hwnd, int x, int y)
     by += 28;   /* 播客工具栏占去顶部 28px，分隔条只在列表区域生效 */
     if (y < by || y > by + bh - 28) return -1;
     totalW = W - 2*MARGIN - 2*GAP_W;
-    w1 = totalW * g_w1perm / 1000;
-    w2 = totalW * g_w2perm / 1000;
+    PanelWidthsPx(totalW, &w1, &w2, &w3);
     s1 = MARGIN + w1 + GAP_W / 2;
     s2 = MARGIN + w1 + GAP_W + w2 + GAP_W / 2;
     if (abs(x - s1) <= 4) return 0;
-    if (abs(x - s2) <= 4) return 1;
+    if (!g_descHidden && abs(x - s2) <= 4) return 1;   /* 简介隐藏时没有第二条分隔 */
     return -1;
 }
 
@@ -7138,9 +7186,7 @@ static void LayoutControls(HWND hwnd)
     bh = H - by - MARGIN;
     if (bh < 40) bh = 40;
     totalW = W - 2*MARGIN - 2*GAP_W;
-    w1 = totalW * g_w1perm / 1000;
-    w2 = totalW * g_w2perm / 1000;
-    w3 = totalW - w1 - w2;
+    PanelWidthsPx(totalW, &w1, &w2, &w3);
 
     /* 播客列顶部工具栏（+/×/刷新/目录），列表向下让出 28px */
     x = MARGIN;
@@ -7167,16 +7213,135 @@ static void LayoutControls(HWND hwnd)
         if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 2, sbw, bh - sbh - 4, TRUE);
         if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
         x += w2 + GAP_W;
-        g_rcPanel[2].left = x;           g_rcPanel[2].top = by;
-        g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
-        MoveWindow(g_editDesc, x + 2, by + 2, w3 - sbw - 4, bh - 4, TRUE);
-        if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, by + 2, sbw, bh - 4, TRUE);
+        if (g_descHidden) {
+            SetRectEmpty(&g_rcPanel[2]);
+            ShowWindow(g_editDesc, SW_HIDE);
+            if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
+        } else {
+            g_rcPanel[2].left = x;           g_rcPanel[2].top = by;
+            g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
+            MoveWindow(g_editDesc, x + 2, by + 2, w3 - sbw - 4, bh - 4, TRUE);
+            if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, by + 2, sbw, bh - 4, TRUE);
+            ShowWindow(g_editDesc, SW_SHOWNA);
+            if (g_vsDesc) ShowWindow(g_vsDesc, SW_SHOWNA);
+        }
+    }
+    /* 简介折叠按钮：贴在简介左缘中段；简介关闭后贴到剧集列表右缘中段 */
+    if (g_btnDescTab) {
+        RECT pr = g_rcPanel[g_descHidden ? 1 : 2];
+        int tx, ty;
+        if (g_descHidden) {
+            /* 贴在竖向滚条左侧：跨在滚条上会挡住拖动，还会显得像残留物 */
+            tx = pr.right - 2 - DSB_W - DESC_TAB_W;
+        } else {
+            /* 跨在简介左缘（一半在缝里） */
+            tx = pr.left - DESC_TAB_W / 2;
+        }
+        ty = (pr.top + pr.bottom - DESC_TAB_H) / 2;
+        g_rcDescTab.left = tx;             g_rcDescTab.top = ty;
+        g_rcDescTab.right = tx + DESC_TAB_W; g_rcDescTab.bottom = ty + DESC_TAB_H;
+        MoveWindow(g_btnDescTab, tx, ty, DESC_TAB_W, DESC_TAB_H, TRUE);
+        SetWindowPos(g_btnDescTab, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (!g_descTabShown) ShowWindow(g_btnDescTab, SW_HIDE);
     }
     /* 缓存按钮压到剧集列表之上（列表创建晚于按钮，z-order 更高；
      * 配合列表的 WS_CLIPSIBLINGS，列表重绘不会再盖住按钮） */
     if (g_btnCache)
         SetWindowPos(g_btnCache, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+/* ================= 简介折叠按钮 ================= */
+/* 悬停才出现的窄条按钮：简介显示时贴在左缘画 ›，点击收起简介；
+ * 收起后贴到剧集右缘画 ‹，点击恢复。只走鼠标，不进 Tab 焦点链。 */
+static void DescTabShow(int show)
+{
+    if (!g_btnDescTab || show == g_descTabShown) return;
+    g_descTabShown = show;
+    ShowWindow(g_btnDescTab, show ? SW_SHOWNA : SW_HIDE);
+    if (show) {
+        SetWindowPos(g_btnDescTab, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        InvalidateRect(g_btnDescTab, NULL, TRUE);
+    }
+}
+
+/* 每次定时器触发：光标靠近按钮（矩形外扩一圈）才显示 */
+static void DescTabHoverTick(HWND hwnd)
+{
+    POINT p;
+    RECT z;
+    int nearIt = 0;
+    if (!g_btnDescTab) return;
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) nearIt = 0;
+    else if (!IsRectEmpty(&g_rcDescTab) && GetCursorPos(&p)) {
+        ScreenToClient(hwnd, &p);
+        z = g_rcDescTab;
+        InflateRect(&z, 16, 14);
+        nearIt = PtInRect(&z, p);
+    }
+    DescTabShow(nearIt);
+}
+
+static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)wp;
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            SetCursor(LoadCursorW(NULL, IDC_HAND));
+            return TRUE;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        g_descHidden = !g_descHidden;
+        /* 简介关闭时焦点若还在简介编辑框里，先交还主窗口，避免输入进了看不见的控件 */
+        if (g_descHidden && g_editDesc && GetFocus() == g_editDesc) SetFocus(g_hwnd);
+        /* 走 ApplyLayout：见/隐简介区会牵动父窗口背景与边框，必须整体重绘，
+         * 否则旧滚动条、旧边框会以像素残留的形式留在界面上 */
+        ApplyLayout(g_hwnd, 1);
+        DescTabShow(0);   /* 按钮已贴到另一侧，光标不在附近 → 收起 */
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        int cx, cy, dx;
+        HBRUSH br = CreateSolidBrush(ThPanel());
+        HPEN pn = CreatePen(PS_SOLID, 1, ThDim());
+        HBRUSH obr = (HBRUSH)SelectObject(dc, br);
+        HPEN opn = (HPEN)SelectObject(dc, pn);
+        GetClientRect(h, &rc);
+        RoundRect(dc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, 10, 10);
+        SelectObject(dc, obr);
+        SelectObject(dc, opn);
+        DeleteObject(br);
+        DeleteObject(pn);
+
+        /* 1px 细 chevron：› 收起 / ‹ 展开（与菜单子项同一画法） */
+        cx = (rc.left + rc.right) / 2;
+        cy = (rc.top + rc.bottom) / 2;
+        dx = g_descHidden ? -3 : 3;
+        {
+            HPEN lp = CreatePen(PS_SOLID, 1, ThText());
+            HPEN olp = (HPEN)SelectObject(dc, lp);
+            MoveToEx(dc, cx - dx, cy - 4, NULL);
+            LineTo(dc, cx + dx, cy);
+            LineTo(dc, cx - dx, cy + 4);
+            SelectObject(dc, olp);
+            DeleteObject(lp);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
 }
 
 /* ================= 方形图标按钮（owner-draw） ================= */
@@ -8843,7 +9008,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         g_editDesc = CreateWindowExW(0, L"EDIT", NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
@@ -8852,6 +9017,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_vsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 0, IDC_SB_EP);
         g_hsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 1, IDC_SB_EP_H);
         g_vsDesc = CreateDarkScrollBar(hwnd, g_editDesc, 2, 0, IDC_SB_DESC);
+
+        /* 简介折叠按钮：悬停才显示，位置由 LayoutControls 每次布局写入 */
+        g_btnDescTab = CreateWindowExW(0, DESC_TAB_CLASS, L"",
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_TAB_DESC, NULL, NULL);
 
         ApplyFontsToControls();
 
@@ -8879,6 +9049,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnCache);
 
         SetTimer(hwnd, 1, 500, NULL);
+        SetTimer(hwnd, 5, 150, NULL);   /* 简介折叠按钮的悬停探测 */
 
         /* 媒体键（全局热键）：播放/暂停、停止、上一曲、下一曲。
          * 失败不影响主功能（可能被其他程序占用） */
@@ -9227,17 +9398,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_MOUSEMOVE:
         if (g_dragSplit >= 0) {
             RECT rc;
-            int totalW, w1px, w2px;
+            int totalW, w1px, w2px, w3px;
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             GetClientRect(hwnd, &rc);
             totalW = rc.right - 2*MARGIN - 2*GAP_W;
-            w1px = totalW * g_w1perm / 1000;
-            w2px = totalW * g_w2perm / 1000;
+            PanelWidthsPx(totalW, &w1px, &w2px, &w3px);
+            (void)w3px;
             if (g_dragSplit == 0) {
                 w1px = pt.x - MARGIN - GAP_W/2;
                 if (w1px < SPLIT_MINPX) w1px = SPLIT_MINPX;
-                if (w1px > totalW - w2px - SPLIT_MINPX)
-                    w1px = totalW - w2px - SPLIT_MINPX;
+                /* 简介隐藏时剧集面板吃满剩余宽度，上限按总宽算；
+                 * 正常模式下要给简介面板留出最小宽度 */
+                if (w1px > (g_descHidden ? totalW - SPLIT_MINPX
+                                         : totalW - w2px - SPLIT_MINPX))
+                    w1px = g_descHidden ? totalW - SPLIT_MINPX
+                                        : totalW - w2px - SPLIT_MINPX;
                 g_w1perm = w1px * 1000 / totalW;
             } else {
                 w2px = pt.x - MARGIN - w1px - 3*GAP_W/2;
@@ -9696,11 +9871,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RestoreBaseStatus();
             return 0;
         }
+        if (wParam == 5) {
+            DescTabHoverTick(hwnd);
+            return 0;
+        }
         /* 滚动条跟随内容/滚动实时刷新（自绘条是唯一滚动条） */
         SyncScrollBar(g_vsPod);
         SyncScrollBar(g_vsEp);
         SyncScrollBar(g_hsEp);
-        SyncScrollBar(g_vsDesc);
+        /* 简介区关闭时不要再同步它的滚条：SyncScrollBar 会按内容重新
+         * ShowWindow，把已隐藏的条弹回旧位置，看起来像一条残留 */
+        SyncDescScrollBar();
         if (g_playState == 1 && !g_seeking && g_player) {
             long long pos = PlayerGet100ns(0);
             long long dur = PlayerGet100ns(1);
@@ -10306,6 +10487,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.lpszClassName = FLY_CLASS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(RGB(45, 45, 52));   /* 暗底与按钮一致 */
+    RegisterClassExW(&wc);
+
+    /* 注册简介折叠按钮窗口类 */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DescTabProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = DESC_TAB_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
     RegisterClassExW(&wc);
 
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
