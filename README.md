@@ -34,7 +34,8 @@
 
 ## 演示视频
 
-[▶ 观看演示视频](<280KB 的 Windows 播客播放器 - 免安装 手机遥控 离线缓存.mp4>)（约 3.6 MB）：免安装、手机遥控、离线缓存全流程。
+免安装、手机遥控、离线缓存全流程：
+https://github.com/EARTH-CODE-42/LiteTune/blob/main/280KB%20%E7%9A%84%20Windows%20%E6%92%AD%E5%AE%A2%E6%92%AD%E6%94%BE%E5%99%A8%20-%20%E5%85%8D%E5%AE%89%E8%A3%85%20%E6%89%8B%E6%9C%BA%E9%81%A5%E6%8E%A7%20%E7%A6%BB%E7%BA%BF%E7%BC%93%E5%AD%98.mp4
 
 ## 功能
 
