@@ -3733,37 +3733,36 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     if (r->url) {
         CachePathFor(r->url, cache, MAX_PATH);
         EnsureCacheDir();
-        if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
-            r->ok = 1;  /* 已缓存 */
-        } else {
-            /* 批量线程可能正在写同一文件：等锁；等待期间被切歌/停止（gen 作废）
-             * 就直接放弃，不做无意义下载。gotLock 与 gen 分开判定，保证
-             * 拿到的锁一定释放，即使 gen 在拿到锁的瞬间作废 */
-            int gotLock = 0;
-            while (!gotLock) {
-                if (InterlockedCompareExchange(&g_dlGen, 0, 0) != job->gen) break;
-                if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
-                Sleep(300);
-            }
-            if (gotLock) {
-                if (InterlockedCompareExchange(&g_dlGen, 0, 0) == job->gen) {
-                    if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
-                        r->ok = 1;  /* 对方刚写完，直接可用 */
-                    } else {
-                        data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS,
-                                         &job->reqSlot, &job->gen);
-                        if (data && len > 0) {
-                            f = _wfopen(cache, L"wb");
-                            if (f) {
-                                r->ok = (fwrite(data, 1, len, f) == len);
-                                fclose(f);
-                            }
+        /* 一律先拿路径锁再判文件存在：批量线程先把整集下载到内存再
+         * fopen+fwrite 落盘，fwrite 窗口内文件已存在但只是半成品，
+         * 锁前判存在会播到截断文件；锁内双检则必然看到完整文件。
+         * 等待期间被切歌/停止（gen 作废）就直接放弃，不做无意义下载。
+         * gotLock 与 gen 分开判定，保证拿到的锁一定释放，
+         * 即使 gen 在拿到锁的瞬间作废 */
+        int gotLock = 0;
+        while (!gotLock) {
+            if (InterlockedCompareExchange(&g_dlGen, 0, 0) != job->gen) break;
+            if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
+            Sleep(300);
+        }
+        if (gotLock) {
+            if (InterlockedCompareExchange(&g_dlGen, 0, 0) == job->gen) {
+                if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+                    r->ok = 1;  /* 已缓存（含批量线程刚写完的） */
+                } else {
+                    data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS,
+                                     &job->reqSlot, &job->gen);
+                    if (data && len > 0) {
+                        f = _wfopen(cache, L"wb");
+                        if (f) {
+                            r->ok = (fwrite(data, 1, len, f) == len);
+                            fclose(f);
                         }
-                        free(data);
                     }
+                    free(data);
                 }
-                DlPathRelease(cache);
             }
+            DlPathRelease(cache);
         }
     }
     free(job);
@@ -3781,6 +3780,7 @@ typedef struct {
     HANDLE              thread;      /* NULL=线程未启动/已回收 */
     wchar_t           **urls;        /* 动态数组，UI 线程 realloc 追加 */
     int                 cap, count, head;   /* head=已取出数，只增不减 */
+    int                 doneCount;          /* 已下完数（≠head：取出后还在下载） */
     int                 okCount;
     int                 truncated;   /* 选中数超过 256 上限时置 1 */
     volatile LONG       cancel;      /* 1=停止：中断当前下载并丢弃剩余队列 */
@@ -3850,6 +3850,7 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
         }
         EnterCriticalSection(&bc->cs);
         if (ok) bc->okCount++;
+        bc->doneCount++;
         LeaveCriticalSection(&bc->cs);
         PostMessageW(g_hwnd, WM_APP_BATCH_DONE, (WPARAM)ok, 0);
     }
@@ -3946,7 +3947,7 @@ static void StartBatchCache(void)
      * 重置后条件 head>=count 仍成立，线程不会因伪唤醒提前行动 */
     if (bc->thread && bc->head >= bc->count) {
         for (int j = 0; j < bc->count; j++) free(bc->urls[j]);
-        bc->count = bc->head = bc->okCount = 0;
+        bc->count = bc->head = bc->okCount = bc->doneCount = 0;
         bc->truncated = 0;
     }
     for (i = 0; i < total; i++) {
@@ -4017,7 +4018,7 @@ static void StartBatchCache(void)
             free(bc);
             g_batch = NULL;
             g_batchActive = 0;
-            SetStatus(tr(TR_DL_THREAD_FAIL));
+            SetStatusTemp(tr(TR_DL_THREAD_FAIL));
             return;
         }
         /* 入队先于建线程：线程进入时 count>head，不会空睡，故无需唤醒 */
@@ -7732,7 +7733,7 @@ static void DoSystemShutdown(void)
         CloseHandle(pi.hProcess);
         SetStatusTemp(tr(TR_SHUTTING_DOWN));
     } else {
-        SetStatus(tr(TR_SHUT_DENIED));
+        SetStatusTemp(tr(TR_SHUT_DENIED));
     }
 }
 
@@ -8146,9 +8147,10 @@ typedef struct MenuItemDataS {
     int isChecked;      /* 创建时的 MF_CHECKED：左侧画 √ */
 } MenuItemData;
 
-/* 与系统浅色菜单对齐的列宽：左勾选栏 / 右箭头栏 / 右内边距 */
-#define MENU_CHECK_COL_W  28
-#define MENU_ARROW_COL_W  22
+/* 列宽对齐系统浅色菜单：左侧勾选栏 + 文字与箭头之间的大留白 + 右内边距。
+ * 数值按原生菜单实测（同字体下总宽多 22px），改小会比亮色菜单明显偏窄 */
+#define MENU_CHECK_COL_W  32
+#define MENU_ARROW_COL_W  40
 #define MENU_RIGHT_PAD     6
 
 /* 系统标准菜单字体（懒创建，全程序复用） */
@@ -8253,28 +8255,27 @@ static void MenuMeasureItem(HWND owner, MEASUREITEMSTRUCT *mi)
     ReleaseDC(owner, hdc);
 }
 
-/* 勾选符号：两笔细线组成的简单 √（不使用彩色 emoji/方框） */
+/* 勾选符号：1px 细线 √，尺寸与系统浅色菜单的 Marlett 勾一致（不粗不大） */
 static void MenuDrawCheck(HDC hdc, int cx, int cy, COLORREF clr)
 {
-    HPEN p = CreatePen(PS_SOLID, 2, clr);
+    HPEN p = CreatePen(PS_SOLID, 1, clr);
     HGDIOBJ old = SelectObject(hdc, p);
-    MoveToEx(hdc, cx - 5, cy, NULL);
-    LineTo(hdc, cx - 1, cy + 4);
-    LineTo(hdc, cx + 6, cy - 5);
+    MoveToEx(hdc, cx - 4, cy, NULL);
+    LineTo(hdc, cx - 1, cy + 3);
+    LineTo(hdc, cx + 4, cy - 4);
     SelectObject(hdc, old);
     DeleteObject(p);
 }
 
-/* 子菜单箭头：细笔画 chevron（›），不是实心三角 */
+/* 子菜单箭头：单像素 chevron，两臂逐点镜像（同简介折叠按钮）。
+ * LineTo 的斜线像素归一化会让上下臂不等长，所以改用 SetPixel */
 static void MenuDrawChevron(HDC hdc, int x, int cy, COLORREF clr)
 {
-    HPEN p = CreatePen(PS_SOLID, 1, clr);
-    HGDIOBJ old = SelectObject(hdc, p);
-    MoveToEx(hdc, x, cy - 5, NULL);
-    LineTo(hdc, x + 4, cy);
-    LineTo(hdc, x, cy + 5);
-    SelectObject(hdc, old);
-    DeleteObject(p);
+    int vx = x + 4, i;
+    for (i = 0; i <= 4; i++) {
+        SetPixel(hdc, vx - i, cy - i, clr);
+        SetPixel(hdc, vx - i, cy + i, clr);
+    }
 }
 
 static void MenuDrawItem(const DRAWITEMSTRUCT *di)
@@ -10008,19 +10009,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         BatchCache *bc = g_batch;
         if (bc) {
             wchar_t st[128];
-            int head, cnt, okc, cap;
+            int head, cnt, okc, cap, doneN;
             EnterCriticalSection(&bc->cs);
             head = bc->head; cnt = bc->count;
-            okc = bc->okCount; cap = bc->truncated;
+            doneN = bc->doneCount; okc = bc->okCount; cap = bc->truncated;
             LeaveCriticalSection(&bc->cs);
             InvalidateRect(g_listEp, NULL, TRUE);   /* 完成项变黄/队列项保持蓝 */
-            if (head >= cnt) {
+            /* doneCount 而不是 head：head 在取件时就 +1，最后一集还在下载时
+             * head 已等于 count，会让进度提前显示“全部完成” */
+            if (g_batchActive && doneN >= cnt) {
                 g_batchActive = 0;
                 SetStatus(g_batchSavedBase);
                 if (cap) swprintf(st, 128, tr(TR_BATCH_DONE_CAP), okc, cnt);
                 else     swprintf(st, 128, tr(TR_BATCH_DONE_FMT), okc, cnt);
                 SetStatusTemp(st);
-            } else {
+            } else if (g_batchActive) {
                 swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), head, cnt);
                 SetBatchProgress(st);
             }

@@ -31,6 +31,10 @@ English | [简体中文](README.md)
 
 > Left: desktop (dark theme) · Right: the phone remote page opened in a mobile browser
 
+## Demo video
+
+[▶ Watch the demo](<280KB 的 Windows 播客播放器 - 免安装 手机遥控 离线缓存.mp4>) (~3.6 MB): portable setup, phone remote and offline caching in action.
+
 ## Features
 
 - RSS podcast subscription management (add / delete / reorder / refresh), single-instance
@@ -88,6 +92,7 @@ English | [简体中文](README.md)
 | Cache folder | Downloaded audio (filename = URL hash), feed & cover cache (`feed_*.xml` / `cover_*.img`). Defaults to `%TEMP%\LiteTune\`, auto-cleaned by Windows; stored in the ini if you pick a custom folder. Deleting a feed cleans its RSS/cover cache (audio is kept) |
 | `resource.rc` / `app.manifest` / `app.ico` | Build resources (DPI-aware manifest, icon) |
 | `screenshot.png` | Screenshot for the README (desktop + phone web) |
+| `280KB 的 Windows 播客播放器 - 免安装 手机遥控 离线缓存.mp4` | Demo video (portable / phone remote / offline cache) |
 | `LICENSE` | MIT license |
 | `tools\make_ico.ps1` | Icon generator (run after changing the icon, then rebuild) |
 
