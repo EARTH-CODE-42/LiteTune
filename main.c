@@ -1980,18 +1980,21 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
                 (LPARAM)(pProgGen ? *pProgGen : 0));
     }
 
-    /* 成功：取回句柄自行关闭；若槽位已空说明被外部取消，数据不完整算失败 */
+    /* 成功：取回句柄自行关闭；若槽位已空说明被外部取消，数据不完整算失败。
+     * WinHTTP 句柄必须从内层到外层释放（request → connect → session）。 */
     {
         HINTERNET own = pReqSlot
             ? (HINTERNET)InterlockedExchangePointer((PVOID volatile*)pReqSlot, NULL)
             : hReq;
-        WinHttpCloseHandle(hCon);
-        WinHttpCloseHandle(hSes);
         if (pReqSlot && !own) {        /* 被 UI 取消 */
+            WinHttpCloseHandle(hCon);
+            WinHttpCloseHandle(hSes);
             free(buf);
             return NULL;
         }
-        WinHttpCloseHandle(own);
+        WinHttpCloseHandle(own);      /* request */
+        WinHttpCloseHandle(hCon);     /* connect */
+        WinHttpCloseHandle(hSes);     /* session */
     }
     if (!buf) { buf = (char*)malloc(1); if (!buf) return NULL; buf[0] = 0; }
     else buf[total] = 0;
@@ -3813,38 +3816,35 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
         if (url && url[0]) {
             CachePathFor(url, cache, MAX_PATH);
             EnsureCacheDir();
-            if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
-                ok = 1;   /* 已缓存，跳过 */
-            } else {
-                /* 与单集播放下载互斥同一文件；等待锁期间响应取消。
-                 * gotLock 与 cancel 分开判定：拿到的锁必须释放，
-                 * 即使取消信号在拿锁成功的瞬间到达 */
-                {
-                    int gotLock = 0;
-                    while (!gotLock) {
-                        if (bc->cancel) break;
-                        if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
-                        Sleep(300);
-                    }
-                    if (gotLock) {
-                        if (!bc->cancel) {
-                            if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
-                                ok = 1;   /* 播放下载刚写完，直接算成功 */
-                            } else {
-                                data = HttpFetch(url, &len, WM_APP_BATCH_PROGRESS,
-                                                 &bc->reqSlot, NULL);
-                                if (data && len > 0) {
-                                    f = _wfopen(cache, L"wb");
-                                    if (f) {
-                                        ok = (fwrite(data, 1, len, f) == len);
-                                        fclose(f);
-                                    }
+            /* lock-first 与单集线程对称：对方的 fopen→fwrite→fclose 窗口内
+             * 文件已存在但只是半成品，锁前判存在会误判 ok=1；锁内双检则安全。
+             * gotLock 与 cancel 分开判定：拿到的锁必须释放，
+             * 即使取消信号在拿锁成功的瞬间到达 */
+            {
+                int gotLock = 0;
+                while (!gotLock) {
+                    if (bc->cancel) break;
+                    if (DlPathTryAcquire(cache)) { gotLock = 1; break; }
+                    Sleep(300);
+                }
+                if (gotLock) {
+                    if (!bc->cancel) {
+                        if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
+                            ok = 1;   /* 单集/本批次其它线程已写完 */
+                        } else {
+                            data = HttpFetch(url, &len, WM_APP_BATCH_PROGRESS,
+                                             &bc->reqSlot, NULL);
+                            if (data && len > 0) {
+                                f = _wfopen(cache, L"wb");
+                                if (f) {
+                                    ok = (fwrite(data, 1, len, f) == len);
+                                    fclose(f);
                                 }
-                                free(data);
                             }
+                            free(data);
                         }
-                        DlPathRelease(cache);
                     }
+                    DlPathRelease(cache);
                 }
             }
         }
@@ -5504,7 +5504,10 @@ static void RequestPlayEpisode(int pod, int ep)
             g_curDlJob = NULL;
             g_downloading = 0;
             free(job->url); free(job);
-            SetStatus(tr(TR_DL_THREAD_FAIL));
+            /* 先纠正 base（前一条 SetStatus(TR_PREPARING) 已写入），
+             * 否则 SetStatusTemp 到期会恢复到陈旧的“准备音频” */
+            SetStatus(tr(TR_READY));
+            SetStatusTemp(tr(TR_DL_THREAD_FAIL));
         } else {
             CloseHandle(th);   /* 线程句柄无需保留：不等待不查询 */
         }
