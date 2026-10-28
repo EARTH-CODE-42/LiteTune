@@ -10430,17 +10430,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     (void)hPrev; (void)lpCmdLine;
 
-    /* DPI 感知（Per-Monitor V2）— Win10+ 动态调用，Win7 上静默失败
-     * 修复高 DPI 缩放下界面模糊、配置弹窗文字被截断的问题。
-     * 注意：启用后所有 GetSystemMetrics / CreateWindow 的尺寸都是物理像素，
-     * 不再有虚拟化补偿；本程序所有硬编码像素值在当前 100% 设计尺度下没问题。 */
+    /* DPI 不感知：交给系统做整窗位图缩放（125%/150% 下窗口整体等比放大）。
+     * 本程序布局全部是 96 DPI 下的硬编码像素，而系统字体会随 DPI 光栅化放大，
+     * 若声明感知（系统级/PMv2），高缩放机器上字变大、布局不变 → 文字溢出截断。
+     * 位图缩放让不同缩放比例的机器显示内容完全一致（代价：高缩放屏略模糊）。
+     * Win10+ 动态调用，Win7 上静默失败；与 manifest 的 dpiAware=false 保持一致，
+     * 同时覆盖用户在文件属性里可能残留的高 DPI 兼容性设置。 */
     {
         typedef BOOL (WINAPI *SetDpiAwareCtxFn)(int);
         HMODULE us = GetModuleHandleW(L"user32.dll");
         if (us) {
             SetDpiAwareCtxFn p = NULL;
             *(void**)&p = (void*)GetProcAddress(us, "SetProcessDpiAwarenessContext");
-            if (p) p(0xFFFFFFFE);   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+            if (p) p(0xFFFFFFFF);   /* DPI_AWARENESS_CONTEXT_UNAWARE */
         }
     }
 
