@@ -135,6 +135,7 @@ typedef struct {
     int      epCount;
     int      epCap;
     int      loadFailed; /* 1=订阅获取/解析失败的占位条目（无剧集，可删除/重试） */
+    int      newCount;   /* 新剧集数（超过“已看”水位的集数，列表角标） */
 } Podcast;
 
 typedef struct {
@@ -219,6 +220,7 @@ static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
 /* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
 static wchar_t  g_cacheDir[MAX_PATH] = L"";
 static int      g_cacheDays = 30;   /* 自动清理天数：0=关（配置 cachedays，默认 30） */
+static int      g_autoRefreshMin = 60; /* 自动刷新间隔（分钟）：0=关（配置 autorefresh，默认 60） */
 
 /* 工具提示 */
 static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 */
@@ -302,6 +304,16 @@ typedef struct {
 } LastEp;
 static LastEp  *g_lastEps = NULL;
 static int      g_lastEpCount = 0, g_lastEpCap = 0;
+
+/* 每播客“已看”水位：新剧集角标用的最大已看 dateKey。
+ * 键同 LastEp（feed URL 哈希）；无记录视为全部已看（新订阅不炸角标）。
+ * ini 行 seenep=<hex>,<hi>,<lo>（dateKey 拆两个 32 位写，避开 %lld 兼容性） */
+typedef struct {
+    unsigned int hash;
+    long long    seenKey;
+} SeenEp;
+static SeenEp  *g_seenEps = NULL;
+static int      g_seenEpCount = 0, g_seenEpCap = 0;
 
 /* 手机播放/遥控 HTTP 服务 */
 /* 端口优先用 80（Windows 防火墙常已放行，手机最容易连上），占用再依次降级 */
@@ -388,6 +400,8 @@ enum {
     TR_CTX_COPY_EP_URL, TR_CTX_COPY_FEED_URL,
     TR_CTX_ADD_POD,
     TR_CLIP_OK, TR_CLIP_FAIL,
+    TR_M_AUTOREFRESH, TR_AR_MIN_FMT, TR_AR_SET_FMT,
+    TR_BALLOON_NEW_FMT,
     TR_N
 };
 
@@ -485,7 +499,9 @@ static const wchar_t *tr(int id)
         L"已加入刷新队列，稍后自动开始",
         L"复制剧集链接", L"复制 Feed URL",
         L"添加订阅...",
-        L"已复制到剪贴板", L"复制失败"
+        L"已复制到剪贴板", L"复制失败",
+        L"自动刷新", L"%d 分钟", L"自动刷新：%ls",
+        L"发现 %d 集新剧集"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -595,7 +611,9 @@ static const wchar_t *tr(int id)
         L"Added to refresh queue",
         L"Copy episode URL", L"Copy feed URL",
         L"Add subscription...",
-        L"Copied to clipboard", L"Copy failed"
+        L"Copied to clipboard", L"Copy failed",
+        L"Auto-Refresh", L"%d min", L"Auto-refresh: %ls",
+        L"Found %d new episode(s)"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -2281,12 +2299,310 @@ static long long ParseDate(const char *s, wchar_t *outText, int outN)
     return 0;
 }
 
-/* 解析 RSS，填充 Podcast */
+/* ---------- JSON Feed（jsonfeed.org）最小解析 ----------
+ * 不引第三方库：字符串感知的扫描器，只取需要的字段。
+ * 输入缓冲保证 NUL 结尾，字符串扫描以引号为准。 */
+
+/* 跳过 JSON 字符串（p 指向开引号），返回闭引号之后的位置 */
+static const char* JsonSkipString(const char *p)
+{
+    for (p++; *p && *p != '"'; p++)
+        if (*p == '\\' && p[1]) p++;
+    return *p ? p + 1 : p;
+}
+
+/* 跳过任意 JSON 值（对象/数组按自身括号配对，字符串感知），返回值后第一个字符 */
+static const char* JsonSkipValue(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p == '"') return JsonSkipString(p);
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = (*p == '{') ? '}' : ']';
+        int depth = 0;
+        for (; *p; p++) {
+            if (*p == '"') { p = JsonSkipString(p) - 1; continue; }
+            if (*p == open) depth++;
+            else if (*p == close) { depth--; if (depth == 0) return p + 1; }
+        }
+        return p;
+    }
+    /* 数字 / true / false / null */
+    while (*p && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+    return p;
+}
+
+/* 在 [begin,end) 找 "key": 并返回值起始；未找到返回 NULL。
+ * 前一个字符不能是标识符字符，防 "subtitle" 误命中 "title" */
+static const char* JsonFindKey(const char *begin, const char *end, const char *key)
+{
+    char pat[64];
+    const char *p = begin;
+    size_t klen = strlen(key);
+    if (klen + 3 > sizeof(pat)) return NULL;
+    pat[0] = '"'; memcpy(pat + 1, key, klen); pat[klen + 1] = '"'; pat[klen + 2] = 0;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *v;
+        if (p >= end) return NULL;
+        if (p > begin && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) { p++; continue; }
+        v = p + klen + 2;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        if (*v != ':') { p++; continue; }
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+        return v;
+    }
+    return NULL;
+}
+
+/* 解析 v 处的 JSON 字符串为 malloc 的 UTF-8（调用方 free）；非字符串返回 NULL。
+ * 处理 \" \\ \/ \b \f \n \r \t 与 \uXXXX（含代理对） */
+static char* JsonGetString(const char *v)
+{
+    char *out, *d;
+    const char *p;
+    if (!v || *v != '"') return NULL;
+    out = (char*)malloc(strlen(v) + 1);   /* 余下整个文档长度是上界，解码只会变短 */
+    if (!out) return NULL;
+    d = out;
+    p = v + 1;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'b': *d++ = '\b'; break;
+            case 'f': *d++ = '\f'; break;
+            case 'n': *d++ = '\n'; break;
+            case 'r': *d++ = '\r'; break;
+            case 't': *d++ = '\t'; break;
+            case 'u': {
+                unsigned cp = 0; int i, ok = 1;
+                for (i = 1; i <= 4; i++) {
+                    char h = p[i];
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                    else { ok = 0; break; }
+                }
+                if (!ok) { *d++ = '?'; break; }
+                p += 4;
+                /* 代理对：高代理后紧跟 \uDC00..\uDFFF 低代理 */
+                if (cp >= 0xD800 && cp <= 0xDBFF && p[1] == '\\' && p[2] == 'u') {
+                    unsigned lo = 0; int ok2 = 1;
+                    for (i = 3; i <= 6; i++) {
+                        char h = p[i];
+                        lo <<= 4;
+                        if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                        else { ok2 = 0; break; }
+                    }
+                    if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000u + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                /* 码点编码为 UTF-8 */
+                if (cp < 0x80) *d++ = (char)cp;
+                else if (cp < 0x800) {
+                    *d++ = (char)(0xC0 | (cp >> 6));
+                    *d++ = (char)(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    *d++ = (char)(0xE0 | (cp >> 12));
+                    *d++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    *d++ = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    *d++ = (char)(0xF0 | (cp >> 18));
+                    *d++ = (char)(0x80 | ((cp >> 12) & 0x3F));
+                    *d++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    *d++ = (char)(0x80 | (cp & 0x3F));
+                }
+                break;
+            }
+            default: *d++ = *p; break;   /* \" \\ \/ 直接输出字符本体 */
+            }
+            p++;
+        } else {
+            *d++ = *p++;
+        }
+    }
+    *d = 0;
+    return out;
+}
+
+/* 按 key 取字符串并转宽字符；空串视为缺失（返回 NULL），便于回退链 */
+static wchar_t* JsonGetTextW(const char *begin, const char *end,
+                             const char *key, int crlf)
+{
+    const char *v = JsonFindKey(begin, end, key);
+    char *raw;
+    wchar_t *w;
+    if (!v) return NULL;
+    raw = JsonGetString(v);
+    if (!raw) return NULL;
+    w = crlf ? U8ToWCrlf(raw) : U8ToW(raw);
+    free(raw);
+    if (w && !*w) { free(w); return NULL; }
+    return w;
+}
+
+/* 按 key 取字符串原样（UTF-8 char*，给 imageUrl 这类不转宽的字段用） */
+static char* JsonGetStrDup(const char *begin, const char *end, const char *key)
+{
+    const char *v = JsonFindKey(begin, end, key);
+    return v ? JsonGetString(v) : NULL;
+}
+
+/* 按 key 取数值；found 可为 NULL */
+static long long JsonGetNumber(const char *begin, const char *end,
+                               const char *key, int *found)
+{
+    const char *v = JsonFindKey(begin, end, key);
+    if (!v || (!isdigit((unsigned char)*v) && *v != '-')) {
+        if (found) *found = 0;
+        return 0;
+    }
+    if (found) *found = 1;
+    return atoll(v);
+}
+
+/* 作者名：JSON Feed 1.1 的 authors[0].name，兼容 1.0 的 author.name */
+static wchar_t* JsonAuthorName(const char *begin, const char *end)
+{
+    const char *v = JsonFindKey(begin, end, "authors");
+    if (!v) v = JsonFindKey(begin, end, "author");
+    if (!v || (*v != '[' && *v != '{')) return NULL;
+    return JsonGetTextW(v, JsonSkipValue(v), "name", 0);
+}
+
+/* JSON Feed 解析（pod 已由 ParseFeed 清零）。结构同 RSS 路径：
+ * 无音频 attachment 的单集跳过；title 缺失回退占位文案 */
+static int ParseJsonFeed(const char *json, Podcast *pod)
+{
+    const char *jend = json + strlen(json);
+    const char *itemsV, *itemsEnd, *p;
+
+    /* 频道信息：只取 items 数组之前的部分，避免拿到单集字段 */
+    itemsV = JsonFindKey(json, jend, "items");
+    {
+        const char *cend = (itemsV && *itemsV == '[') ? itemsV : jend;
+        pod->title = JsonGetTextW(json, cend, "title", 0);
+        pod->desc  = JsonGetTextW(json, cend, "description", 1);
+        pod->author = JsonAuthorName(json, cend);
+        pod->lang  = JsonGetTextW(json, cend, "language", 0);
+        pod->link  = JsonGetTextW(json, cend, "home_page_url", 0);
+        pod->imageUrl = JsonGetStrDup(json, cend, "icon");
+        if (!pod->imageUrl) pod->imageUrl = JsonGetStrDup(json, cend, "favicon");
+    }
+    if (!pod->title) pod->title = _wcsdup(tr(TR_UNTITLED));
+    if (!pod->desc)  pod->desc  = _wcsdup(L"");
+
+    if (!itemsV || *itemsV != '[') return 0;
+    itemsEnd = JsonSkipValue(itemsV);
+
+    /* 遍历 items 数组中的每个对象 */
+    p = itemsV + 1;
+    while (p < itemsEnd) {
+        const char *objEnd, *attV;
+        char *encUrl = NULL;
+        Episode *e;
+
+        while (p < itemsEnd && *p != '{' && *p != ']') p++;
+        if (p >= itemsEnd || *p == ']') break;
+        objEnd = JsonSkipValue(p);
+        if (objEnd <= p) break;
+
+        /* enclosure：attachments 里优先音频 mime，否则第一个 attachment */
+        attV = JsonFindKey(p, objEnd, "attachments");
+        if (attV && *attV == '[') {
+            const char *ap = attV + 1, *attEnd = JsonSkipValue(attV);
+            char *firstUrl = NULL;
+            while (ap < attEnd) {
+                const char *aEnd;
+                while (ap < attEnd && *ap != '{' && *ap != ']') ap++;
+                if (ap >= attEnd || *ap == ']') break;
+                aEnd = JsonSkipValue(ap);
+                if (aEnd <= ap) break;
+                {
+                    char *u = JsonGetStrDup(ap, aEnd, "url");
+                    if (u) {
+                        char *mt = JsonGetStrDup(ap, aEnd, "mime_type");
+                        int isAudio = (mt && strstr(mt, "audio")) ? 1 : 0;
+                        free(mt);
+                        if (isAudio) { encUrl = u; break; }
+                        if (!firstUrl) firstUrl = u; else free(u);
+                    }
+                }
+                ap = aEnd;
+            }
+            if (!encUrl) { encUrl = firstUrl; firstUrl = NULL; }
+            free(firstUrl);
+        }
+
+        if (encUrl && pod->epCount < 10000) {
+            char *d;
+            if (pod->epCount >= pod->epCap) {
+                /* 与 RSS 路径同理：realloc 用临时变量，失败不丢原指针 */
+                Episode *ne;
+                pod->epCap = pod->epCap ? pod->epCap * 2 : 32;
+                ne = (Episode*)realloc(pod->eps, pod->epCap * sizeof(Episode));
+                if (!ne) { free(encUrl); return 0; }
+                pod->eps = ne;
+            }
+            e = &pod->eps[pod->epCount];
+            memset(e, 0, sizeof(*e));
+            e->origIdx = pod->epCount;
+            e->title = JsonGetTextW(p, objEnd, "title", 0);
+            if (!e->title) e->title = _wcsdup(tr(TR_UNTITLED));
+            e->desc = JsonGetTextW(p, objEnd, "content_html", 1);
+            if (!e->desc) e->desc = JsonGetTextW(p, objEnd, "content_text", 1);
+            if (!e->desc) e->desc = JsonGetTextW(p, objEnd, "summary", 1);
+            if (!e->desc) e->desc = _wcsdup(L"");
+            e->author = JsonAuthorName(p, objEnd);
+            e->url = U8ToW(encUrl);
+            if (!e->url) {
+                free(e->title); free(e->desc); free(e->author);
+                free(encUrl);
+                p = objEnd;
+                continue;
+            }
+            {
+                int found;
+                long long dur = JsonGetNumber(p, objEnd, "duration_in_seconds", &found);
+                if (found && dur > 0 && dur < 7 * 24 * 3600)
+                    e->durationSec = (int)dur;
+            }
+            /* 发布日期：date_published（RFC3339），date_modified 兜底 */
+            d = JsonGetStrDup(p, objEnd, "date_published");
+            if (!d) d = JsonGetStrDup(p, objEnd, "date_modified");
+            if (d) {
+                e->dateKey = ParseDate(d, e->dateText, 24);
+                free(d);
+            }
+            pod->epCount++;
+            free(encUrl);
+        } else {
+            free(encUrl);
+        }
+        p = objEnd;
+    }
+    return pod->epCount > 0;
+}
+
+/* 解析 RSS / JSON Feed，填充 Podcast */
 static int ParseFeed(const char *xml, Podcast *pod)
 {
     const char *chanEnd, *item;
 
     memset(pod, 0, sizeof(*pod));
+
+    /* JSON Feed：首个非空白字符是 { 就走 JSON 解析 */
+    {
+        const char *p = xml;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '{') return ParseJsonFeed(p, pod);
+    }
 
     /* 频道信息：只取第一个 <item> 之前的部分，避免拿到单集标题 */
     item = FindOpenTag(xml, "item");
@@ -2704,6 +3020,107 @@ static void LastEpFreeAll(void)
     g_lastEps = NULL; g_lastEpCount = 0; g_lastEpCap = 0;
 }
 
+static SeenEp* SeenFind(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_seenEpCount; i++)
+        if (g_seenEps[i].hash == hash) return &g_seenEps[i];
+    return NULL;
+}
+
+/* 抬高某播客的已看水位（只升不降：旧缓存回退不会让角标复活） */
+static void SeenSet(unsigned int hash, long long key)
+{
+    SeenEp *se = SeenFind(hash);
+    if (!se) {
+        if (g_seenEpCount >= 512) return;   /* 防异常膨胀，与 LastEp 同上限 */
+        if (g_seenEpCount >= g_seenEpCap) {
+            int nc = g_seenEpCap ? g_seenEpCap * 2 : 16;
+            SeenEp *nb = (SeenEp*)realloc(g_seenEps, nc * sizeof(SeenEp));
+            if (!nb) return;
+            g_seenEps = nb; g_seenEpCap = nc;
+        }
+        se = &g_seenEps[g_seenEpCount++];
+        se->hash = hash;
+        se->seenKey = 0;
+    }
+    if (key > se->seenKey) se->seenKey = key;
+}
+
+/* 删除某播客的记录（删订阅时调用） */
+static void SeenDrop(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_seenEpCount; i++) {
+        if (g_seenEps[i].hash == hash) {
+            memmove(&g_seenEps[i], &g_seenEps[i + 1],
+                    (g_seenEpCount - i - 1) * sizeof(SeenEp));
+            g_seenEpCount--;
+            return;
+        }
+    }
+}
+
+/* 启动清理：哈希对不上任何现有订阅的记录删除（与 LastEp 同一时机） */
+static void SeenPurgeOrphans(void)
+{
+    int i, keep = 0;
+    for (i = 0; i < g_seenEpCount; i++) {
+        unsigned int h = g_seenEps[i].hash;
+        int j, found = 0;
+        for (j = 0; j < g_podCount && !found; j++)
+            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
+        if (found) g_seenEps[keep++] = g_seenEps[i];
+    }
+    g_seenEpCount = keep;
+}
+
+static void SeenFreeAll(void)
+{
+    free(g_seenEps);
+    g_seenEps = NULL; g_seenEpCount = 0; g_seenEpCap = 0;
+}
+
+/* 播客当前最大 dateKey（忽略未知日期的 0） */
+static long long PodMaxDateKey(const Podcast *p)
+{
+    long long mx = 0;
+    int i;
+    for (i = 0; i < p->epCount; i++)
+        if (p->eps[i].dateKey > mx) mx = p->eps[i].dateKey;
+    return mx;
+}
+
+/* 按“已看”水位重算新剧集数（无记录视为全部已看） */
+static void UpdateNewCount(Podcast *p)
+{
+    SeenEp *se;
+    int i, n = 0;
+    if (!p->feedUrl) { p->newCount = 0; return; }
+    se = SeenFind(LastEpHash(p->feedUrl));
+    if (se) {
+        for (i = 0; i < p->epCount; i++)
+            if (p->eps[i].dateKey > se->seenKey) n++;
+    }
+    p->newCount = n;
+}
+
+/* 托盘气泡：刷新发现新剧集（仅窗口藏到托盘时弹，可见时角标已足够） */
+static void TrayBalloonNewEpisodes(int total)
+{
+    NOTIFYICONDATAW nid;
+    if (!g_trayAdded) return;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(nid.szInfoTitle, 64, L"LiteTune");
+    swprintf(nid.szInfo, 256, tr(TR_BALLOON_NEW_FMT), total);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 /* ================= 订阅 XML / 封面缓存（cache\feed_*.xml、cover_*.img） ================= */
 
 /* 文件名 = 前缀 + URL 哈希 + 扩展名，跨启动稳定 */
@@ -3038,6 +3455,23 @@ static void ParseConfigLine(char *line)
                 }
             }
         }
+        else if (strcmp(s, "seenep") == 0) {
+            /* 格式 seenep=<hash hex>,<hi>,<lo>（dateKey 拆两个 32 位存储） */
+            char *c1 = strchr(val, ',');
+            if (c1) {
+                char *c2;
+                *c1 = 0; c2 = strchr(c1 + 1, ',');
+                if (c2) {
+                    unsigned int h, hi, lo;
+                    *c2 = 0;
+                    h  = (unsigned int)strtoul(val, NULL, 16);
+                    hi = (unsigned int)strtoul(c1 + 1, NULL, 10);
+                    lo = (unsigned int)strtoul(c2 + 1, NULL, 10);
+                    if (h != 0)
+                        SeenSet(h, ((long long)hi << 32) | (long long)lo);
+                }
+            }
+        }
         else if (strcmp(s, "cachedir") == 0) {
             wchar_t *w = U8ToW(val);
             if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
@@ -3045,6 +3479,10 @@ static void ParseConfigLine(char *line)
         else if (strcmp(s, "cachedays") == 0) {
             g_cacheDays = atoi(val);
             if (g_cacheDays < 0) g_cacheDays = 0;
+        }
+        else if (strcmp(s, "autorefresh") == 0) {
+            g_autoRefreshMin = atoi(val);
+            if (g_autoRefreshMin < 0) g_autoRefreshMin = 0;
         }
     } else if (strstr(s, "://")) {
         AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
@@ -3233,10 +3671,12 @@ static void LoadConfig(void)
     g_lang = 1;
     g_speed = 100;
     g_cfgExternal = 0;
+    g_autoRefreshMin = 60;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
     g_resumePaused = 0;
     LastEpFreeAll();
+    SeenFreeAll();
 
     /* 上次保存残留的改名副本（此时已无占用），顺手删除 */
     {
@@ -3361,12 +3801,25 @@ static char *BuildConfigText(DWORD *lenOut)
             }
         }
     }
+    /* 每播客“已看”水位（新剧集角标），dateKey 拆两个 32 位写 */
+    {
+        int li;
+        for (li = 0; li < g_seenEpCount; li++) {
+            if (g_seenEps[li].hash != 0 && g_seenEps[li].seenKey > 0) {
+                SbAddf(&sb, "seenep=%x,%u,%u\n", g_seenEps[li].hash,
+                       (unsigned int)((unsigned long long)g_seenEps[li].seenKey >> 32),
+                       (unsigned int)(g_seenEps[li].seenKey & 0xFFFFFFFFu));
+            }
+        }
+    }
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
         if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
     }
     if (g_cacheDays != 30)   /* 默认 30 天不写入，保持配置干净 */
         SbAddf(&sb, "cachedays=%d\n", g_cacheDays);
+    if (g_autoRefreshMin != 60)   /* 默认 60 分钟不写入 */
+        SbAddf(&sb, "autorefresh=%d\n", g_autoRefreshMin);
     SbAddf(&sb, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         SbAddf(&sb, "%s\n", g_feedUrls[i]);
@@ -3576,7 +4029,7 @@ static void FreeFeedLoadArg(FeedLoadArg *a)
 static DWORD WINAPI FeedLoaderThread(LPVOID param)
 {
     FeedLoadArg *a = (FeedLoadArg*)param;
-    int i, loaded = 0;
+    int i, loaded = 0, nf = a->netFirst;
 
     for (i = 0; i < a->count; i++) {
         Podcast *pod = LoadOneFeed(a->urls[i], a->netFirst);
@@ -3588,7 +4041,8 @@ static DWORD WINAPI FeedLoaderThread(LPVOID param)
         PostMessageW(g_hwnd, WM_APP_FEED_PROGRESS, i + 1, a->count);
     }
     FreeFeedLoadArg(a);
-    PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, 0);
+    /* lParam 带 netFirst：启动加载（0）不弹新剧集气泡，联网刷新（1）才弹 */
+    PostMessageW(g_hwnd, WM_APP_FEEDS_DONE, loaded, nf);
     return 0;
 }
 
@@ -5774,6 +6228,7 @@ static void RemovePodcast(int i)
             DeleteFileW(cp);
         }
         LastEpDrop(LastEpHash(g_pods[i].feedUrl));
+        SeenDrop(LastEpHash(g_pods[i].feedUrl));
     }
     FreePodcast(&g_pods[i]);
     memmove(&g_pods[i], &g_pods[i + 1], (g_podCount - i - 1) * sizeof(Podcast));
@@ -6039,8 +6494,9 @@ typedef struct {
 } SearchResult;
 
 /* 前置声明（实现在导入导出段） */
-static BOOL FileDlg(int save, const wchar_t *title, const wchar_t *filter,
-                    const wchar_t *defExt, wchar_t *path, int pathMax);
+static BOOL FileDlg(HWND owner, int save, const wchar_t *title,
+                    const wchar_t *filter, const wchar_t *defExt,
+                    wchar_t *path, int pathMax);
 static char *ReadFileAll(const wchar_t *path, DWORD *lenOut);
 static int ImportOpmlText(const char *buf);
 static int FeedUrlDup(const char *url);
@@ -6055,7 +6511,7 @@ static void DoOpmlPickImport(HWND h)
     char *buf;
     int added;
 
-    if (!FileDlg(0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
+    if (!FileDlg(h, 0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
     buf = ReadFileAll(path, &len);
     if (!buf) {
         MessageBoxTh(h, tr(TR_IMP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
@@ -7839,15 +8295,16 @@ static void ApplyLanguage(void)
 
 /* ================= 设置菜单：导入 / 导出 ================= */
 
-/* 通用打开/保存文件对话框（comdlg32），返回是否选中路径 */
-static BOOL FileDlg(int save, const wchar_t *title, const wchar_t *filter,
-                    const wchar_t *defExt, wchar_t *path, int pathMax)
+/* 通用打开/保存文件对话框（comdlg32），owner 决定模态归属与层级，返回是否选中路径 */
+static BOOL FileDlg(HWND owner, int save, const wchar_t *title,
+                    const wchar_t *filter, const wchar_t *defExt,
+                    wchar_t *path, int pathMax)
 {
     OPENFILENAMEW ofn;
     ZeroMemory(&ofn, sizeof(ofn));
     path[0] = 0;
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = g_hwnd;
+    ofn.hwndOwner   = owner;
     ofn.lpstrFilter = filter;
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = pathMax;
@@ -7989,7 +8446,7 @@ static void DoExportOpml(void)
     FILE *f;
     int i;
 
-    if (!FileDlg(1, tr(TR_EXP_OPML_CAP), FILTER, L"opml", path, MAX_PATH)) return;
+    if (!FileDlg(g_hwnd, 1, tr(TR_EXP_OPML_CAP), FILTER, L"opml", path, MAX_PATH)) return;
     f = _wfsopen(path, L"wb", _SH_DENYNO);
     if (!f) {
         MessageBoxTh(g_hwnd, tr(TR_EXP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
@@ -8025,7 +8482,7 @@ static void DoExportIni(void)
     DWORD len = 0;
     char *cfg;
 
-    if (!FileDlg(1, tr(TR_EXP_INI_CAP), FILTER, L"ini", path, MAX_PATH)) return;
+    if (!FileDlg(g_hwnd, 1, tr(TR_EXP_INI_CAP), FILTER, L"ini", path, MAX_PATH)) return;
     cfg = BuildConfigText(&len);
     if (!cfg) return;
     if (WriteTextFile(path, cfg, len))
@@ -8046,7 +8503,7 @@ static void DoImport(void)
     DWORD len = 0;
     char *buf;
 
-    if (!FileDlg(0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
+    if (!FileDlg(g_hwnd, 0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
     buf = ReadFileAll(path, &len);
     if (!buf) {
         MessageBoxTh(g_hwnd, tr(TR_IMP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
@@ -8321,6 +8778,14 @@ static void MenuDrawItem(const DRAWITEMSTRUCT *di)
     }
 }
 
+/* 自动刷新定时器（ID 6）：周期触发，0=关；改间隔时重新武装即可 */
+static void ArmAutoRefreshTimer(void)
+{
+    KillTimer(g_hwnd, 6);
+    if (g_autoRefreshMin > 0)
+        SetTimer(g_hwnd, 6, (UINT)g_autoRefreshMin * 60000, NULL);
+}
+
 static void OnSettingsButton(void)
 {
     HMENU menu = CreatePopupMenu();
@@ -8352,6 +8817,19 @@ static void OnSettingsButton(void)
             MenuAdd(cl, g_cacheDays == days[di] ? MF_CHECKED : 0, 31 + di, t);
         }
         MenuAddPopup(menu, cl, tr(TR_M_CACHE_CLEAN), 0);
+    }
+    {
+        /* 自动刷新：关 / 30 / 60 / 120 / 360 分钟，单选勾选 */
+        static const int arms[] = { 30, 60, 120, 360 };
+        HMENU ar = CreatePopupMenu();
+        int ai;
+        MenuAdd(ar, g_autoRefreshMin == 0 ? MF_CHECKED : 0, 40, tr(TR_CC_OFF));
+        for (ai = 0; ai < 4; ai++) {
+            wchar_t t[32];
+            swprintf(t, 32, tr(TR_AR_MIN_FMT), arms[ai]);
+            MenuAdd(ar, g_autoRefreshMin == arms[ai] ? MF_CHECKED : 0, 41 + ai, t);
+        }
+        MenuAddPopup(menu, ar, tr(TR_M_AUTOREFRESH), 0);
     }
     MenuAddSep(menu);
     MenuAdd(menu, 0, 22, tr(TR_M_IMPORT));
@@ -8408,6 +8886,17 @@ static void OnSettingsButton(void)
         if (g_cacheDays > 0) swprintf(d, 32, tr(TR_CC_DAYS_FMT), g_cacheDays);
         else wcscpy_s(d, 32, tr(TR_CC_OFF));
         swprintf(t, 64, tr(TR_CC_SET_FMT), d);
+        SetStatusTemp(t);
+        return;
+    }
+    if (cmd >= 40 && cmd <= 44) {   /* 自动刷新：关/30/60/120/360 分钟 */
+        wchar_t t[64], d[32];
+        static const int vals[] = { 0, 30, 60, 120, 360 };
+        g_autoRefreshMin = vals[cmd - 40];
+        ArmAutoRefreshTimer();
+        if (g_autoRefreshMin > 0) swprintf(d, 32, tr(TR_AR_MIN_FMT), g_autoRefreshMin);
+        else wcscpy_s(d, 32, tr(TR_CC_OFF));
+        swprintf(t, 64, tr(TR_AR_SET_FMT), d);
         SetStatusTemp(t);
         return;
     }
@@ -9378,6 +9867,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             }
 
+            /* 新剧集角标：右上角红色圆角小标（与垂直居中的剧集数错开） */
+            if (!isCache && !p->loadFailed && p->newCount > 0) {
+                wchar_t nb[16];
+                RECT rb = { rc.right - 26, rc.top + 4, rc.right - 4, rc.top + 20 };
+                HBRUSH bb = CreateSolidBrush(RGB(214, 48, 49));
+                HGDIOBJ ob = SelectObject(di->hDC, bb);
+                HGDIOBJ op = SelectObject(di->hDC, GetStockObject(NULL_PEN));
+                RoundRect(di->hDC, rb.left, rb.top, rb.right, rb.bottom, 8, 8);
+                SelectObject(di->hDC, ob);
+                SelectObject(di->hDC, op);
+                DeleteObject(bb);
+                if (p->newCount > 99) wcscpy_s(nb, 16, L"99+");
+                else swprintf(nb, 16, L"%d", p->newCount);
+                SetTextColor(di->hDC, RGB(255, 255, 255));
+                SelectObject(di->hDC, g_fontSmall);
+                DrawTextW(di->hDC, nb, -1, &rb,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
             /* 焦点虚线框 */
             if (di->itemState & ODS_FOCUS) DrawFocusRect(di->hDC, &di->rcItem);
         }
@@ -9719,8 +10227,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (HIWORD(wParam) == LBN_SELCHANGE) {
-            if (LOWORD(wParam) == IDC_LIST_POD)
-                SelectPodcast((int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0));
+            if (LOWORD(wParam) == IDC_LIST_POD) {
+                int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
+                /* 用户点选 = 已看：清掉该播客的新剧集角标
+                 *（程序式 LB_SETCURSEL 不触发 LBN_SELCHANGE，角标保留） */
+                if (sel >= 0 && sel < g_podCount && g_pods[sel].newCount > 0 &&
+                    g_pods[sel].feedUrl) {
+                    SeenSet(LastEpHash(g_pods[sel].feedUrl),
+                            PodMaxDateKey(&g_pods[sel]));
+                    g_pods[sel].newCount = 0;
+                    InvalidateRect(g_listPod, NULL, TRUE);
+                }
+                SelectPodcast(sel);
+            }
         } else if (HIWORD(wParam) == LBN_DBLCLK) {
             /* 双击播客：播橙色（上次听到）剧集，无记录则从第 1 集开始 */
             if (LOWORD(wParam) == IDC_LIST_POD)
@@ -9907,6 +10426,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DescTabHoverTick(hwnd);
             return 0;
         }
+        if (wParam == 6) {
+            /* 自动刷新：播放/下载/批量/加载中跳过，下个周期自然重试 */
+            if (g_playState == 0 && !g_downloading && !g_batchActive &&
+                !g_feedsLoading)
+                ReloadFeeds(1);
+            return 0;
+        }
         /* 滚动条跟随内容/滚动实时刷新（自绘条是唯一滚动条） */
         SyncScrollBar(g_vsPod);
         SyncScrollBar(g_vsEp);
@@ -10069,6 +10595,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 FreePodcast(&old);       /* 释放旧数据 */
                 free(pod);
                 pod = NULL;
+                UpdateNewCount(&g_pods[idx]);   /* 刷新后重算新剧集角标 */
                 if (g_playPod == idx && g_playEp >= g_pods[idx].epCount)
                     g_playEp = -1;
                 if (g_curPod == idx) SelectPodcast(idx);
@@ -10083,6 +10610,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_podCount < MAX_PODCASTS) {
                 int newIdx = g_podCount;
                 g_pods[g_podCount] = *pod;
+                /* 单条新增（加订阅/OPML 导入）：全部视为已看，不炸角标 */
+                if (incremental == 1 && pod->feedUrl)
+                    SeenSet(LastEpHash(pod->feedUrl), PodMaxDateKey(pod));
+                UpdateNewCount(&g_pods[newIdx]);
                 /* 插入到"已缓存"虚拟行之前（无虚拟行时等同末尾追加）。
                  * owner-draw 列表真正显示在 WM_DRAWITEM 里画，这里 lParam 仅作占位 */
                 SendMessageW(g_listPod, LB_INSERTSTRING, newIdx,
@@ -10131,6 +10662,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         TryResumePlayback();   /* 启动续播：有记忆位置时自动恢复上次播放 */
         LastEpPurgeOrphans();  /* 清掉对不上现有订阅的“上次听到”记录 */
+        SeenPurgeOrphans();    /* 同上：清“已看”水位的孤儿记录 */
+        /* 联网全量刷新（手动/自动）完成且窗口在托盘：有新剧集时弹气泡 */
+        if (g_fullReload && lParam == 1 && !IsWindowVisible(g_hwnd)) {
+            int i, total = 0;
+            for (i = 0; i < g_podCount; i++) total += g_pods[i].newCount;
+            if (total > 0) TrayBalloonNewEpisodes(total);
+        }
         g_fullReload = 0;
         PumpRefreshQueue();    /* 单播客刷新队列：接续下一条 */
         return 0;
@@ -10351,6 +10889,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
         KillTimer(hwnd, 4);
+        KillTimer(hwnd, 6);   /* 自动刷新 */
         UnregisterHotKey(hwnd, 1);
         UnregisterHotKey(hwnd, 2);
         UnregisterHotKey(hwnd, 3);
@@ -10553,6 +11092,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     UpdateWindow(hwnd);
     SetStatus(tr(TR_READY));   /* 初始状态文本跟随语言（静态初值固定为中文） */
     ReloadFeeds(0);   /* 启动：订阅缓存优先，已下载过就无需重新联网 */
+    ArmAutoRefreshTimer();   /* 周期性自动刷新（0=关），播完空闲时才真正执行 */
     /* 离线启动时订阅可能加载很慢/失败：先立即挂上“已缓存”行，不等订阅 */
     RefreshCachedEntry();
     if (g_podCount == 0 && g_cacheRowHere) {
