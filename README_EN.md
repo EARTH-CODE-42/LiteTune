@@ -2,10 +2,10 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 270 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 280 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![version](https://img.shields.io/badge/Version-1.4-blue)
-![size](https://img.shields.io/badge/Size-270%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.4.1-blue)
+![size](https://img.shields.io/badge/Size-280%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -45,7 +45,10 @@ English | [简体中文](README.md)
 - **Local cache view**: the last row of the podcast list, “Cached (N)”, opens a browsable list of every downloaded episode — no network involved, ideal offline
 - **Feed cache**: RSS and cover art cached locally — instant startup from cache (no network needed), browse feeds offline; manual refresh fetches the latest and falls back to cache on failure (list is never cleared)
 - **Feed compatibility**: auto-reads the system proxy (e.g. Clash); FeedBurner, BBC, Buzzsprout and similar feeds now parse correctly; all 2xx response codes accepted
+- **JSON Feed support**: besides RSS / Atom, [jsonfeed.org](https://jsonfeed.org) feeds can be subscribed directly
 - Loading progress: status bar shows "loaded x/n" while loading/refreshing feeds
+- **New-episode badges**: after a refresh, podcasts with new episodes show a red unread count on the right (99+ when higher); opening the podcast clears it, and unopened badges survive a restart
+- **Scheduled auto-refresh**: choose Off / 30 / 60 / 120 / 360 minutes in Settings to update all feeds automatically while idle (skipped during playback, downloads and batch caching so listening is never interrupted)
 - **Batch caching**: drag or Ctrl+click to multi-select episodes, hit the download button to cache them all (already-cached ones are skipped, playback is never interrupted)
 - Resume memory: remembers the episode and position on exit, resumes automatically next launch; if it was paused at exit, it reopens paused at the saved position (nothing is written after a manual stop)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
@@ -58,6 +61,7 @@ English | [简体中文](README.md)
 - Seekable progress bar; green while playing, yellow when cached, orange for "last heard"
 - **Phone playback / remote**: enable in the Settings menu, open the LAN page in your phone browser — playback controls, seekable progress bar, volume, episode picker, play mode & speed, sleep timer; lock-screen media controls supported
 - System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev / play-pause / next / shuffle), double-click restores the main window
+- **Tray balloon notice**: while the window sits in the tray, a refresh that finds new episodes shows the total in a balloon tip (silent when the window is visible)
 - Multimedia keyboard media keys (play/pause, previous, next, stop)
 - Arrow-key shortcuts: ←/→ seek back / forward 15 s, ↑/↓ previous / next episode; lists, edit boxes, sliders and scroll bars keep their own arrow-key behavior
 - Light / dark theme (switched at runtime; title bar, settings menu, context menus and tooltips share the same palette)
@@ -129,6 +133,8 @@ winw=480              ; window size (client area)
 winh=360
 cachedir=             ; cache folder (empty = default %TEMP%\LiteTune)
 cachedays=30          ; cache auto-clean days (0 = off; default 30, written only when non-default)
+autorefresh=60        ; auto-refresh interval in minutes (0 = off; default 60, written only when non-default)
+seenep=1a2b3c4d,0,20250812 ; per-feed "seen" watermark (hash,hi,lo) for the new-episode badge, one line per feed
 resume=1234           ; last playback position in seconds (for auto resume)
 resumeplay=1          ; playing at exit? (0 = paused; reopens paused at the saved position)
 resumeurl=...         ; URL of the episode playing at last exit

@@ -444,7 +444,7 @@ static const wchar_t *tr(int id)
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
-        L"LiteTune  版本 1.4\r\n\r\n"
+        L"LiteTune  版本 1.4.1\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
             L"纯 C + Win32 API 编写，单文件绿色便携，\r\n不依赖任何第三方 DLL。",
         L"夜间模式已开启", L"夜间模式已关闭", L"字号已切换",
@@ -544,7 +544,7 @@ static const wchar_t *tr(int id)
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
-        L"LiteTune  version 1.4\r\n\r\n"
+        L"LiteTune  version 1.4.1\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
             L"auto-cache episodes and listen offline.\r\n\r\n"
             L"Written in pure C with Win32 API. One portable executable,\r\n"
@@ -2360,9 +2360,13 @@ static const char* JsonFindKey(const char *begin, const char *end, const char *k
 static char* JsonGetString(const char *v)
 {
     char *out, *d;
-    const char *p;
+    const char *p, *end;
+    size_t cap;
     if (!v || *v != '"') return NULL;
-    out = (char*)malloc(strlen(v) + 1);   /* 余下整个文档长度是上界，解码只会变短 */
+    end = JsonSkipString(v);             /* 先定位闭引号，按原串长度分配 */
+    cap = (size_t)(end - v) + 1;
+    if (cap < 2) cap = 2;
+    out = (char*)malloc(cap);            /* 解码只会变短，此上界必够 */
     if (!out) return NULL;
     d = out;
     p = v + 1;
@@ -2713,6 +2717,8 @@ static int ParseFeed(const char *xml, Podcast *pod)
             }
             pod->epCount++;
             free(encUrl);
+        } else {
+            free(encUrl);   /* 超过 10000 集上限时同样要释放 */
         }
         free(seg);
         item = FindOpenTag(itemEnd, "item");
