@@ -130,6 +130,7 @@ typedef struct {
     wchar_t *copyright;
     char    *imageUrl;   /* 封面图 URL */
     char    *feedUrl;    /* 该播客的 RSS 订阅源地址 */
+    char    *srcUrl;     /* 自动发现时的原始网页地址（仅加载途中存在，UI 升级 ini 后即释放） */
     HBITMAP  hImage;     /* 已解码的封面图，NULL=未下载或失败 */
     Episode *eps;
     int      epCount;
@@ -1924,8 +1925,29 @@ static HINTERNET WinHttpOpenUser(void)
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 }
 
-static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
-                       void * volatile *pReqSlot, volatile long *pProgGen)
+/* 响应元信息：仅订阅源的条件请求（304 增量刷新）使用 */
+typedef struct {
+    DWORD status;       /* HTTP 状态码；返回 NULL 时凭它区分 304 与真正失败 */
+    char  etag[160];    /* 响应 ETag（无则空串） */
+    char  lastMod[64];  /* 响应 Last-Modified（无则空串） */
+} HttpInfo;
+
+/* 响应头值窄化为 ASCII（ETag/Last-Modified 本就是 ASCII，越界字符兜底 ?） */
+static void NarrowHdr(char *dst, int dstMax, const wchar_t *src)
+{
+    int i = 0;
+    while (src[i] && i < dstMax - 1) {
+        dst[i] = (src[i] > 0 && src[i] < 128) ? (char)src[i] : '?';
+        i++;
+    }
+    dst[i] = 0;
+}
+
+/* extraHdrs：追加请求头（如 If-None-Match），可 NULL；
+ * info：回传状态码与验证器，可 NULL。304 时返回 NULL 且 info->status==304 */
+static char* HttpFetchEx(const wchar_t *url, DWORD *outLen, UINT progressMsg,
+                         void * volatile *pReqSlot, volatile long *pProgGen,
+                         const wchar_t *extraHdrs, HttpInfo *info)
 {
     URL_COMPONENTS uc;
     wchar_t host[256], path[2048];
@@ -1963,7 +1985,9 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
         WinHttpSetOption(hReq, WINHTTP_OPTION_DECOMPRESSION, &flags, sizeof(flags));
     }
 
-    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    if (!WinHttpSendRequest(hReq,
+            extraHdrs ? extraHdrs : WINHTTP_NO_ADDITIONAL_HEADERS,
+            extraHdrs ? (DWORD)-1L : 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto fail;
     if (!WinHttpReceiveResponse(hReq, NULL)) goto fail;
 
@@ -1971,7 +1995,20 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
         DWORD status = 0, sz = sizeof(status);
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             NULL, &status, &sz, NULL);
+        if (info) { info->status = status; info->etag[0] = info->lastMod[0] = 0; }
+        /* 304 走 fail 清理路径返回 NULL，调用方凭 info->status 识别“未变更” */
         if (status < 200 || status >= 300) goto fail;
+        if (info) {   /* 成功响应：取回验证器供下次条件请求 */
+            wchar_t hb[256];
+            sz = sizeof(hb);
+            if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_ETAG, NULL,
+                    hb, &sz, NULL))
+                NarrowHdr(info->etag, (int)sizeof(info->etag), hb);
+            sz = sizeof(hb);
+            if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_LAST_MODIFIED, NULL,
+                    hb, &sz, NULL))
+                NarrowHdr(info->lastMod, (int)sizeof(info->lastMod), hb);
+        }
         sz = sizeof(contentLen);
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
             NULL, &contentLen, &sz, NULL);
@@ -2030,6 +2067,13 @@ fail:
     if (hSes) WinHttpCloseHandle(hSes);
     free(buf);
     return NULL;
+}
+
+/* 普通下载（无条件请求、不回传响应信息）：音频/封面/搜索沿用此入口 */
+static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
+                       void * volatile *pReqSlot, volatile long *pProgGen)
+{
+    return HttpFetchEx(url, outLen, progressMsg, pReqSlot, pProgGen, NULL, NULL);
 }
 
 /* ================= XML 解析 ================= */
@@ -3178,6 +3222,66 @@ static void WriteUrlCache(const char *url, const wchar_t *prefix,
     fclose(f);
 }
 
+/* ---------- 订阅源验证器（feed_*.hdr：ETag\nLast-Modified\n） ----------
+ * 与 feed_*.xml 缓存成对存在，服务器据此对未变更的订阅回 304，
+ * 定时/全量刷新只花一个空响应的代价；解析成功才写，保证 hdr 与可用缓存同代 */
+
+/* 200 响应后让验证器与缓存同代：响应带验证器则更新，不带则清除旧记录 */
+static void FeedSyncValidators(const char *url, const HttpInfo *info)
+{
+    char hb[256];
+    int n;
+    if (info->etag[0] || info->lastMod[0]) {
+        n = snprintf(hb, sizeof(hb), "%s\n%s\n", info->etag, info->lastMod);
+        if (n > 0) WriteUrlCache(url, L"feed_", L"hdr", hb, (DWORD)n);
+    } else {
+        wchar_t cp[MAX_PATH];
+        UrlCachePath(url, L"feed_", L"hdr", cp, MAX_PATH);
+        DeleteFileW(cp);
+    }
+}
+
+/* 去掉行尾 \r 与空格（hdr 文件按行切分后的防御性清理） */
+static void TrimTail(char *s)
+{
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+}
+
+/* 有验证器且缓存本体在 → 组装条件请求头写入 out，返回 1；否则返回 0 */
+static int FeedCondHeaders(const char *url, wchar_t *out, int outMax)
+{
+    wchar_t cp[MAX_PATH];
+    DWORD len = 0;
+    char *hdr, *nl, *p;
+    char etag[160] = "", lastMod[64] = "";
+    int n = 0;
+
+    UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
+    if (GetFileAttributesW(cp) == INVALID_FILE_ATTRIBUTES) return 0;
+    hdr = ReadUrlCache(url, L"feed_", L"hdr", &len);
+    if (!hdr) return 0;
+    nl = strchr(hdr, '\n');
+    if (nl) {
+        *nl = 0;
+        strncpy(etag, hdr, sizeof(etag) - 1);
+        p = nl + 1;
+        nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        strncpy(lastMod, p, sizeof(lastMod) - 1);
+    }
+    free(hdr);
+    TrimTail(etag);
+    TrimTail(lastMod);
+    if (!etag[0] && !lastMod[0]) return 0;
+    out[0] = 0;
+    if (etag[0])
+        n += swprintf(out + n, (size_t)outMax - n, L"If-None-Match: %hs\r\n", etag);
+    if (lastMod[0])
+        n += swprintf(out + n, (size_t)outMax - n, L"If-Modified-Since: %hs\r\n", lastMod);
+    return 1;
+}
+
 static void ParseSortValue(const char *v)
 {
     if (strncmp(v, "title", 5) == 0)         g_sortCol = SORT_TITLE;
@@ -3972,40 +4076,143 @@ static Podcast* MakeFailedPod(const char *url)
     return p;
 }
 
+static void DecodeAmp(char *s);   /* 定义在 OPML 段，自动发现解 href 里的 &amp; 用 */
+
+/* ---------- 网页 <link> 自动发现订阅地址 ----------
+ * 粘贴播客主页（而非 RSS 地址）时，从 HTML 里找
+ * <link rel="alternate" type="application/rss+xml|atom+xml|feed+json" href="...">，
+ * 找到就用真实订阅地址重新加载，并把订阅升级过去（UI 在 FEED_ADDED 里同步 ini）。 */
+
+/* 大小写不敏感查找直接用 shlwapi 的 StrStrIA（HTML 标签/属性大小写不定） */
+
+/* 在 HTML 里找 feed <link> 的 href（malloc 返回，未解码实体），找不到返回 NULL */
+static char* HtmlFindFeedLink(const char *html)
+{
+    const char *p = html;
+    while ((p = StrStrIA(p, "<link")) != NULL) {
+        char tag[2048], lc[2048];
+        const char *gt = strchr(p, '>');
+        size_t len, i;
+        const char *h;
+        char c = p[5];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '/')
+            { p += 5; continue; }   /* <linkx 之类的误匹配 */
+        if (!gt || gt - p >= (ptrdiff_t)sizeof(tag)) { p += 5; continue; }
+        len = (size_t)(gt - p + 1);
+        memcpy(tag, p, len); tag[len] = 0;
+        for (i = 0; i <= len; i++)
+            lc[i] = (char)((tag[i] >= 'A' && tag[i] <= 'Z') ? tag[i] + 32 : tag[i]);
+        /* type 是精确串，足以判定；rel=alternate 宽松包含即可 */
+        if (strstr(lc, "alternate") &&
+            (strstr(lc, "application/rss+xml") ||
+             strstr(lc, "application/atom+xml") ||
+             strstr(lc, "application/feed+json"))) {
+            h = StrStrIA(lc, "href");
+            if (h) {
+                size_t off = (size_t)(h - lc) + 4, vlen;
+                char *v;
+                while (lc[off] == ' ' || lc[off] == '\t') off++;
+                if (lc[off] != '=') { p = gt + 1; continue; }
+                off++;
+                while (lc[off] == ' ' || lc[off] == '\t') off++;
+                if (lc[off] == '"' || lc[off] == '\'') {
+                    char q = lc[off++];
+                    const char *e = strchr(tag + off, q);
+                    if (!e) { p = gt + 1; continue; }
+                    vlen = (size_t)(e - (tag + off));
+                } else {
+                    size_t e = off;
+                    while (lc[e] && lc[e] != ' ' && lc[e] != '\t'
+                           && lc[e] != '>' && lc[e] != '/') e++;
+                    vlen = e - off;
+                }
+                v = (char*)malloc(vlen + 1);
+                if (!v) return NULL;
+                memcpy(v, tag + off, vlen); v[vlen] = 0;
+                return v;
+            }
+        }
+        p = gt + 1;
+    }
+    return NULL;
+}
+
+/* href 可能是相对地址：按页面地址补全为绝对地址 */
+static char* ResolveFeedUrl(const char *pageUrl, const char *href)
+{
+    wchar_t *bw, *rw, out[2083];
+    DWORD n = 2083;
+    char *r = NULL;
+    if (strstr(href, "://")) return _strdup(href);
+    if (href[0] == '/' && href[1] == '/') {   /* //host/path 协议相对 */
+        const char *scheme = strstr(pageUrl, "://");
+        size_t sl = scheme ? (size_t)(scheme - pageUrl) : 5;
+        char *v = (char*)malloc(sl + 1 + strlen(href) + 1);
+        if (!v) return NULL;
+        memcpy(v, pageUrl, sl);
+        v[sl] = ':';
+        strcpy(v + sl + 1, href);
+        return v;
+    }
+    bw = U8ToW(pageUrl);
+    rw = U8ToW(href);
+    if (bw && rw && UrlCombineW(bw, rw, out, &n, 0) == S_OK) r = WToU8(out);
+    free(bw); free(rw);
+    return r;
+}
+
 /* 加载单条订阅：成功返回 Podcast*（已排序、含封面、feedUrl 已设）；
  * 失败时返回 loadFailed=1 的占位条目（让 URL 在列表中可见、可删除、可重试），
  * 仅在内存分配彻底失败时返回 NULL。
  * netFirst=0 启动模式：缓存命中就不联网，秒开且断网可用；
- * netFirst=1 刷新模式：强制联网取最新，成功后更新缓存，
- *            联网失败时回退缓存（断网刷新列表不清空） */
-static Podcast* LoadOneFeed(const char *url, int netFirst)
+ * netFirst=1 刷新模式：带验证器联网，服务器认 304 就直接吃本地缓存（省流量），
+ *            200 才更新缓存与验证器；联网失败时回退缓存（断网刷新列表不清空）。
+ * depth=0 时若拿到的是网页则按 <link> 自动发现真实订阅地址（仅一跳，防循环） */
+static Podcast* LoadOneFeedDepth(const char *url, int netFirst, int depth)
 {
     wchar_t *wurl;
     DWORD xmlLen = 0;
     char *xml;
     int fromNet = 0;
+    HttpInfo info;
     Podcast *pod;
 
+    info.status = 0; info.etag[0] = info.lastMod[0] = 0;
     xml = netFirst ? NULL : ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
     if (!xml) {
+        wchar_t cond[320];
+        const wchar_t *ch = FeedCondHeaders(url, cond, 320) ? cond : NULL;
         wurl = U8ToW(url);
         if (wurl) {
-            xml = HttpFetch(wurl, &xmlLen, 0, NULL, NULL);
+            xml = HttpFetchEx(wurl, &xmlLen, 0, NULL, NULL, ch, &info);
+            if (!xml && info.status == 304) {
+                /* 未变更：吃本地缓存；缓存意外丢失则去掉条件头重取一次 */
+                xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
+                if (!xml) {
+                    xml = HttpFetchEx(wurl, &xmlLen, 0, NULL, NULL, NULL, &info);
+                    if (xml) fromNet = 1;
+                }
+            } else if (xml) {
+                fromNet = 1;
+            }
             free(wurl);
         }
-        if (xml) {
-            fromNet = 1;
-        } else if (netFirst) {
-            xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
-            if (!xml) return MakeFailedPod(url);
-        } else {
-            return MakeFailedPod(url);
+        if (!xml) {
+            if (netFirst) {
+                xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
+                if (!xml) return MakeFailedPod(url);
+            } else {
+                return MakeFailedPod(url);
+            }
         }
     }
 
     pod = (Podcast*)calloc(1, sizeof(Podcast));
     if (pod && ParseFeed(xml, pod)) {
-        if (fromNet) WriteUrlCache(url, L"feed_", L"xml", xml, xmlLen);
+        if (fromNet) {
+            WriteUrlCache(url, L"feed_", L"xml", xml, xmlLen);
+            FeedSyncValidators(url, &info);
+        }
         SortPodcast(pod);
         pod->feedUrl = _strdup(url);
         if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
@@ -4013,8 +4220,35 @@ static Podcast* LoadOneFeed(const char *url, int netFirst)
         return pod;
     }
     if (pod) { FreePodcast(pod); free(pod); }
+
+    /* 解析失败且内容来自联网：当是网页处理，尝试 <link> 自动发现真实订阅地址 */
+    if (fromNet && depth == 0) {
+        char *href = HtmlFindFeedLink(xml);
+        if (href) {
+            char *f;
+            DecodeAmp(href);
+            f = ResolveFeedUrl(url, href);
+            free(href);
+            if (f && strcmp(f, url) != 0) {
+                Podcast *dp = LoadOneFeedDepth(f, 1, 1);
+                if (dp && !dp->loadFailed) {
+                    dp->srcUrl = _strdup(url);   /* UI 据此把 ini 地址升级为真实订阅地址 */
+                    free(f);
+                    free(xml);
+                    return dp;
+                }
+                if (dp) { FreePodcast(dp); free(dp); }
+            }
+            free(f);
+        }
+    }
     free(xml);
     return MakeFailedPod(url);
+}
+
+static Podcast* LoadOneFeed(const char *url, int netFirst)
+{
+    return LoadOneFeedDepth(url, netFirst, 0);
 }
 
 /* 加载线程参数：订阅 URL 快照。线程不再读 g_feedUrls，
@@ -6119,6 +6353,7 @@ static void FreePodcast(Podcast *p)
     free(p->copyright);
     free(p->imageUrl);
     free(p->feedUrl);
+    free(p->srcUrl);
     if (p->hImage) DeleteObject(p->hImage);
 }
 
@@ -6225,9 +6460,11 @@ static void RemovePodcast(int i)
     }
 
     if (g_pods[i].feedUrl) {
-        /* 顺带清掉该订阅的 RSS/封面缓存（已缓存音频 mp3 保留） */
+        /* 顺带清掉该订阅的 RSS/封面缓存与验证器（已缓存音频 mp3 保留） */
         wchar_t cp[MAX_PATH];
         UrlCachePath(g_pods[i].feedUrl, L"feed_", L"xml", cp, MAX_PATH);
+        DeleteFileW(cp);
+        UrlCachePath(g_pods[i].feedUrl, L"feed_", L"hdr", cp, MAX_PATH);
         DeleteFileW(cp);
         if (g_pods[i].imageUrl) {
             UrlCachePath(g_pods[i].imageUrl, L"cover_", L"img", cp, MAX_PATH);
@@ -6275,8 +6512,10 @@ static void PumpRefreshQueue(void)
     url = g_refreshQ[0];
     memmove(&g_refreshQ[0], &g_refreshQ[1], (g_refreshQN - 1) * sizeof(char*));
     g_refreshQN--;
-    /* 清掉 RSS 缓存，强制联网取最新 */
+    /* 清掉 RSS 缓存与验证器，强制联网全量取最新 */
     UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
+    DeleteFileW(cp);
+    UrlCachePath(url, L"feed_", L"hdr", cp, MAX_PATH);
     DeleteFileW(cp);
     AddSingleFeedEx(url, 1);   /* 原位替换，不改变订阅顺序 */
     free(url);
@@ -10589,12 +10828,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_FEED_ADDED: {
         Podcast *pod = (Podcast*)lParam;
         int incremental = (int)wParam;   /* 0=全量刷新 1=单条添加 2=原位替换 */
+        char *oldUrl = NULL;             /* 自动发现前的原始网页地址（匹配老条目用） */
+        if (pod && pod->srcUrl && pod->feedUrl) {
+            /* 网页自动发现：订阅地址升级为真实 feed 地址（ini 退出时统一落盘）；
+             * “已看”水位与“上次听到”按旧地址的哈希迁过来，无水位则视为全部已看 */
+            unsigned int oh = LastEpHash(pod->srcUrl), nh = LastEpHash(pod->feedUrl);
+            SeenEp *se = SeenFind(oh);
+            LastEp *le = LastEpFind(oh);
+            int k;
+            for (k = 0; k < g_feedUrlCount; k++) {
+                if (strcmp(g_feedUrls[k], pod->srcUrl) == 0) {
+                    char *nu = _strdup(pod->feedUrl);
+                    if (nu) { free(g_feedUrls[k]); g_feedUrls[k] = nu; }
+                    break;
+                }
+            }
+            SeenSet(nh, se ? se->seenKey : PodMaxDateKey(pod));
+            SeenDrop(oh);
+            if (le) { LastEpSet(nh, le->epUrl, le->sec); LastEpDrop(oh); }
+            oldUrl = pod->srcUrl;        /* 接管：原位替换匹配完再 free */
+            pod->srcUrl = NULL;
+        }
         if (pod && incremental == 2) {
             /* 右键"刷新播客"：按 feedUrl 原位替换，列表顺序不变 */
+            const char *want = oldUrl ? oldUrl : pod->feedUrl;
             int idx = -1, x;
             for (x = 0; x < g_podCount; x++)
-                if (g_pods[x].feedUrl && pod->feedUrl &&
-                    strcmp(g_pods[x].feedUrl, pod->feedUrl) == 0) { idx = x; break; }
+                if (g_pods[x].feedUrl && want &&
+                    strcmp(g_pods[x].feedUrl, want) == 0) { idx = x; break; }
             if (idx >= 0) {
                 Podcast old = g_pods[idx];
                 g_pods[idx] = *pod;      /* 接管新数据（含封面句柄） */
@@ -10643,6 +10904,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             free(pod);
         }
+        free(oldUrl);
         return 0;
     }
 
