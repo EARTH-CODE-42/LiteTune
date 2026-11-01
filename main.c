@@ -42,6 +42,7 @@
 #include <mfidl.h>
 #include <mfplay.h>
 #include <mfreadwrite.h>
+#include <mmsystem.h>   /* PlaySound：新剧集提示音 */
 #include <gdiplus.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,7 @@ typedef struct {
     int      epCount;
     int      epCap;
     int      loadFailed; /* 1=订阅获取/解析失败的占位条目（无剧集，可删除/重试） */
+    int      refreshFailed; /* 1=联网刷新失败、退回旧缓存（内容可能过期，列表提示） */
     int      newCount;   /* 新剧集数（超过“已看”水位的集数，列表角标） */
 } Podcast;
 
@@ -222,6 +224,7 @@ static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
 static wchar_t  g_cacheDir[MAX_PATH] = L"";
 static int      g_cacheDays = 30;   /* 自动清理天数：0=关（配置 cachedays，默认 30） */
 static int      g_autoRefreshMin = 60; /* 自动刷新间隔（分钟）：0=关（配置 autorefresh，默认 60） */
+static int      g_traySound = 1;    /* 托盘新剧集提示音：1=开（配置 traysound，默认 1） */
 
 /* 工具提示 */
 static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 */
@@ -387,7 +390,7 @@ enum {
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
     TR_BATCH_DONE_CAP, TR_BATCH_CANCELLED, TR_BATCH_STOPPING,
     TR_LOADING_PROG,
-    TR_FEED_FAIL_TITLE, TR_FEED_FAIL_SUB,
+    TR_FEED_FAIL_TITLE, TR_FEED_FAIL_SUB, TR_STALE_SUB,
     TR_M_IMPORT, TR_M_EXPORT, TR_M_EXP_OPML, TR_M_EXP_INI,
     TR_IMP_TITLE, TR_EXP_OPML_CAP, TR_EXP_INI_CAP, TR_EXP_DONE, TR_EXP_FAIL,
     TR_IMP_INI_Q, TR_IMP_INI_DONE, TR_IMP_WRITE_FAIL,
@@ -402,6 +405,7 @@ enum {
     TR_CTX_ADD_POD,
     TR_CLIP_OK, TR_CLIP_FAIL,
     TR_M_AUTOREFRESH, TR_AR_MIN_FMT, TR_AR_SET_FMT,
+    TR_M_TRAY_SOUND, TR_SOUND_ON, TR_SOUND_OFF,
     TR_BALLOON_NEW_FMT,
     TR_N
 };
@@ -478,6 +482,7 @@ static const wchar_t *tr(int id)
         L"正在加载订阅 %d/%d ...",
         L"加载失败的订阅",
         L"无法获取或解析，按 × 按钮可删除；刷新可重试",
+        L"刷新失败，显示缓存内容",
         L"导入...", L"导出", L"OPML 订阅列表", L"配置文件 (feeds.ini)",
         L"导入", L"导出 OPML", L"导出配置",
         L"已导出", L"无法写入文件",
@@ -502,6 +507,7 @@ static const wchar_t *tr(int id)
         L"添加订阅...",
         L"已复制到剪贴板", L"复制失败",
         L"自动刷新", L"%d 分钟", L"自动刷新：%ls",
+        L"新剧集提示音", L"提示音已开启", L"提示音已关闭",
         L"发现 %d 集新剧集"
     };
     static const wchar_t *const en[TR_N] = {
@@ -584,6 +590,7 @@ static const wchar_t *tr(int id)
         L"Loading feeds %d/%d ...",
         L"Failed to load feed",
         L"Cannot fetch or parse. Click \u00d7 to remove, Refresh to retry",
+        L"Refresh failed, showing cached data",
         L"Import...", L"Export", L"OPML feed list", L"Configuration (feeds.ini)",
         L"Import", L"Export OPML", L"Export Configuration",
         L"Exported", L"Cannot write the file",
@@ -614,6 +621,8 @@ static const wchar_t *tr(int id)
         L"Add subscription...",
         L"Copied to clipboard", L"Copy failed",
         L"Auto-Refresh", L"%d min", L"Auto-refresh: %ls",
+        L"New episode sound", L"Notification sound on",
+        L"Notification sound off",
         L"Found %d new episode(s)"
     };
     return (g_lang ? en : zh)[id];
@@ -3169,6 +3178,9 @@ static void TrayBalloonNewEpisodes(int total)
     wcscpy_s(nid.szInfoTitle, 64, L"LiteTune");
     swprintf(nid.szInfo, 256, tr(TR_BALLOON_NEW_FMT), total);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
+    /* 系统通知音（跟随用户的 Windows 声音方案；未配置该事件时保持安静） */
+    if (g_traySound)
+        PlaySoundW(L"SystemNotification", NULL, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
 }
 
 /* ================= 订阅 XML / 封面缓存（cache\feed_*.xml、cover_*.img） ================= */
@@ -3594,6 +3606,9 @@ static void ParseConfigLine(char *line)
             g_autoRefreshMin = atoi(val);
             if (g_autoRefreshMin < 0) g_autoRefreshMin = 0;
         }
+        else if (strcmp(s, "traysound") == 0) {
+            g_traySound = (atoi(val) != 0);
+        }
     } else if (strstr(s, "://")) {
         AddFeedUrl(s);   /* [feeds] 段或旧 txt 的裸 URL */
     }
@@ -3782,6 +3797,7 @@ static void LoadConfig(void)
     g_speed = 100;
     g_cfgExternal = 0;
     g_autoRefreshMin = 60;
+    g_traySound = 1;
     free(g_resumeUrl); g_resumeUrl = NULL;
     g_resumeSec = 0;
     g_resumePaused = 0;
@@ -3930,6 +3946,7 @@ static char *BuildConfigText(DWORD *lenOut)
         SbAddf(&sb, "cachedays=%d\n", g_cacheDays);
     if (g_autoRefreshMin != 60)   /* 默认 60 分钟不写入 */
         SbAddf(&sb, "autorefresh=%d\n", g_autoRefreshMin);
+    if (!g_traySound) SbAddf(&sb, "traysound=0\n");   /* 默认开，仅关时记录 */
     SbAddf(&sb, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         SbAddf(&sb, "%s\n", g_feedUrls[i]);
@@ -4173,7 +4190,7 @@ static Podcast* LoadOneFeedDepth(const char *url, int netFirst, int depth)
     wchar_t *wurl;
     DWORD xmlLen = 0;
     char *xml;
-    int fromNet = 0;
+    int fromNet = 0, stale = 0;
     HttpInfo info;
     Podcast *pod;
 
@@ -4201,6 +4218,7 @@ static Podcast* LoadOneFeedDepth(const char *url, int netFirst, int depth)
             if (netFirst) {
                 xml = ReadUrlCache(url, L"feed_", L"xml", &xmlLen);
                 if (!xml) return MakeFailedPod(url);
+                stale = 1;   /* 联网失败退回缓存：列表里标“可能过期” */
             } else {
                 return MakeFailedPod(url);
             }
@@ -4209,6 +4227,7 @@ static Podcast* LoadOneFeedDepth(const char *url, int netFirst, int depth)
 
     pod = (Podcast*)calloc(1, sizeof(Podcast));
     if (pod && ParseFeed(xml, pod)) {
+        pod->refreshFailed = stale;
         if (fromNet) {
             WriteUrlCache(url, L"feed_", L"xml", xml, xmlLen);
             FeedSyncValidators(url, &info);
@@ -6244,6 +6263,15 @@ static void PlayAdjacent(int delta)
     RequestPlayEpisode(pod, target);
 }
 
+/* 续播回退：按“上次听到”恢复时往回退几秒，避免一开场重复刚听过的半句话 */
+#define RESUME_BACK_SEC 3
+static long long ResumeSeek100ns(long long sec)
+{
+    if (sec <= 0) return 0;
+    sec -= RESUME_BACK_SEC;
+    return (sec > 0 ? sec : 0) * 10000000LL;
+}
+
 /* 双击播客：优先续播“上次听到哪”的橙色剧集，无记录则从第 1 集开始。
  * 与剧集列表双击同一约定：先置 g_resumeSeek100ns，再由 PLAY 事件一次性定位。 */
 static void PlayPodcastDefault(int pod)
@@ -6266,7 +6294,7 @@ static void PlayPodcastDefault(int pod)
         for (i = 0; i < p->epCount; i++) {
             if (p->eps[i].url && wcscmp(p->eps[i].url, le->epUrl) == 0) {
                 target = i;
-                g_resumeSeek100ns = le->sec * 10000000LL;
+                g_resumeSeek100ns = ResumeSeek100ns(le->sec);
                 break;
             }
         }
@@ -6297,7 +6325,7 @@ static void TryResumePlayback(void)
                 break;
             }
     if (pod >= 0) {
-        g_resumeSeek100ns = g_resumeSec * 10000000LL;
+        g_resumeSeek100ns = ResumeSeek100ns(g_resumeSec);
         SendMessageW(g_listPod, LB_SETCURSEL, pod, 0);
         SelectPodcast(pod);
         RequestPlayEpisode(pod, ep);
@@ -9076,6 +9104,7 @@ static void OnSettingsButton(void)
         }
         MenuAddPopup(menu, ar, tr(TR_M_AUTOREFRESH), 0);
     }
+    MenuAdd(menu, g_traySound ? MF_CHECKED : 0, 45, tr(TR_M_TRAY_SOUND));
     MenuAddSep(menu);
     MenuAdd(menu, 0, 22, tr(TR_M_IMPORT));
     MenuAdd(exp, 0, 23, tr(TR_M_EXP_OPML));
@@ -9143,6 +9172,11 @@ static void OnSettingsButton(void)
         else wcscpy_s(d, 32, tr(TR_CC_OFF));
         swprintf(t, 64, tr(TR_AR_SET_FMT), d);
         SetStatusTemp(t);
+        return;
+    }
+    if (cmd == 45) {
+        g_traySound = !g_traySound;
+        SetStatusTemp(g_traySound ? tr(TR_SOUND_ON) : tr(TR_SOUND_OFF));
         return;
     }
     if (cmd == 4) {
@@ -10071,8 +10105,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 } else if (p->loadFailed) {
                     tp = tr(TR_FEED_FAIL_TITLE);
                 } else tp = p->title;
+                /* 加载失败=橙（要处理）；刷新失败退回缓存=灰（内容可能过期） */
                 SetTextColor(di->hDC,
-                    p->loadFailed ? RGB(230,175,50) : (isPlaying ? ThGreen() : ThText()));
+                    p->loadFailed ? RGB(230,175,50)
+                                  : (isPlaying ? ThGreen()
+                                               : (p->refreshFailed ? ThDim() : ThText())));
                 SelectObject(di->hDC, g_fontBold);
                 DrawTextW(di->hDC, tp, -1, &rct,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -10084,7 +10121,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const wchar_t *sub = isCache
                     ? tr(TR_OFFLINE_LOCAL)
                     : (p->loadFailed ? tr(TR_FEED_FAIL_SUB)
-                       : (p->copyright ? p->copyright : p->author));
+                       : (p->refreshFailed ? tr(TR_STALE_SUB)
+                          : (p->copyright ? p->copyright : p->author)));
                 if (sub && *sub) {
                     RECT rcs = rc;
                     rcs.left = textLeft;
@@ -10546,7 +10584,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (le && le->sec > 0 && sel < p->epCount &&
                         p->eps[sel].url && le->epUrl &&
                         wcscmp(p->eps[sel].url, le->epUrl) == 0)
-                        g_resumeSeek100ns = le->sec * 10000000LL;
+                        g_resumeSeek100ns = ResumeSeek100ns(le->sec);
                     else
                         g_resumeSeek100ns = 0;
                 } else if (sel >= 0) {
