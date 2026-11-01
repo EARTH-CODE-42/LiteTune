@@ -214,6 +214,7 @@ static HICON    g_trayIco = NULL;    /* 托盘小图标（资源加载，退出�
 #define FLY_CLASS L"LiteTuneFlyout"
 static HWND     g_fly = NULL;        /* 浮窗（popup，平时隐藏） */
 static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
+static DWORD    g_trayClickTick;     /* 上次托盘单击时刻（过滤双击的第二击） */
 #define FLY_PAD   6                  /* 浮窗内边距 */
 #define FLY_BTN   32                 /* 按钮边长 */
 #define FLY_GAP   2                  /* 按钮间距 */
@@ -1124,6 +1125,9 @@ static void RecreateSlider(HWND *ph, WNDPROC *pold, int id, int maxRange, int po
     SendMessageW(*ph, TBM_SETPOS, TRUE, pos);
     *pold = (WNDPROC)SetWindowLongPtrW(*ph, GWLP_WNDPROC, (LONG_PTR)SliderProc);
 }
+
+static void PaintCaption(HWND hwnd);
+static void RepaintCaption(HWND hwnd);
 
 static void ApplyTheme(void)
 {
@@ -9361,7 +9365,8 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static void CreateFlyout(HINSTANCE hInst)
 {
     int i;
-    g_fly = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+    /* NOACTIVATE：悬停弹出，不能抢走当前窗口焦点 */
+    g_fly = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         FLY_CLASS, NULL, WS_POPUP | WS_BORDER,
         0, 0, FLY_W, FLY_H, NULL, NULL, hInst, NULL);
     if (!g_fly) return;
@@ -9372,22 +9377,35 @@ static void CreateFlyout(HINSTANCE hInst)
             FLY_BTN, FLY_BTN, g_fly, (HMENU)(INT_PTR)i, hInst, NULL);
 }
 
-/* 在托盘图标正上方弹出浮窗（夹到屏幕工作区内） */
+/* 托盘图标屏幕矩形；拿不到时用光标位置估计 */
+static void TrayIconRect(HWND hwnd, RECT *rc)
+{
+    NOTIFYICONIDENTIFIER niid;
+    POINT pt;
+    ZeroMemory(&niid, sizeof(niid));
+    niid.cbSize = sizeof(niid);
+    niid.hWnd = hwnd;
+    niid.uID = 1;
+    if (Shell_NotifyIconGetRect(&niid, rc) == S_OK) return;
+    GetCursorPos(&pt);
+    SetRect(rc, pt.x - 8, pt.y - 8, pt.x + 8, pt.y + 8);
+}
+
+/* 在托盘图标正上方弹出浮窗（底边贴图标顶边，夹到屏幕工作区内） */
 static void ShowFlyout(void)
 {
-    POINT pt;
-    RECT wr;
+    RECT ir, wr;
     HMONITOR mon;
     MONITORINFO mi;
     if (!g_fly) return;
     g_flyHover = -1;
-    GetCursorPos(&pt);
-    wr.left = pt.x - FLY_W / 2;
-    wr.top = pt.y - FLY_H - 8;      /* 光标上方 8px */
+    TrayIconRect(g_hwnd, &ir);
+    wr.left = (ir.left + ir.right) / 2 - FLY_W / 2;
+    wr.top = ir.top - FLY_H - 6;    /* 图标上方 6px：不挡图标本身和邻居 */
     wr.right = wr.left + FLY_W;
     wr.bottom = wr.top + FLY_H;
     mi.cbSize = sizeof(mi);
-    mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    mon = MonitorFromRect(&ir, MONITOR_DEFAULTTONEAREST);
     if (GetMonitorInfoW(mon, &mi)) {
         if (wr.left < mi.rcWork.left) {
             wr.right += mi.rcWork.left - wr.left; wr.left = mi.rcWork.left;
@@ -9709,6 +9727,184 @@ static void UpdatePodTipFromPoint(POINT pt)
 }
 
 /* ================= 窗口过程 ================= */
+/* ================= 自绘标题栏（非客户区） ================= */
+/* 去掉系统标题栏，自己在 NC 区画一条：最小化到任务栏 / 最小化到托盘 /
+ * 最大化-还原 / 关闭。保留 WS_THICKFRAME：边缘缩放、拖动、贴边吸附、
+ * 双击最大化都仍是系统原生行为，只是按钮由我们画。 */
+#define TITLE_H     34   /* 自绘标题栏高度 */
+#define FRAME_W      4   /* 可拖拽边框厚度 */
+#define CAP_BTN_W   44   /* 单个标题栏按钮宽度 */
+
+enum { CAP_MIN, CAP_TRAY, CAP_MAX, CAP_CLOSE, CAP_BTN_N };
+static int g_capHover  = -1;   /* 悬停的按钮索引，-1=无 */
+static int g_capActive = 1;    /* 窗口是否激活（标题文字变灰） */
+
+/* 标题栏几何（窗口坐标系；最大化时边框挂在屏幕外也能算对） */
+static void CaptionMetrics(HWND hwnd, RECT *band)
+{
+    RECT wr, cr;
+    POINT tl = { 0, 0 };
+    int cx, cy;
+    GetWindowRect(hwnd, &wr);
+    GetClientRect(hwnd, &cr);
+    ClientToScreen(hwnd, &tl);
+    cx = tl.x - wr.left;
+    cy = tl.y - wr.top;
+    band->left = cx;
+    band->right = cx + cr.right;
+    band->top = cy - TITLE_H;
+    band->bottom = cy;
+}
+
+/* 屏幕坐标点在哪个标题栏按钮上；-1=不是按钮 */
+static int CaptionButtonAt(HWND hwnd, POINT sp)
+{
+    RECT band, wr;
+    int i;
+    CaptionMetrics(hwnd, &band);
+    GetWindowRect(hwnd, &wr);
+    if (sp.y < band.top + wr.top || sp.y >= band.bottom + wr.top) return -1;
+    for (i = 0; i < CAP_BTN_N; i++) {
+        int x0 = band.right - CAP_BTN_W * (CAP_BTN_N - i) + wr.left;
+        if (sp.x >= x0 && sp.x < x0 + CAP_BTN_W) return i;
+    }
+    return -1;
+}
+
+/* 按钮图形：全部线条自绘，不依赖字体/图标资源 */
+static void CapGlyph(HDC hdc, int idx, const RECT *rc, int zoomed)
+{
+    int cx = (rc->left + rc->right) / 2;
+    int cy = (rc->top + rc->bottom) / 2;
+    switch (idx) {
+    case CAP_MIN:
+        MoveToEx(hdc, cx - 5, cy + 4, NULL);
+        LineTo(hdc, cx + 6, cy + 4);
+        break;
+    case CAP_TRAY:  /* 向下箭头落入托盘 */
+        MoveToEx(hdc, cx, cy - 8, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx - 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx + 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 5);
+        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx - 6, cy + 2);
+        MoveToEx(hdc, cx + 7, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 2);
+        break;
+    case CAP_MAX:
+        if (zoomed) {   /* 还原：两个错开的方框 */
+            Rectangle(hdc, cx - 7, cy - 6, cx + 1, cy + 1);
+            Rectangle(hdc, cx - 3, cy - 2, cx + 5, cy + 6);
+        } else {
+            Rectangle(hdc, cx - 5, cy - 5, cx + 6, cy + 5);
+        }
+        break;
+    case CAP_CLOSE:
+        MoveToEx(hdc, cx - 5, cy - 5, NULL); LineTo(hdc, cx + 6, cy + 6);
+        MoveToEx(hdc, cx + 6, cy - 5, NULL); LineTo(hdc, cx - 5, cy + 6);
+        break;
+    }
+}
+
+/* 只重画标题栏/边框，不碰客户区 */
+static void RepaintCaption(HWND hwnd)
+{
+    RedrawWindow(hwnd, NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+}
+
+static void PaintCaption(HWND hwnd)
+{
+    HDC hdc;
+    RECT band, wr, r;
+    HBRUSH hb;
+    int i, ww, wh;
+    COLORREF cBar  = g_darkMode ? RGB(30, 30, 34) : RGB(246, 246, 246);
+    COLORREF cLine = g_darkMode ? RGB(64, 64, 70) : RGB(178, 178, 182);
+    COLORREF cTxt  = g_capActive ? ThText()
+                                 : (g_darkMode ? RGB(140, 140, 146) : RGB(118, 118, 122));
+
+    if (IsIconic(hwnd)) return;
+    hdc = GetWindowDC(hwnd);
+    if (!hdc) return;
+    GetWindowRect(hwnd, &wr);
+    ww = wr.right - wr.left;
+    wh = wr.bottom - wr.top;
+    CaptionMetrics(hwnd, &band);
+
+    /* 标题栏带 + 三边窄边框；只涂非客户区，避免擦掉客户区内容 */
+    hb = CreateSolidBrush(cBar);
+    FillRect(hdc, &band, hb);
+    SetRect(&r, 0, band.top, FRAME_W, wh);            FillRect(hdc, &r, hb);
+    SetRect(&r, ww - FRAME_W, band.top, ww, wh);      FillRect(hdc, &r, hb);
+    SetRect(&r, 0, wh - FRAME_W, ww, wh);             FillRect(hdc, &r, hb);
+    DeleteObject(hb);
+
+    /* 1px 外框，明确窗口边界 */
+    {
+        HPEN p = CreatePen(PS_SOLID, 1, cLine);
+        HGDIOBJ op = SelectObject(hdc, p);
+        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, 0, 0, ww, wh);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(p);
+    }
+
+    /* 标题文字（沿用 SetWindowText 的内容：播放剧集/关机倒计时） */
+    {
+        wchar_t t[200];
+        RECT tr;
+        HGDIOBJ oldF;
+        GetWindowTextW(hwnd, t, 200);
+        tr.left = band.left + 12;
+        tr.right = band.right - CAP_BTN_W * CAP_BTN_N - 8;
+        tr.top = band.top;
+        tr.bottom = band.bottom;
+        if (tr.right > tr.left) {
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, cTxt);
+            oldF = SelectObject(hdc, g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT));
+            DrawTextW(hdc, t, -1, &tr,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            SelectObject(hdc, oldF);
+        }
+    }
+
+    /* 四个按钮 */
+    {
+        HPEN pen = CreatePen(PS_SOLID, 1, cTxt);
+        HGDIOBJ op = SelectObject(hdc, pen);
+        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        for (i = 0; i < CAP_BTN_N; i++) {
+            RECT br;
+            HPEN upen = pen;
+            br.left = band.right - CAP_BTN_W * (CAP_BTN_N - i);
+            br.right = br.left + CAP_BTN_W;
+            br.top = band.top;
+            br.bottom = band.bottom;
+            if (g_capHover == i) {
+                COLORREF hl = (i == CAP_CLOSE)
+                    ? RGB(196, 43, 28)
+                    : (g_darkMode ? RGB(58, 58, 64) : RGB(226, 226, 230));
+                HBRUSH hh = CreateSolidBrush(hl);
+                FillRect(hdc, &br, hh);
+                DeleteObject(hh);
+                if (i == CAP_CLOSE) {   /* 关闭按钮悬停：白叉 */
+                    upen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+                    SelectObject(hdc, upen);
+                }
+            }
+            CapGlyph(hdc, i, &br, IsZoomed(hwnd));
+            if (upen != pen) {
+                SelectObject(hdc, pen);
+                DeleteObject(upen);
+            }
+        }
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(pen);
+    }
+    ReleaseDC(hwnd, hdc);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     /* 任务栏缩略图工具栏：Explorer 广播此消息后初始化 */
@@ -9717,6 +9913,53 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     switch (msg) {
+    /* --- 自绘标题栏 --- */
+    case WM_NCHITTEST: {
+        RECT wr, band;
+        int x, y, ww, wh;
+        POINT sp = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        GetWindowRect(hwnd, &wr);
+        ww = wr.right - wr.left;
+        wh = wr.bottom - wr.top;
+        x = sp.x - wr.left;
+        y = sp.y - wr.top;
+        if (!IsZoomed(hwnd) &&
+            (x < FRAME_W || y < FRAME_W || x >= ww - FRAME_W || y >= wh - FRAME_W)) {
+            /* 四角/四边缩放 */
+            if (y < FRAME_W)
+                return (x < FRAME_W) ? HTTOPLEFT
+                     : (x >= ww - FRAME_W) ? HTTOPRIGHT : HTTOP;
+            if (y >= wh - FRAME_W)
+                return (x < FRAME_W) ? HTBOTTOMLEFT
+                     : (x >= ww - FRAME_W) ? HTBOTTOMRIGHT : HTBOTTOM;
+            return (x < FRAME_W) ? HTLEFT : HTRIGHT;
+        }
+        CaptionMetrics(hwnd, &band);
+        if (y >= band.top && y < band.bottom) {
+            /* 按钮区域交回客户区点击逻辑，空白处交给系统拖动 */
+            return CaptionButtonAt(hwnd, sp) >= 0 ? HTCLIENT : HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+    case WM_NCPAINT:
+        PaintCaption(hwnd);
+        return 0;
+    case WM_NCACTIVATE:
+        g_capActive = (wParam != FALSE);
+        PaintCaption(hwnd);
+        return TRUE;
+    case WM_NCMOUSEMOVE:
+        if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
+        break;
+    case WM_MOUSELEAVE:
+        if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
+        break;
+    case WM_SETTEXT: {
+        LRESULT lr = DefWindowProcW(hwnd, msg, wParam, lParam);
+        PaintCaption(hwnd);   /* 标题内容变了（播放剧集/关机倒计时） */
+        return lr;
+    }
+
     case WM_SETTINGCHANGE:
         /* 系统在浅色/深色之间切换后重画缩略图工具栏图标，避免颜色对不上 */
         if (lParam && !wcscmp((const wchar_t *)lParam, L"ImmersiveColorSet"))
@@ -10176,14 +10419,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
-        if (wParam == SIZE_MINIMIZED) {
-            /* 最小化 = 收进托盘（点 × 才是退出） */
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
-        }
+        if (wParam == SIZE_MINIMIZED) return 0;   /* 最小化到任务栏（收进托盘走标题栏托盘按钮） */
         /* 这里不再写 g_winW/g_winH——SaveConfig 统一用 GetWindowRect 抓外框矩形 */
         ApplyLayout(hwnd, IsWindowVisible(hwnd));
         UpdateMarquee();   /* 可用宽度变化，重算跑马灯 */
+        PaintCaption(hwnd);   /* 标题栏几何随窗口变化 */
         return 0;
 
     case WM_MOUSEWHEEL:
@@ -10191,6 +10431,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
             ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1));
             return 0;
+        }
+        /* 简介是只读 EDIT，没有 WS_VSCROLL，KatMouse 之类的滚轮重定向工具
+         * 会判定其不可滚动而把消息交给主窗口：这里补上，行为与列表一致 */
+        if (!g_descHidden && g_editDesc && IsWindowVisible(g_editDesc)) {
+            POINT sp = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            RECT dr;
+            GetWindowRect(g_editDesc, &dr);
+            if (PtInRect(&dr, sp)) {
+                int d = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -3 : 3;
+                SendMessageW(g_editDesc, EM_LINESCROLL, 0, (LPARAM)d);
+                SyncScrollBar(g_vsDesc);
+                return 0;
+            }
         }
         break;
 
@@ -10208,7 +10461,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_LBUTTONDOWN: {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        int s = SplitterHitTest(hwnd, pt.x, pt.y);
+        int s;
+        /* 标题栏按钮是 HTCLIENT，坐标映射到客户区时 y 为负；动作留到抬键 */
+        if (pt.y < 0) return 0;
+        s = SplitterHitTest(hwnd, pt.x, pt.y);
         if (s >= 0) {
             g_dragSplit = s;
             SetCapture(hwnd);
@@ -10219,6 +10475,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_MOUSEMOVE:
+        /* 标题栏按钮悬停高亮（HTCLIENT 映射过来时 y 为负） */
+        if (GET_Y_LPARAM(lParam) < 0) {
+            POINT sp;
+            int bi;
+            GetCursorPos(&sp);
+            bi = CaptionButtonAt(hwnd, sp);
+            if (bi != g_capHover) {
+                TRACKMOUSEEVENT tme;
+                g_capHover = bi;
+                RepaintCaption(hwnd);
+                ZeroMemory(&tme, sizeof(tme));
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+            }
+            return 0;
+        }
+        if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
         if (g_dragSplit >= 0) {
             RECT rc;
             int totalW, w1px, w2px, w3px;
@@ -10250,6 +10525,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
 
     case WM_LBUTTONUP:
+        if (GET_Y_LPARAM(lParam) < 0) {
+            POINT sp;
+            int bi;
+            GetCursorPos(&sp);
+            bi = CaptionButtonAt(hwnd, sp);
+            if (bi == CAP_MIN) {
+                ShowWindow(hwnd, SW_MINIMIZE);          /* 到任务栏 */
+            } else if (bi == CAP_TRAY) {
+                if (g_fly) ShowWindow(g_fly, SW_HIDE);  /* 到托盘 */
+                ShowWindow(hwnd, SW_HIDE);
+            } else if (bi == CAP_MAX) {
+                ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+                PaintCaption(hwnd);
+            } else if (bi == CAP_CLOSE) {
+                SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            return 0;
+        }
         if (g_dragSplit >= 0) {
             g_dragSplit = -1;
             ReleaseCapture();
@@ -10347,25 +10640,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
     case WM_GETMINMAXINFO: {
-        /* 限制的是客户区最小 480x360，换算成含标题栏/可调边框的外框尺寸
-         * （GetWindowRect 含每侧约 7-8px 不可见调宽边，直接写 480 会导致客户区被缩小） */
+        /* 客户区最小 480x360，外框 = 客户区 + 自绘标题栏 + 四周窄边框 */
         MINMAXINFO *mm = (MINMAXINFO*)lParam;
-        RECT wr = { 0, 0, 480, 360 };
-        AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
-        mm->ptMinTrackSize.x = wr.right - wr.left;
-        mm->ptMinTrackSize.y = wr.bottom - wr.top;
+        mm->ptMinTrackSize.x = 480 + 2*FRAME_W;
+        mm->ptMinTrackSize.y = 360 + TITLE_H + FRAME_W;
         return 0;
     }
 
     case WM_NCCALCSIZE: {
-        /* 窄边框：让 DefWindowProc 算出默认非客户区后，把客户区向外扩几像素，
-         * 压薄左右下三边的可见边框（标题栏保留）。尺寸拖拽仍由原命中区负责。 */
+        /* 整窗客户区，只在顶部留出 TITLE_H 的自绘标题栏带、四周留 FRAME_W 的缩放宽边 */
         if (wParam == TRUE) {
             NCCALCSIZE_PARAMS *ncp = (NCCALCSIZE_PARAMS*)lParam;
-            DefWindowProcW(hwnd, WM_NCCALCSIZE, wParam, lParam);
-            ncp->rgrc[0].left   -= 4;
-            ncp->rgrc[0].right  += 4;
-            ncp->rgrc[0].bottom += 4;
+            RECT *rc = &ncp->rgrc[0];
+            if (IsZoomed(hwnd)) {
+                /* 最大化：贴工作区，避免盖住任务栏；标题栏带仍留在顶部 */
+                MONITORINFO mi;
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                    rc->left   = mi.rcWork.left;
+                    rc->top    = mi.rcWork.top;
+                    rc->right  = mi.rcWork.right;
+                    rc->bottom = mi.rcWork.bottom;
+                }
+                rc->top += TITLE_H;
+            } else {
+                rc->left   += FRAME_W;
+                rc->top    += TITLE_H;
+                rc->right  -= FRAME_W;
+                rc->bottom -= FRAME_W;
+            }
             return 0;
         }
         break;
@@ -10714,6 +11017,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_playState == 0 && !g_downloading && !g_batchActive &&
                 !g_feedsLoading)
                 ReloadFeeds(1);
+            return 0;
+        }
+        if (wParam == 7) {
+            /* 悬停浮窗：光标同时离开图标与浮窗后收起（留 150ms 容错） */
+            POINT p;
+            RECT ir, fr;
+            GetCursorPos(&p);
+            TrayIconRect(hwnd, &ir);
+            if (g_fly && IsWindowVisible(g_fly)) GetWindowRect(g_fly, &fr);
+            else SetRectEmpty(&fr);
+            if (!PtInRect(&ir, p) && !PtInRect(&fr, p)) {
+                if (g_fly) ShowWindow(g_fly, SW_HIDE);
+                KillTimer(hwnd, 7);
+            }
             return 0;
         }
         /* 滚动条跟随内容/滚动实时刷新（自绘条是唯一滚动条） */
@@ -11144,17 +11461,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件。
-     * 左键单击：弹出迷你控制浮窗；右键：显示主窗口/退出菜单 */
+     * 悬停：图标上方弹迷你控制浮窗；单击：主窗口显示/收进托盘；右键：菜单 */
     case WM_TRAYICON:
-        /* 左键单击：弹出/收起控制浮窗（双击、右键行为不变） */
+        /* 悬停=图标上方弹浮窗；单击=主窗口显示/收进托盘；右键=菜单 */
+        if (LOWORD(lParam) == WM_MOUSEMOVE) {
+            /* 只在主窗口收进托盘/最小化时弹浮窗，不打扰正在看的主界面 */
+            if ((!IsWindowVisible(hwnd) || IsIconic(hwnd)) &&
+                (!g_fly || !IsWindowVisible(g_fly))) {
+                ShowFlyout();
+                SetTimer(hwnd, 7, 150, NULL);   /* 轮询光标是否已离开 */
+            }
+            return 0;
+        }
         if (LOWORD(lParam) == WM_LBUTTONUP) {
-            if (g_fly && IsWindowVisible(g_fly)) ShowWindow(g_fly, SW_HIDE);
-            else ShowFlyout();
-        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            /* 双击：直接恢复主窗口（第二击前单击已弹出的浮窗一并收起） */
+            DWORD now = GetTickCount();
+            if (now - g_trayClickTick < 400) return 0;   /* 双击的第二击忽略 */
+            g_trayClickTick = now;
             if (g_fly) ShowWindow(g_fly, SW_HIDE);
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
+            KillTimer(hwnd, 7);
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                ShowWindow(hwnd, SW_HIDE);               /* 再次单击：收进托盘 */
+            } else {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+            /* 单击已切换过，双击不再重复切换，避免窗口闪一下又收起 */
         } else if (LOWORD(lParam) == WM_RBUTTONUP) {
             POINT pt;
             HMENU m = CreatePopupMenu();
@@ -11196,6 +11528,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 3);
         KillTimer(hwnd, 4);
         KillTimer(hwnd, 6);   /* 自动刷新 */
+        KillTimer(hwnd, 7);   /* 托盘悬停浮窗轮询 */
         UnregisterHotKey(hwnd, 1);
         UnregisterHotKey(hwnd, 2);
         UnregisterHotKey(hwnd, 3);
@@ -11385,8 +11718,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
 
     /* 直接用保存的外框矩形（含标题栏边框）创建窗口，不走 AdjustWindowRectEx
      * 避免不同会话边框像素差异导致每次启动窗口变大。首次无保存时 CW_USEDEFAULT */
+    /* 去掉 WS_CAPTION：标题栏改由 WM_NCCALCSIZE/WM_NCPAINT 自绘；
+     * WS_THICKFRAME/WS_MAXIMIZEBOX/WS_SYSMENU 保留，拖动/缩放/吸附照旧 */
     hwnd = CreateWindowExW(0, CLASS_NAME, L"LiteTune",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        (WS_OVERLAPPEDWINDOW & ~WS_CAPTION) | WS_CLIPCHILDREN,
         g_winX, g_winY,
         g_winW, g_winH,
         NULL, NULL, hInst, NULL);
