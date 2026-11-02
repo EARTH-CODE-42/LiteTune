@@ -161,7 +161,7 @@ enum {
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
     IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
-    IDC_EDIT_FILTER, IDC_BTN_FAVONLY,
+    IDC_EDIT_FILTER, IDC_BTN_FAVONLY, IDC_BTN_PHONE,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
     IDC_TAB_DESC
 };
@@ -189,12 +189,14 @@ static HWND     g_sldVol, g_stVol, g_stFormat;
 static HWND     g_listPod, g_listEp, g_editDesc;
 static HWND     g_editFilter;      /* 剧集标题即时过滤框 */
 static HWND     g_btnFavOnly;      /* “只显示已收藏”开关按钮 */
+static int      g_cacheOnly;       /* “只显示已缓存”开关（缓存按钮） */
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
 static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAINT 统一画边框 */
 static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
-static HWND g_btnCache;        /* 批量缓存：Ctrl+多选剧集后点击下载 */
+static HWND     g_btnCache;        /* “只显示已缓存”开关（批量下载在多选右键菜单） */
+static HWND     g_btnPhone;        /* 手机播放/遥控开关 */
 /* 简介折叠/展开小按钮（自绘，悬停才显示） */
 static HWND     g_btnDescTab;
 static int      g_descHidden;      /* 1=简介区隐藏，剧集占满右侧 */
@@ -224,7 +226,7 @@ static DWORD    g_trayClickTick;     /* 上次托盘单击时刻（过滤双击�
 #define FLY_PAD   6                  /* 浮窗内边距 */
 #define FLY_BTN   32                 /* 按钮边长 */
 #define FLY_GAP   2                  /* 按钮间距 */
-#define FLY_W   (FLY_PAD * 2 + FLY_BTN * 4 + FLY_GAP * 3)
+#define FLY_W   (FLY_PAD * 2 + FLY_BTN * 5 + FLY_GAP * 4)
 #define FLY_H   (FLY_PAD * 2 + FLY_BTN)
 
 /* 缓存目录：默认程序目录下 cache，可由用户更改，退出时存入 ini */
@@ -235,6 +237,7 @@ static int      g_traySound = 1;    /* 托盘新剧集提示音：1=开（配置
 
 /* 工具提示 */
 static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 */
+static HWND     g_hwndCapTip = NULL;     /* 标题栏按钮的 tracking tooltip */
 static HWND     g_hwndPodTip = NULL;     /* 自定义 tooltip：播客封面+标题+作者 */
 static HWND     g_hwndEpTip = NULL;      /* 剧集列表 tracking tooltip（不依赖标题截断） */
 static int      g_tipPodIdx = -1;        /* 当前播客提示对应的条目下标 */
@@ -420,7 +423,6 @@ enum {
     TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_FAIL,
     TR_PHONE_ON, TR_PHONE_OFF, TR_PHONE_FW,
     TR_SPEED_SET,
-    TR_TRAY_SHOW, TR_TRAY_EXIT,
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
     TR_BATCH_DONE_CAP, TR_BATCH_CANCELLED, TR_BATCH_STOPPING,
     TR_LOADING_PROG,
@@ -444,6 +446,10 @@ enum {
     TR_TIP_FILTER, TR_FAV_ONLY_TIP,
     TR_CTX_FAV, TR_CTX_UNFAV, TR_FAV_ON, TR_FAV_OFF,
     TR_M_REFRESH_INT, TR_RI_FOLLOW, TR_TRAY_NEW_FMT,
+    TR_CAP_MIN, TR_CAP_TRAY, TR_CAP_MAX, TR_CAP_RESTORE, TR_CAP_CLOSE,
+    TR_TIP_PHONE, TR_CTX_REVEAL,
+    TR_CTX_FAV_N_FMT, TR_CTX_UNFAV_N_FMT, TR_CTX_DL_N_FMT,
+    TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_N
 };
 
@@ -510,8 +516,7 @@ static const wchar_t *tr(int id)
             L"另外，手机要连页面上标注 WiFi/以太网 的地址；复制到别的电脑运行时，"
             L"那台电脑也会重新询问一次防火墙权限。",
         L"倍速已切换",
-        L"显示主窗口", L"退出",
-        L"批量缓存（Ctrl+点选剧集后点击）",
+        L"只显示已缓存（右键多选可批量下载）",
         L"批量缓存 %d/%d…", L"批量缓存完成（成功 %d/%d 集）",
         L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中",
         L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）",
@@ -548,7 +553,11 @@ static const wchar_t *tr(int id)
         L"发现 %d 集新剧集",
         L"按标题过滤剧集", L"只显示已收藏",
         L"收藏", L"取消收藏", L"已收藏", L"已取消收藏",
-        L"刷新间隔", L"跟随全局设置", L"LiteTune - %d 集新剧集"
+        L"刷新间隔", L"跟随全局设置", L"LiteTune - %d 集新剧集",
+        L"最小化到任务栏", L"最小化到托盘", L"最大化", L"向下还原", L"关闭",
+        L"手机播放/遥控", L"打开文件位置",
+        L"收藏选中的 %d 集", L"取消收藏选中的 %d 集", L"下载选中的 %d 集",
+        L"已收藏 %d 集", L"已取消收藏 %d 集"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -621,8 +630,7 @@ static const wchar_t *tr(int id)
             L"Copying the program to another PC means that PC will ask for "
             L"firewall permission again.",
         L"Playback speed changed",
-        L"Show window", L"Exit",
-        L"Batch cache (Ctrl+click episodes, then click)",
+        L"Show cached only (right-click to batch download)",
         L"Batch caching %d/%d...", L"Batch cache done (%d/%d ok)",
         L"Select episodes first (Ctrl+click)", L"Batch cache in progress",
         L"Batch cache done (%d/%d ok, rest over limit skipped)",
@@ -668,7 +676,11 @@ static const wchar_t *tr(int id)
         L"Add to favorites", L"Remove from favorites",
         L"Added to favorites", L"Removed from favorites",
         L"Refresh interval", L"Use global setting",
-        L"LiteTune - %d new episode(s)"
+        L"LiteTune - %d new episode(s)",
+        L"Minimize", L"Minimize to tray", L"Maximize", L"Restore", L"Close",
+        L"Phone play/remote", L"Show in folder",
+        L"Favorite %d selected", L"Unfavorite %d selected", L"Download %d selected",
+        L"Favorited %d episode(s)", L"Unfavorited %d episode(s)"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -734,8 +746,17 @@ static int CopyToClipboardW(const wchar_t *text)
     return 1;
 }
 
-/* ---- 暗色弹窗（MessageBox / InputBox 共用） ----
- * 亮色模式不接管任何消息，全部走系统原样 */
+/* 在资源管理器中打开所在目录并选中该文件 */
+static void RevealInExplorer(const wchar_t *path)
+{
+    PIDLIST_ABSOLUTE pidl = NULL;
+    if (!path || !*path) return;
+    if (FAILED(SHParseDisplayName(path, NULL, &pidl, 0, NULL))) return;
+    SHOpenFolderAndSelectItems(pidl, 1, (PCUITEMID_CHILD_ARRAY)&pidl, 0);
+    CoTaskMemFree(pidl);
+}
+
+/* ---- 自绘弹窗（MessageBox / InputBox 共用，亮暗同款） ---- */
 static HBRUSH g_dlgBgBrush = NULL;      /* 弹窗背景刷，随主题重建 */
 static HBRUSH g_dlgPanelBrush = NULL;   /* 弹窗输入框底刷 */
 
@@ -764,16 +785,20 @@ static void FillDlgBg(HWND h, HDC dc)
     FillRect(dc, &rc, DlgBgBrush());
 }
 
-/* 暗色下压按钮绘制：底色、边框（默认键描主色）、焦点框、文字 */
+/* 自绘下压按钮：底色、边框（默认键描主色）、焦点框、文字；亮暗同款 */
 static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
 {
     wchar_t txt[128];
     HFONT f, of;
     RECT rc = di->rcItem, fr;
-    HBRUSH b = CreateSolidBrush((di->itemState & ODS_SELECTED)
-        ? RGB(24,24,28) : RGB(50,50,58));
-    HBRUSH bo = CreateSolidBrush((di->itemState & ODS_DEFAULT)
-        ? ThAccent() : RGB(86,86,96));
+    COLORREF bg = (di->itemState & ODS_SELECTED)
+        ? (g_darkMode ? RGB(24,24,28) : RGB(205,205,210))
+        : (g_darkMode ? RGB(50,50,58) : RGB(240,240,242));
+    COLORREF bd = (di->itemState & ODS_DEFAULT)
+        ? ThAccent()
+        : (g_darkMode ? RGB(86,86,96) : RGB(160,160,166));
+    HBRUSH b = CreateSolidBrush(bg);
+    HBRUSH bo = CreateSolidBrush(bd);
     FillRect(di->hDC, &rc, b);
     FrameRect(di->hDC, &rc, bo);
     DeleteObject(b);
@@ -794,36 +819,32 @@ static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
     SelectObject(di->hDC, of);
 }
 
-/* 暗色弹窗通用消息：背景/文字/编辑框/自绘按钮。
+/* 自绘弹窗通用消息：背景/文字/编辑框/自绘按钮（配色随主题）。
  * 已处理返回 1（结果写入 *res），否则返回 0 交回调用方 */
 static int DarkDlgMsg(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
 {
     switch (msg) {
     case WM_ERASEBKGND:
-        if (!g_darkMode) return 0;
         FillDlgBg(h, (HDC)wp);
         *res = 1;
         return 1;
     case WM_CTLCOLORSTATIC:
-        if (!g_darkMode) return 0;
         SetBkColor((HDC)wp, ThWinBg());
         SetTextColor((HDC)wp, ThText());
         *res = (LRESULT)DlgBgBrush();
         return 1;
     case WM_CTLCOLOREDIT:
-        if (!g_darkMode) return 0;
         SetBkColor((HDC)wp, ThPanel());
         SetTextColor((HDC)wp, ThText());
         *res = (LRESULT)DlgPanelBrush();
         return 1;
     case WM_CTLCOLORLISTBOX:
-        if (!g_darkMode) return 0;
         SetBkColor((HDC)wp, ThPanel());
         SetTextColor((HDC)wp, ThText());
         *res = (LRESULT)DlgPanelBrush();
         return 1;
     case WM_DRAWITEM:
-        if (g_darkMode && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
+        if (((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
             DrawDarkBtn((DRAWITEMSTRUCT*)lp);
             *res = TRUE;
             return 1;
@@ -902,13 +923,13 @@ static LRESULT CALLBACK MsgBoxHookProc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
-/* 统一的消息框入口（全项目都用它）；亮色直接透传系统 */
+/* 统一的消息框入口（全项目都用它）；亮/暗主题同一套自绘 */
 static int MessageBoxTh(HWND owner, const wchar_t *text,
                         const wchar_t *title, UINT type)
 {
     int r;
     HHOOK hook;
-    if (!g_darkMode) return MessageBoxW(owner, text, title, type);
+    /* 亮/暗都走同一套自绘，配色由主题函数切换，避免两套外观逻辑 */
     hook = SetWindowsHookExW(WH_CBT, MsgBoxHookProc, NULL, GetCurrentThreadId());
     r = MessageBoxW(owner, text, title, type);
     if (hook) UnhookWindowsHookEx(hook);
@@ -1805,7 +1826,7 @@ static void ApplyFontsToControls(void)
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_sldVol, g_stVol, g_stFormat,
         g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
-        g_listPod, g_listEp, g_editDesc, g_editFilter
+        g_btnPhone, g_listPod, g_listEp, g_editDesc, g_editFilter
     };
     int i;
     for (i = 0; i < (int)(sizeof(ctrls)/sizeof(ctrls[0])); i++)
@@ -3614,9 +3635,13 @@ static void ParseSortValue(const char *v)
 }
 
 /* 配置文本格式（exe 尾部内嵌与旧 feeds.ini 完全同构，互为迁移）：
- *   [settings] 下 sort=title|date|duration:asc|desc, w1/w2=列宽千分比
- *   [feeds] 下一行一个 RSS 地址（裸 URL，直接粘贴）
- *   兼容旧版无 section 的 feeds.txt */
+ *   [settings]     界面/播放/窗口/缓存目录等键值（sort、w1、vol、dark…）
+ *   [lastplayed]   resume/resumeplay/resumeurl 与每播客 lastep=
+ *   [favorites]    收藏的剧集 fav=
+ *   [seen]         每播客已看水位 seenep=
+ *   [podrefresh]   每播客刷新间隔 podrefresh=
+ *   [feeds]        每行一个 RSS 地址（裸 URL，直接粘贴）
+ *   解析按行键名匹配、忽略 [section] 行，兼容旧版无分节的 feeds.txt */
 
 /* ---------- 配置内嵌 exe 尾部（PE overlay）：单文件便携 ----------
  * 配置跟着 exe 走：复制 exe 到 U 盘/别的电脑 = 连配置一起带走。
@@ -4219,7 +4244,7 @@ static char *BuildConfigText(DWORD *lenOut)
     sb.p = NULL; sb.len = 0; sb.cap = 0;
     SbAddf(&sb, "; LiteTune config\n");
     SbAddf(&sb, "; Add one RSS feed URL per line under [feeds]\n");
-    SbAddf(&sb, "[settings]\n");
+    SbAddf(&sb, "\n[settings]\n");
     SbAddf(&sb, "sort=%s:%s\n", SortColName(), g_sortDir > 0 ? "asc" : "desc");
     SbAddf(&sb, "w1=%d\n", g_w1perm);
     SbAddf(&sb, "w2=%d\n", g_w2perm);
@@ -4236,6 +4261,17 @@ static char *BuildConfigText(DWORD *lenOut)
     SbAddf(&sb, "winh=%d\n", g_winH);
     SbAddf(&sb, "winx=%d\n", g_winX);
     SbAddf(&sb, "winy=%d\n", g_winY);
+    if (g_cacheDir[0]) {
+        char *u8 = WToU8(g_cacheDir);
+        if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
+    }
+    if (g_cacheDays != 30)   /* 默认 30 天不写入，保持配置干净 */
+        SbAddf(&sb, "cachedays=%d\n", g_cacheDays);
+    if (g_autoRefreshMin != 60)   /* 默认 60 分钟不写入 */
+        SbAddf(&sb, "autorefresh=%d\n", g_autoRefreshMin);
+    if (!g_traySound) SbAddf(&sb, "traysound=0\n");   /* 默认开，仅关时记录 */
+
+    SbAddf(&sb, "\n[lastplayed]\n");
     /* 续播记忆：正在播放/暂停时记住剧集与位置；已手动停止则不写（下次不续播） */
     if (g_playUrl && g_playState != 0) {
         long long pos = PlayerGet100ns(0);
@@ -4265,18 +4301,8 @@ static char *BuildConfigText(DWORD *lenOut)
             }
         }
     }
-    /* 每播客“已看”水位（新剧集角标），dateKey 拆两个 32 位写 */
-    {
-        int li;
-        for (li = 0; li < g_seenEpCount; li++) {
-            if (g_seenEps[li].hash != 0 && g_seenEps[li].seenKey > 0) {
-                SbAddf(&sb, "seenep=%x,%u,%u\n", g_seenEps[li].hash,
-                       (unsigned int)((unsigned long long)g_seenEps[li].seenKey >> 32),
-                       (unsigned int)(g_seenEps[li].seenKey & 0xFFFFFFFFu));
-            }
-        }
-    }
     /* 每播客收藏的剧集（fav=<hash>,<utf8url>，URL 可含逗号，解析按第一个逗号切） */
+    SbAddf(&sb, "\n[favorites]\n");
     {
         int li;
         for (li = 0; li < g_favCount; li++) {
@@ -4289,7 +4315,20 @@ static char *BuildConfigText(DWORD *lenOut)
             }
         }
     }
+    /* 每播客“已看”水位（新剧集角标），dateKey 拆两个 32 位写 */
+    SbAddf(&sb, "\n[seen]\n");
+    {
+        int li;
+        for (li = 0; li < g_seenEpCount; li++) {
+            if (g_seenEps[li].hash != 0 && g_seenEps[li].seenKey > 0) {
+                SbAddf(&sb, "seenep=%x,%u,%u\n", g_seenEps[li].hash,
+                       (unsigned int)((unsigned long long)g_seenEps[li].seenKey >> 32),
+                       (unsigned int)(g_seenEps[li].seenKey & 0xFFFFFFFFu));
+            }
+        }
+    }
     /* 每播客自动刷新间隔（podrefresh=<hash>,<min>；跟随全局不写） */
+    SbAddf(&sb, "\n[podrefresh]\n");
     {
         int li;
         for (li = 0; li < g_podRefCount; li++)
@@ -4297,15 +4336,7 @@ static char *BuildConfigText(DWORD *lenOut)
                 SbAddf(&sb, "podrefresh=%x,%d\n",
                        g_podRefs[li].hash, g_podRefs[li].min);
     }
-    if (g_cacheDir[0]) {
-        char *u8 = WToU8(g_cacheDir);
-        if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
-    }
-    if (g_cacheDays != 30)   /* 默认 30 天不写入，保持配置干净 */
-        SbAddf(&sb, "cachedays=%d\n", g_cacheDays);
-    if (g_autoRefreshMin != 60)   /* 默认 60 分钟不写入 */
-        SbAddf(&sb, "autorefresh=%d\n", g_autoRefreshMin);
-    if (!g_traySound) SbAddf(&sb, "traysound=0\n");   /* 默认开，仅关时记录 */
+
     SbAddf(&sb, "\n[feeds]\n");
     for (i = 0; i < g_feedUrlCount; i++)
         SbAddf(&sb, "%s\n", g_feedUrls[i]);
@@ -6298,7 +6329,7 @@ static const wchar_t* EpListTitle(const Podcast *p, int ep)
     return buf;
 }
 
-/* 过滤判定：标题子串（大小写不敏感）+ 可选“只看已收藏” */
+/* 过滤判定：标题子串（大小写不敏感）+ 可选“只看已收藏/已缓存” */
 static int EpMatchesFilter(const Podcast *p, int ep)
 {
     Episode *e = &p->eps[ep];
@@ -6306,6 +6337,7 @@ static int EpMatchesFilter(const Podcast *p, int ep)
         if (g_viewCached || !p->feedUrl) return 0;
         if (!FavHas(LastEpHash(p->feedUrl), e->url)) return 0;
     }
+    if (g_cacheOnly && !g_viewCached && !EpisodeIsCached(e)) return 0;
     if (g_epFilter[0]) {
         const wchar_t *t = (e->title && *e->title) ? e->title : L"";
         if (!StrStrIW(t, g_epFilter)) return 0;
@@ -6340,6 +6372,10 @@ static void FillEpisodeList(void)
         if (row < 0) continue;
         EpMapPush(i);
 
+        /* 子列不能用 LVIF_PARAM（只对 iSubItem=0 合法），否则设置失败，
+         * 表现为标题正常、日期/时长空白 */
+        lvi.mask = LVIF_TEXT;
+        lvi.lParam = 0;
         lvi.iItem = row;
         lvi.iSubItem = 1;
         lvi.pszText = g_viewCached
@@ -8384,6 +8420,7 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(g_btnDel,     x + 27, by, 24, 24, TRUE);
     MoveWindow(g_btnRefresh, x + 54, by, 24, 24, TRUE);
     MoveWindow(g_btnDir,     x + 81, by, 24, 24, TRUE);
+    if (g_btnPhone) MoveWindow(g_btnPhone, x + 108, by, 24, 24, TRUE);
     /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
     {
@@ -8394,19 +8431,21 @@ static void LayoutControls(HWND hwnd)
         g_rcPanel[0].right = x + w1;     g_rcPanel[0].bottom = by + bh;
         MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
         if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
-        /* 剧集面板顶部：过滤框 + 星形收藏开关 + 缓存按钮，列表向下让出 28px */
-        if (g_btnCache)
-            MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by + 2, 24, 24, TRUE);
-        if (g_btnFavOnly)
-            MoveWindow(g_btnFavOnly, x + w1 + GAP_W + w2 - 28 - DSB_W - 27, by + 2, 24, 24, TRUE);
-        if (g_editFilter)
-            MoveWindow(g_editFilter, x + w1 + GAP_W + 2, by + 3,
-                w2 - sbw - 4 - 54 - 2, 22, TRUE);
+        /* 剧集工具栏与播客工具栏同基线，放在面板边框之外：
+         * 右侧是收藏/缓存开关，左侧过滤框自动填满剩余宽度 */
+        {
+            int ex = x + w1 + GAP_W;
+            int cx = ex + w2 - 26;   /* 缓存按钮右缘距面板右缘 2px */
+            if (g_btnCache)   MoveWindow(g_btnCache,   cx,      by, 24, 24, TRUE);
+            if (g_btnFavOnly) MoveWindow(g_btnFavOnly, cx - 27, by, 24, 24, TRUE);
+            if (g_editFilter) MoveWindow(g_editFilter, ex + 2, by + 1,
+                cx - 27 - 6 - (ex + 2), 22, TRUE);
+        }
         x += w1 + GAP_W;
-        g_rcPanel[1].left = x;           g_rcPanel[1].top = by;
+        g_rcPanel[1].left = x;           g_rcPanel[1].top = by + 28;
         g_rcPanel[1].right = x + w2;     g_rcPanel[1].bottom = by + bh;
-        MoveWindow(g_listEp, x + 2, by + 28, w2 - sbw - 4, bh - sbh - 30, TRUE);
-        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 28, sbw, bh - sbh - 30, TRUE);
+        MoveWindow(g_listEp, x + 2, by + 30, w2 - sbw - 4, bh - sbh - 32, TRUE);
+        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 30, sbw, bh - sbh - 32, TRUE);
         if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
         x += w2 + GAP_W;
         if (g_descHidden) {
@@ -8441,14 +8480,6 @@ static void LayoutControls(HWND hwnd)
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (!g_descTabShown) ShowWindow(g_btnDescTab, SW_HIDE);
     }
-    /* 缓存按钮压到剧集列表之上（列表创建晚于按钮，z-order 更高；
-     * 配合列表的 WS_CLIPSIBLINGS，列表重绘不会再盖住按钮） */
-    if (g_btnCache)
-        SetWindowPos(g_btnCache, HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    if (g_btnFavOnly)
-        SetWindowPos(g_btnFavOnly, g_btnCache ? g_btnCache : HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 /* ================= 简介折叠按钮 ================= */
@@ -8560,7 +8591,7 @@ enum {
     ICO_PREV, ICO_PLAY, ICO_PAUSE, ICO_NEXT, ICO_STOP,
     ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_CROSS, ICO_SORT, ICO_REFRESH,
     ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_GEAR,
-    ICO_DOWNLOAD
+    ICO_DOWNLOAD, ICO_PHONE
 };
 
 /* 在按钮矩形内绘制单个矢量图标 */
@@ -8786,6 +8817,15 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
         LineTo(hdc, x0 + s - 3, bot);
         break;
     }
+    case ICO_PHONE: {
+        /* 手机：圆角竖屏机身 + 底部圆点 */
+        SelectObject(hdc, pen2);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        RoundRect(hdc, x0 + 4, y0 + 1, x0 + s - 3, y0 + s - 1, 6, 6);
+        SelectObject(hdc, br);
+        Ellipse(hdc, x0 + s / 2 - 1, y0 + s - 5, x0 + s / 2 + 2, y0 + s - 2);
+        break;
+    }
     }
 
     SelectObject(hdc, op);
@@ -8836,7 +8876,8 @@ static int IconKindOf(int id, int *on)
                (g_playMode == 2) ? ICO_REPEATONE :
                (g_playMode == 3) ? ICO_PLAYONCE : ICO_ORDER;
     case IDC_BTN_DIR:   return ICO_GEAR;
-    case IDC_BTN_CACHE: return ICO_DOWNLOAD;
+    case IDC_BTN_CACHE: *on = g_cacheOnly; return ICO_DOWNLOAD;
+    case IDC_BTN_PHONE: *on = (g_httpThread != NULL); return ICO_PHONE;
     }
     return -1;
 }
@@ -8995,6 +9036,9 @@ static void ApplyLanguage(void)
     UpdateTipText(g_btnPlayMode, PlayModeTipText());
     UpdateTipText(g_btnDir,      tr(TR_TIP_SETTINGS));
     UpdateTipText(g_btnCache,    tr(TR_TIP_CACHE));
+    UpdateTipText(g_btnFavOnly,  tr(TR_FAV_ONLY_TIP));
+    UpdateTipText(g_editFilter,  tr(TR_TIP_FILTER));
+    UpdateTipText(g_btnPhone,    tr(TR_TIP_PHONE));
     UpdateThumbbarLanguage();
     UpdateWindowTitle();
 
@@ -9441,13 +9485,12 @@ static void MenuMeasureItem(HWND owner, MEASUREITEMSTRUCT *mi)
 /* 勾选符号：1px 细线 √，尺寸与系统浅色菜单的 Marlett 勾一致（不粗不大） */
 static void MenuDrawCheck(HDC hdc, int cx, int cy, COLORREF clr)
 {
-    HPEN p = CreatePen(PS_SOLID, 1, clr);
-    HGDIOBJ old = SelectObject(hdc, p);
-    MoveToEx(hdc, cx - 4, cy, NULL);
-    LineTo(hdc, cx - 1, cy + 3);
-    LineTo(hdc, cx + 4, cy - 4);
-    SelectObject(hdc, old);
-    DeleteObject(p);
+    int i;
+    /* LineTo 不画终点，斜线还会被像素归一化拉歪；逐点画保证两臂对齐 */
+    for (i = 0; i <= 3; i++)
+        SetPixel(hdc, cx - 4 + i, cy + i, clr);
+    for (i = 0; i <= 4; i++)
+        SetPixel(hdc, cx + i, cy + 2 - i, clr);
 }
 
 /* 子菜单箭头：单像素 chevron，两臂逐点镜像（同简介折叠按钮）。
@@ -9510,6 +9553,30 @@ static void ArmAutoRefreshTimer(void)
         g_lastAutoRefreshMin = (int)(time(NULL) / 60);
     } else {
         g_lastAutoRefreshMin = 0;
+    }
+}
+
+/* 手机播放/遥控：开关 HTTP 服务；开启时自动打开本机页面 */
+static void TogglePhoneServer(void)
+{
+    if (g_httpThread) {
+        PhoneServerStop();
+        SetStatusTemp(tr(TR_PHONE_OFF));
+    } else {
+        int r = PhoneServerStart();
+        if (r) {
+            wchar_t url[64];
+            /* 自动在本机浏览器打开，地址列表（WiFi/以太网）在网页里显示 */
+            swprintf(url, 64, L"http://localhost:%u/", g_httpPort);
+            ShellExecuteW(g_hwnd, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+            SetStatusTemp(tr(TR_PHONE_ON));
+            /* 服务开了但防火墙没放行：本机页面正常，手机会一直转圈 */
+            if (r == 2)
+                MessageBoxTh(g_hwnd, tr(TR_PHONE_FW), tr(TR_PHONE_TITLE),
+                            MB_OK | MB_ICONWARNING);
+        } else {
+            MessageBoxTh(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
+        }
     }
 }
 
@@ -9587,7 +9654,6 @@ static void OnSettingsButton(void)
         g_fontLevel == 0 ? tr(TR_FONT_S) : g_fontLevel == 1 ? tr(TR_FONT_M) : tr(TR_FONT_L));
     MenuAdd(menu, 0, 6, fontItem);
     MenuAddSep(menu);
-    MenuAdd(menu, g_httpThread ? MF_CHECKED : 0, 9, tr(TR_M_PHONE));
     MenuAdd(menu, 0, 7, tr(TR_M_ABOUT));
 
     GetCursorPos(&pt);
@@ -9642,28 +9708,6 @@ static void OnSettingsButton(void)
     if (cmd == 20 || cmd == 21) {
         int nl = (cmd == 21) ? 1 : 0;
         if (nl != g_lang) { g_lang = nl; ApplyLanguage(); }
-        return;
-    }
-    if (cmd == 9) {
-        if (g_httpThread) {
-            PhoneServerStop();
-            SetStatusTemp(tr(TR_PHONE_OFF));
-        } else {
-            int r = PhoneServerStart();
-            if (r) {
-                wchar_t url[64];
-                /* 自动在本机浏览器打开，地址列表（WiFi/以太网）在网页里显示 */
-                swprintf(url, 64, L"http://localhost:%u/", g_httpPort);
-                ShellExecuteW(g_hwnd, L"open", url, NULL, NULL, SW_SHOWNORMAL);
-                SetStatusTemp(tr(TR_PHONE_ON));
-                /* 服务开了但防火墙没放行：本机页面正常，手机会一直转圈 */
-                if (r == 2)
-                    MessageBoxTh(g_hwnd, tr(TR_PHONE_FW), tr(TR_PHONE_TITLE),
-                                MB_OK | MB_ICONWARNING);
-            } else {
-                MessageBoxTh(g_hwnd, tr(TR_PHONE_FAIL), tr(TR_PHONE_TITLE), MB_OK | MB_ICONERROR);
-            }
-        }
         return;
     }
     if (cmd == 7) {
@@ -9749,38 +9793,73 @@ static void OnSettingsButton(void)
     }
 }
 
-/* ---- 托盘左键迷你控制浮窗 ---- */
-/* 4 个按钮命令与任务栏缩略图工具栏完全一致（tid 0..3），
- * 点击时以 THBN_CLICKED 转发回主窗口同一分支处理 */
+/* ---- 托盘悬停迷你控制浮窗 ---- */
+/* 单窗口自绘：5 个按钮（上一曲/播放暂停/下一曲/随机/退出），
+ * 悬停即高亮；点击直接执行，不再转发 WM_COMMAND 给子按钮 */
+#define FLY_BTN_N 5
+
+/* 客户区坐标 → 按钮下标，-1=空白 */
+static int FlyBtnAt(int x, int y)
+{
+    int span = FLY_BTN_N * FLY_BTN + (FLY_BTN_N - 1) * FLY_GAP;
+    int id;
+    if (x < FLY_PAD || x >= FLY_PAD + span ||
+        y < FLY_PAD || y >= FLY_PAD + FLY_BTN)
+        return -1;
+    id = (x - FLY_PAD) / (FLY_BTN + FLY_GAP);
+    return (id >= FLY_BTN_N) ? -1 : id;
+}
+
+/* 点击执行；退出用 WM_CLOSE 走正常收尾（保存配置、销毁托盘图标） */
+static void FlyAction(int id)
+{
+    if (id == 0) PlayAdjacent(-1);
+    else if (id == 1) PauseResume();
+    else if (id == 2) PlayAdjacent(+1);
+    else if (id == 3) {
+        int pod = (g_playPod >= 0) ? g_playPod : g_curPod;
+        int n;
+        if (pod < 0) return;
+        n = (pod == g_podCount) ? g_cachePod.epCount : g_pods[pod].epCount;
+        if (n > 0) RequestPlayEpisode(pod, rand() % n);
+    } else if (id == 4) {
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (g_fly) ShowWindow(g_fly, SW_HIDE);
+}
+
 static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_DRAWITEM: {
-        DRAWITEMSTRUCT *di = (DRAWITEMSTRUCT *)lp;
-        int kind;
-        if (di->CtlType != ODT_BUTTON) break;
-        FillRectColor(di->hDC, &di->rcItem,
-            (di->itemState & ODS_SELECTED) ? RGB(96, 96, 112)
-            : ((int)di->CtlID == g_flyHover ? RGB(64, 64, 74) : RGB(45, 45, 52)));
-        kind = (di->CtlID == 0) ? ICO_PREV
-             : (di->CtlID == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
-             : (di->CtlID == 2) ? ICO_NEXT : ICO_SHUFFLE;
-        DrawGlyphC(di->hDC, &di->rcItem, kind, RGB(255, 255, 255));
-        return TRUE;
-    }
-    case WM_COMMAND:
-        PostMessageW(g_hwnd, WM_COMMAND,
-            MAKEWPARAM(LOWORD(wp), THBN_CLICKED), 0);
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        int i;
+        GetClientRect(hwnd, &rc);
+        FillRectColor(hdc, &rc, RGB(40, 40, 46));
+        for (i = 0; i < FLY_BTN_N; i++) {
+            RECT br;
+            int kind;
+            br.left  = FLY_PAD + i * (FLY_BTN + FLY_GAP);
+            br.top   = FLY_PAD;
+            br.right = br.left + FLY_BTN;
+            br.bottom = br.top + FLY_BTN;
+            if (i == g_flyHover) FillRectColor(hdc, &br, RGB(64, 64, 74));
+            kind = (i == 0) ? ICO_PREV
+                 : (i == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
+                 : (i == 2) ? ICO_NEXT
+                 : (i == 3) ? ICO_SHUFFLE : ICO_CROSS;
+            DrawGlyphC(hdc, &br, kind,
+                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255));
+        }
+        EndPaint(hwnd, &ps);
         return 0;
+    }
     case WM_MOUSEMOVE: {
         /* 悬停高亮：按固定网格算出按钮下标 */
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int id = -1;
-        if (pt.x >= FLY_PAD && pt.x < FLY_PAD + FLY_BTN * 4 + FLY_GAP * 3 &&
-            pt.y >= FLY_PAD && pt.y < FLY_PAD + FLY_BTN) {
-            id = (pt.x - FLY_PAD) / (FLY_BTN + FLY_GAP);
-            if (id > 3) id = 3;
-        }
+        int id = FlyBtnAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         if (id != g_flyHover) {
             g_flyHover = id;
             InvalidateRect(hwnd, NULL, TRUE);
@@ -9801,30 +9880,26 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hwnd, NULL, TRUE);
         }
         return 0;
-    case WM_ACTIVATE:
-        /* 点击浮窗以外的地方→失去激活→自动收起。
-         * 不能用 WM_KILLFOCUS：点击窗内按钮时焦点会转到子控件，父窗随之收到
-         * KILLFOCUS 而立即隐藏，导致 4 个按钮「按下去没反应」。 */
-        if (LOWORD(wp) == WA_INACTIVE)
-            ShowWindow(hwnd, SW_HIDE);
+    case WM_LBUTTONUP: {
+        int id = FlyBtnAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (id >= 0) FlyAction(id);
         return 0;
+    }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static void CreateFlyout(HINSTANCE hInst)
 {
-    int i;
+    HRGN rgn;
     /* NOACTIVATE：悬停弹出，不能抢走当前窗口焦点 */
     g_fly = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        FLY_CLASS, NULL, WS_POPUP | WS_BORDER,
+        FLY_CLASS, NULL, WS_POPUP,
         0, 0, FLY_W, FLY_H, NULL, NULL, hInst, NULL);
     if (!g_fly) return;
-    for (i = 0; i < 4; i++)
-        CreateWindowExW(0, L"BUTTON", NULL,
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            FLY_PAD + i * (FLY_BTN + FLY_GAP), FLY_PAD,
-            FLY_BTN, FLY_BTN, g_fly, (HMENU)(INT_PTR)i, hInst, NULL);
+    /* 圆角窗口：客户端整体裁成圆角矩形，WM_PAINT 直接填满 */
+    rgn = CreateRoundRectRgn(0, 0, FLY_W + 1, FLY_H + 1, 10, 10);
+    SetWindowRgn(g_fly, rgn, TRUE);   /* 成功后 region 归系统所有，不再删除 */
 }
 
 /* 托盘图标屏幕矩形；拿不到时用光标位置估计 */
@@ -9872,8 +9947,6 @@ static void ShowFlyout(void)
     }
     SetWindowPos(g_fly, HWND_TOPMOST, wr.left, wr.top, 0, 0,
         SWP_NOSIZE | SWP_SHOWWINDOW);
-    /* 接管前台：点击浮窗外时收到 WM_ACTIVATE(WA_INACTIVE) 自动隐藏 */
-    SetForegroundWindow(g_fly);
 }
 
 /* ---- 任务栏缩略图工具栏（ITaskbarList3） ---- */
@@ -10181,7 +10254,7 @@ static void UpdatePodTipFromPoint(POINT pt)
 /* 去掉系统标题栏，自己在 NC 区画一条：最小化到任务栏 / 最小化到托盘 /
  * 最大化-还原 / 关闭。保留 WS_THICKFRAME：边缘缩放、拖动、贴边吸附、
  * 双击最大化都仍是系统原生行为，只是按钮由我们画。 */
-#define TITLE_H     34   /* 自绘标题栏高度 */
+#define TITLE_H     30   /* 自绘标题栏高度 */
 #define FRAME_W      4   /* 可拖拽边框厚度 */
 #define CAP_BTN_W   44   /* 单个标题栏按钮宽度 */
 
@@ -10222,7 +10295,7 @@ static int CaptionButtonAt(HWND hwnd, POINT sp)
 }
 
 /* 按钮图形：全部线条自绘，不依赖字体/图标资源 */
-static void CapGlyph(HDC hdc, int idx, const RECT *rc, int zoomed)
+static void CapGlyph(HDC hdc, int idx, const RECT *rc, int zoomed, COLORREF clr)
 {
     int cx = (rc->left + rc->right) / 2;
     int cy = (rc->top + rc->bottom) / 2;
@@ -10247,11 +10320,60 @@ static void CapGlyph(HDC hdc, int idx, const RECT *rc, int zoomed)
             Rectangle(hdc, cx - 5, cy - 5, cx + 6, cy + 5);
         }
         break;
-    case CAP_CLOSE:
-        MoveToEx(hdc, cx - 5, cy - 5, NULL); LineTo(hdc, cx + 6, cy + 6);
-        MoveToEx(hdc, cx + 6, cy - 5, NULL); LineTo(hdc, cx - 5, cy + 6);
+    case CAP_CLOSE: {
+        int i;
+        /* 两条对角逐像素镜像，避免 LineTo 不画终点造成上下不对称 */
+        for (i = 0; i <= 10; i++) {
+            SetPixel(hdc, cx - 5 + i, cy - 5 + i, clr);
+            SetPixel(hdc, cx + 5 - i, cy - 5 + i, clr);
+        }
         break;
     }
+    }
+}
+
+/* 标题栏按钮文案（悬停 tooltip 用） */
+static const wchar_t *CapTipText(int idx)
+{
+    switch (idx) {
+    case CAP_MIN:   return tr(TR_CAP_MIN);
+    case CAP_TRAY:  return tr(TR_CAP_TRAY);
+    case CAP_MAX:   return IsZoomed(g_hwnd) ? tr(TR_CAP_RESTORE) : tr(TR_CAP_MAX);
+    case CAP_CLOSE: return tr(TR_CAP_CLOSE);
+    }
+    return L"";
+}
+
+/* 在按钮正下方显示追踪 tooltip */
+static void CapTipShow(HWND hwnd, int idx)
+{
+    TOOLINFOW ti;
+    RECT band, wr;
+    if (!g_hwndCapTip || idx < 0) return;
+    CaptionMetrics(hwnd, &band);
+    GetWindowRect(hwnd, &wr);
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    ti.hwnd = hwnd;
+    ti.uId = 1;
+    ti.lpszText = (LPWSTR)CapTipText(idx);
+    SendMessageW(g_hwndCapTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    SendMessageW(g_hwndCapTip, TTM_TRACKPOSITION, 0,
+        MAKELPARAM(wr.left + band.right - CAP_BTN_W * (CAP_BTN_N - idx) + CAP_BTN_W / 2,
+                   wr.top + band.bottom + 6));
+    SendMessageW(g_hwndCapTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+}
+
+static void CapTipHide(void)
+{
+    TOOLINFOW ti;
+    if (!g_hwndCapTip) return;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = g_hwnd;
+    ti.uId = 1;
+    SendMessageW(g_hwndCapTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
 }
 
 /* 只重画标题栏/边框，不碰客户区 */
@@ -10298,13 +10420,19 @@ static void PaintCaption(HWND hwnd)
         DeleteObject(p);
     }
 
+    /* 左侧程序图标（与 Windows 原生标题栏一致） */
+    if (g_trayIco) {
+        int iy = band.top + (band.bottom - band.top - 16) / 2;
+        DrawIconEx(hdc, band.left + 8, iy, g_trayIco, 16, 16, 0, NULL, DI_NORMAL);
+    }
+
     /* 标题文字（沿用 SetWindowText 的内容：播放剧集/关机倒计时） */
     {
         wchar_t t[200];
         RECT tr;
         HGDIOBJ oldF;
         GetWindowTextW(hwnd, t, 200);
-        tr.left = band.left + 12;
+        tr.left = band.left + 8 + 16 + 8;
         tr.right = band.right - CAP_BTN_W * CAP_BTN_N - 8;
         tr.top = band.top;
         tr.bottom = band.bottom;
@@ -10342,7 +10470,8 @@ static void PaintCaption(HWND hwnd)
                     SelectObject(hdc, upen);
                 }
             }
-            CapGlyph(hdc, i, &br, IsZoomed(hwnd));
+            CapGlyph(hdc, i, &br, IsZoomed(hwnd),
+                     (g_capHover == CAP_CLOSE) ? RGB(255, 255, 255) : cTxt);
             if (upen != pen) {
                 SelectObject(hdc, pen);
                 DeleteObject(upen);
@@ -10400,9 +10529,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return TRUE;
     case WM_NCMOUSEMOVE:
         if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
+        CapTipHide();
         break;
     case WM_MOUSELEAVE:
         if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
+        CapTipHide();
         break;
     case WM_SETTEXT: {
         LRESULT lr = DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -10440,16 +10571,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 全部方形图标按钮 */
         {
-            const int ids[12] = {
+            const int ids[13] = {
                 IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
                 IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
-                IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE };
-            HWND *p[12] = {
+                IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE, IDC_BTN_PHONE };
+            HWND *p[13] = {
                 &g_btnPrev, &g_btnPlay, &g_btnNext, &g_btnStop, &g_btnMute,
                 &g_btnAdd, &g_btnDel, &g_btnRefresh, &g_btnPlayMode,
-                &g_btnDir, &g_btnSpeed, &g_btnCache };
+                &g_btnDir, &g_btnSpeed, &g_btnCache, &g_btnPhone };
             int bi;
-            for (bi = 0; bi < 12; bi++)
+            for (bi = 0; bi < 13; bi++)
                 *p[bi] = CreateWindowExW(0, L"BUTTON", NULL,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
@@ -10481,10 +10612,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
         /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
-        /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序）
-         * WS_CLIPSIBLINGS：重绘时裁掉缓存按钮区域，否则列表会画到按钮上 */
+        /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
         g_listEp = CreateWindowExW(0, WC_LISTVIEWW, NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             LVS_REPORT | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
         {
@@ -10550,6 +10680,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnPlayMode);
         SubclassForFontWheel(g_btnDir);
         SubclassForFontWheel(g_btnCache);
+        SubclassForFontWheel(g_btnPhone);
         SubclassForFontWheel(g_editFilter);
         SubclassForFontWheel(g_btnFavOnly);
 
@@ -10606,6 +10737,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             AddButtonTip(g_btnCache,   tr(TR_TIP_CACHE));
             AddButtonTip(g_editFilter, tr(TR_TIP_FILTER));
             AddButtonTip(g_btnFavOnly, tr(TR_FAV_ONLY_TIP));
+            AddButtonTip(g_btnPhone,  tr(TR_TIP_PHONE));
+        }
+        /* 标题栏按钮 tooltip：追踪式，内容随悬停按钮变化 */
+        {
+            TOOLINFOW ti;
+            g_hwndCapTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+                WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                0, 0, 0, 0, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (g_hwndCapTip) {
+                ThemeTipSubclass(g_hwndCapTip);
+                ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+                ti.hwnd = hwnd;
+                ti.uId = 1;
+                ti.lpszText = L"";
+                SendMessageW(g_hwndCapTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
         }
         /* 剧集列表 tracking tooltip：不依赖标题截断，悬停即显示 */
         {
@@ -10926,26 +11075,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         PaintCaption(hwnd);   /* 标题栏几何随窗口变化 */
         return 0;
 
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        POINT sp;
+        HWND under, target;
         /* 在播放区/按钮等空白处 Ctrl+滚轮也能调字号 */
         if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
             ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1));
             return 0;
         }
-        /* 简介是只读 EDIT，没有 WS_VSCROLL，KatMouse 之类的滚轮重定向工具
-         * 会判定其不可滚动而把消息交给主窗口：这里补上，行为与列表一致 */
-        if (!g_descHidden && g_editDesc && IsWindowVisible(g_editDesc)) {
-            POINT sp = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            RECT dr;
-            GetWindowRect(g_editDesc, &dr);
-            if (PtInRect(&dr, sp)) {
-                int d = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -3 : 3;
-                SendMessageW(g_editDesc, EM_LINESCROLL, 0, (LPARAM)d);
-                SyncScrollBar(g_vsDesc);
-                return 0;
-            }
+        /* 统一按光标下真实控件分发。KatMouse 之类的工具会把滚轮消息
+         * 转给主窗口，且 lParam 可能是 (0,0)，不能依赖消息里的坐标 */
+        GetCursorPos(&sp);
+        under = WindowFromPoint(sp);
+        if (!under || GetAncestor(under, GA_ROOT) != hwnd) break;
+        if (g_editDesc && IsWindowVisible(g_editDesc) &&
+            (under == g_editDesc || IsChild(g_editDesc, under))) {
+            int d = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -3 : 3;
+            SendMessageW(g_editDesc, EM_LINESCROLL, 0, (LPARAM)d);
+            SyncScrollBar(g_vsDesc);
+            return 0;
+        }
+        target = NULL;
+        if (under == g_sldSeek || under == g_sldVol) target = under;
+        else if (g_listEp && (under == g_listEp || IsChild(g_listEp, under)))
+            target = g_listEp;
+        else if (g_listPod && (under == g_listPod || IsChild(g_listPod, under)))
+            target = g_listPod;
+        if (target) {
+            SendMessageW(target, WM_MOUSEWHEEL, wParam, 0);
+            return 0;
         }
         break;
+    }
 
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
@@ -10985,6 +11146,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 TRACKMOUSEEVENT tme;
                 g_capHover = bi;
                 RepaintCaption(hwnd);
+                if (bi >= 0) CapTipShow(hwnd, bi);
+                else CapTipHide();
                 ZeroMemory(&tme, sizeof(tme));
                 tme.cbSize = sizeof(tme);
                 tme.dwFlags = TME_LEAVE;
@@ -10993,7 +11156,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-        if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); }
+        if (g_capHover >= 0) { g_capHover = -1; RepaintCaption(hwnd); CapTipHide(); }
         if (g_dragSplit >= 0) {
             RECT rc;
             int totalW, w1px, w2px, w3px;
@@ -11030,6 +11193,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int bi;
             GetCursorPos(&sp);
             bi = CaptionButtonAt(hwnd, sp);
+            CapTipHide();
             if (bi == CAP_MIN) {
                 ShowWindow(hwnd, SW_MINIMIZE);          /* 到任务栏 */
             } else if (bi == CAP_TRAY) {
@@ -11283,10 +11447,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else if (cmd == 5) OpenCacheFolder();
             }
         } else if (src == g_listEp) {
-            /* 剧集列表右键：已缓存→删除缓存；未缓存→下载；恒有复制剧集链接 */
+            /* 剧集列表右键：单选按行操作；多选提供批量收藏/取消收藏/批量下载 */
             LVHITTESTINFO hti;
             HMENU m;
-            int cmd, ep, cached;
+            int cmd, row, ep, cached = 0, selCount, nFav = 0, nUnfav = 0, nUncached = 0;
             Episode *e = NULL;
             Podcast *vp = (g_curPod == g_podCount) ? &g_cachePod :
                 (g_curPod >= 0 && g_curPod < g_podCount ? &g_pods[g_curPod] : NULL);
@@ -11294,8 +11458,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ZeroMemory(&hti, sizeof(hti));
             hti.pt = pt;
             ScreenToClient(g_listEp, &hti.pt);
-            ep = (int)SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hti);
-            ep = EpIdxOfRow(ep);   /* 列表行号 → 剧集下标 */
+            row = (int)SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hti);
+            ep = EpIdxOfRow(row);   /* 列表行号 → 剧集下标 */
             if (ep < 0 || g_curPod < 0 || g_curPod > g_podCount) break;
             if (g_curPod == g_podCount) {
                 if (ep >= g_cachePod.epCount) break;
@@ -11303,17 +11467,49 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else {
                 if (ep >= g_pods[g_curPod].epCount) break;
                 e = &g_pods[g_curPod].eps[ep];
+                if (vp->feedUrl) fh = LastEpHash(vp->feedUrl);
             }
             if (!e || !e->url) break;
             cached = e->localFile || EpisodeIsCached(e);
             m = CreatePopupMenu();
-            if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
-            else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
-            MenuAddSep(m);
-            MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
-            if (vp && vp->feedUrl && !g_viewCached) {
-                fh = LastEpHash(vp->feedUrl);
-                MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
+            selCount = (int)SendMessageW(g_listEp, LVM_GETSELECTEDCOUNT, 0, 0);
+            if (selCount > 1 && row >= 0 &&
+                (SendMessageW(g_listEp, LVM_GETITEMSTATE, row, LVIS_SELECTED) & LVIS_SELECTED)) {
+                /* 多选：按选中项里实际存在的类别给出批量项（收藏/取消收藏可同时出现） */
+                int r = -1;
+                while ((r = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                              (WPARAM)r, LVNI_SELECTED)) >= 0) {
+                    int i = EpIdxOfRow(r);
+                    if (i < 0 || i >= vp->epCount) continue;
+                    if (fh && FavHas(fh, vp->eps[i].url)) nFav++;
+                    else nUnfav++;
+                    if (!(vp->eps[i].localFile || EpisodeIsCached(&vp->eps[i]))) nUncached++;
+                }
+                if (!g_viewCached) {
+                    wchar_t t[64];
+                    if (nUnfav > 0) {
+                        swprintf(t, 64, tr(TR_CTX_FAV_N_FMT), nUnfav);
+                        MenuAdd(m, 0, 7, t);
+                    }
+                    if (nFav > 0) {
+                        swprintf(t, 64, tr(TR_CTX_UNFAV_N_FMT), nFav);
+                        MenuAdd(m, 0, 8, t);
+                    }
+                    if (nUncached > 0) {
+                        swprintf(t, 64, tr(TR_CTX_DL_N_FMT), nUncached);
+                        MenuAdd(m, 0, 6, t);
+                    }
+                    if (nFav || nUnfav || nUncached) MenuAddSep(m);
+                }
+                MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
+            } else {
+                if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
+                else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
+                if (cached) MenuAdd(m, 0, 5, tr(TR_CTX_REVEAL));
+                MenuAddSep(m);
+                MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
+                if (vp && vp->feedUrl && !g_viewCached)
+                    MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
             }
             SetForegroundWindow(hwnd);
             {
@@ -11327,21 +11523,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyMenu(m);
             if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
+            else if (cmd == 5) {
+                wchar_t path[MAX_PATH];
+                CachePathFor(e->url, path, MAX_PATH);
+                RevealInExplorer(path);
+            }
             else if (cmd == 3) {
                 if (CopyToClipboardW(e->url)) SetStatusTemp(tr(TR_CLIP_OK));
                 else SetStatusTemp(tr(TR_CLIP_FAIL));
+            }
+            else if (cmd == 6) StartBatchCache();
+            else if ((cmd == 7 || cmd == 8) && fh && vp) {
+                /* 批量收藏/取消收藏：先快照选中行，再逐项写入收藏表 */
+                int list[256], n = 0, k, done = 0, r = -1;
+                wchar_t t[64];
+                while ((r = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                              (WPARAM)r, LVNI_SELECTED)) >= 0) {
+                    int i = EpIdxOfRow(r);
+                    if (i >= 0 && i < vp->epCount && vp->eps[i].url &&
+                        n < (int)(sizeof(list) / sizeof(list[0])))
+                        list[n++] = i;
+                }
+                for (k = 0; k < n; k++) {
+                    int i = list[k];
+                    if (cmd == 7) {
+                        if (!FavHas(fh, vp->eps[i].url)) {
+                            FavSet(fh, vp->eps[i].url, 1);
+                            done++;
+                        }
+                    } else if (FavHas(fh, vp->eps[i].url)) {
+                        FavSet(fh, vp->eps[i].url, 0);
+                        done++;
+                    }
+                }
+                swprintf(t, 64, tr(cmd == 7 ? TR_FAV_BATCH_ON_FMT : TR_FAV_BATCH_OFF_FMT), done);
+                SetStatusTemp(t);
+                FillEpisodeList();
+                SyncScrollBar(g_vsEp);
             }
             else if (cmd == 4 && vp) {
                 if (FavHas(fh, e->url)) { FavSet(fh, e->url, 0); SetStatusTemp(tr(TR_FAV_OFF)); }
                 else { FavSet(fh, e->url, 1); SetStatusTemp(tr(TR_FAV_ON)); }
                 if (g_favOnly) FillEpisodeList();   /* 取消收藏后该行需消失 */
                 else {
-                    int row = RowOfEpIdx(ep);
-                    if (row >= 0) {
+                    int r2 = RowOfEpIdx(ep);
+                    if (r2 >= 0) {
                         LVITEMW li;
                         ZeroMemory(&li, sizeof(li));
                         li.mask = LVIF_TEXT;
-                        li.iItem = row; li.iSubItem = 0;
+                        li.iItem = r2; li.iSubItem = 0;
                         li.pszText = (wchar_t*)EpListTitle(vp, ep);
                         SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&li);
                     }
@@ -11413,7 +11643,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
             else if (id == IDC_BTN_DIR) OnSettingsButton();
             else if (id == IDC_BTN_SPEED) CycleSpeed();
-            else if (id == IDC_BTN_CACHE) StartBatchCache();
+            else if (id == IDC_BTN_CACHE) {
+                g_cacheOnly = !g_cacheOnly;   /* 只看已缓存；批量下载在右键菜单 */
+                InvalidateRect(g_btnCache, NULL, TRUE);
+                FillEpisodeList();
+                SyncScrollBar(g_vsEp);
+            }
+            else if (id == IDC_BTN_PHONE) TogglePhoneServer();
             else if (id == IDC_BTN_FAVONLY) {
                 g_favOnly = !g_favOnly;
                 InvalidateRect(g_btnFavOnly, NULL, TRUE);
@@ -12061,9 +12297,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     /* 托盘图标消息：wParam=图标ID，lParam=鼠标事件。
-     * 悬停：图标上方弹迷你控制浮窗；单击：主窗口显示/收进托盘；右键：菜单 */
+     * 悬停：图标上方弹迷你控制浮窗；单击：主窗口显示/收进托盘；右键：播放/暂停 */
     case WM_TRAYICON:
-        /* 悬停=图标上方弹浮窗；单击=主窗口显示/收进托盘；右键=菜单 */
         if (LOWORD(lParam) == WM_MOUSEMOVE) {
             /* 只在主窗口收进托盘/最小化时弹浮窗，不打扰正在看的主界面 */
             if ((!IsWindowVisible(hwnd) || IsIconic(hwnd)) &&
@@ -12088,29 +12323,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
             /* 单击已切换过，双击不再重复切换，避免窗口闪一下又收起 */
         } else if (LOWORD(lParam) == WM_RBUTTONUP) {
-            POINT pt;
-            HMENU m = CreatePopupMenu();
-            MenuAdd(m, 0, 1, tr(TR_TRAY_SHOW));
-            MenuAdd(m, 0, 2, tr(TR_TRAY_EXIT));
-            GetCursorPos(&pt);
-            SetForegroundWindow(hwnd);   /* 让菜单能正常消失 */
-            {
-                HBRUSH bg = ApplyMenuTheme(m);
-                {
-                    int cmd = TrackPopupMenu(m,
-                        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                        pt.x, pt.y, 0, hwnd, NULL);
-                    if (cmd == 1) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
-                    else if (cmd == 2) DestroyWindow(hwnd);
-                }
-                ThemeMenuCleanup(m);
-                if (bg) DeleteObject(bg);
-            }
-            DestroyMenu(m);
+            /* 右键直接播放/暂停；退出在浮窗最右侧的按钮上 */
+            PauseResume();
         }
         return 0;
 
-    /* 关闭按钮：直接退出（收进托盘走最小化按钮；托盘右键菜单也可退出） */
+    /* 关闭按钮：直接退出（收进托盘走最小化按钮；托盘浮窗右侧也有退出按钮） */
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
