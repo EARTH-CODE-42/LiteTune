@@ -188,6 +188,7 @@ static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
 static HWND     g_sldVol, g_stVol, g_stFormat;
 static HWND     g_listPod, g_listEp, g_editDesc;
 static HWND     g_editFilter;      /* 剧集标题即时过滤框 */
+static RECT     g_rcFilterFrame;   /* 过滤框外圈 1px 细边（父窗口绘制） */
 static HWND     g_btnFavOnly;      /* “只显示已收藏”开关按钮 */
 static int      g_cacheOnly;       /* “只显示已缓存”开关（缓存按钮） */
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
@@ -749,11 +750,21 @@ static int CopyToClipboardW(const wchar_t *text)
 /* 在资源管理器中打开所在目录并选中该文件 */
 static void RevealInExplorer(const wchar_t *path)
 {
-    PIDLIST_ABSOLUTE pidl = NULL;
+    PIDLIST_ABSOLUTE file = NULL, folder = NULL;
+    PCUITEMID_CHILD child;
     if (!path || !*path) return;
-    if (FAILED(SHParseDisplayName(path, NULL, &pidl, 0, NULL))) return;
-    SHOpenFolderAndSelectItems(pidl, 1, (PCUITEMID_CHILD_ARRAY)&pidl, 0);
-    CoTaskMemFree(pidl);
+    if (FAILED(SHParseDisplayName(path, NULL, &file, 0, NULL))) return;
+    /* 必须把绝对 PIDL 拆成「父目录 + 末级子项」再传：
+     * 直接把文件 PIDL 当目录传会被 Shell 当成“打开该文件”，
+     * 结果用外部播放器播放而不是打开文件夹。 */
+    child = ILFindLastID(file);
+    folder = ILClone(file);
+    if (folder) {
+        ILRemoveLastID(folder);
+        SHOpenFolderAndSelectItems(folder, 1, (PCUITEMID_CHILD_ARRAY)&child, 0);
+        ILFree(folder);
+    }
+    ILFree(file);
 }
 
 /* ---- 自绘弹窗（MessageBox / InputBox 共用，亮暗同款） ---- */
@@ -8005,12 +8016,44 @@ static int PodListModeClick(POINT pt)
     return 1;
 }
 
+/* ================= 滚轮统一路由 ================= */
+/* 焦点在哪个控件，滚轮消息就发给谁；若光标实际悬停在别的可滚控件上，
+ * 转交给它（否则“焦点在列表时简介滚不动”）。返回 1=已转交。 */
+static int WheelRouted(HWND self, WPARAM wp, LPARAM lp)
+{
+    POINT sp;
+    HWND under;
+    if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) return 0;   /* Ctrl+滚轮=字号，各自处理 */
+    GetCursorPos(&sp);
+    under = WindowFromPoint(sp);
+    if (!under || GetAncestor(under, GA_ROOT) != g_hwnd || under == self) return 0;
+    if (g_editDesc && IsWindowVisible(g_editDesc) &&
+        (under == g_editDesc || IsChild(g_editDesc, under))) {
+        SendMessageW(g_editDesc, WM_MOUSEWHEEL, wp, lp);
+        return 1;
+    }
+    if (under == g_sldSeek || under == g_sldVol) {
+        SendMessageW(under, WM_MOUSEWHEEL, wp, lp);
+        return 1;
+    }
+    if (g_listEp && (under == g_listEp || IsChild(g_listEp, under))) {
+        SendMessageW(g_listEp, WM_MOUSEWHEEL, wp, lp);
+        return 1;
+    }
+    if (g_listPod && (under == g_listPod || IsChild(g_listPod, under))) {
+        SendMessageW(g_listPod, WM_MOUSEWHEEL, wp, lp);
+        return 1;
+    }
+    return 0;
+}
+
 /* ================= 滑块滚轮修正 ================= */
 /* trackbar 默认滚轮方向是反的（向上滚反而减小），子类化后自己处理 */
 
 static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
+    if (msg == WM_MOUSEWHEEL && WheelRouted(hwnd, wp, lp)) return 0;
     if (msg == WM_MOUSEWHEEL) {
         /* Ctrl+滚轮：调全局字号（普通滚轮才是调滑块） */
         if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
@@ -8052,6 +8095,8 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
+    /* 滚轮先按光标位置路由：焦点控件不一定是鼠标下那个 */
+    if (msg == WM_MOUSEWHEEL && WheelRouted(hwnd, wp, lp)) return 0;
     /* 暗色表头：ODT_HEADER 的 WM_DRAWITEM 发给表头的父窗口 ListView */
     if (g_darkMode && msg == WM_DRAWITEM &&
         (hwnd == g_listEp || hwnd == g_ibList)) {
@@ -8438,8 +8483,15 @@ static void LayoutControls(HWND hwnd)
             int cx = ex + w2 - 26;   /* 缓存按钮右缘距面板右缘 2px */
             if (g_btnCache)   MoveWindow(g_btnCache,   cx,      by, 24, 24, TRUE);
             if (g_btnFavOnly) MoveWindow(g_btnFavOnly, cx - 27, by, 24, 24, TRUE);
-            if (g_editFilter) MoveWindow(g_editFilter, ex + 2, by + 1,
-                cx - 27 - 6 - (ex + 2), 22, TRUE);
+            if (g_editFilter) {
+                int ex2 = cx - 27 - 6;
+                MoveWindow(g_editFilter, ex + 2, by + 1,
+                    ex2 - (ex + 2), 22, TRUE);
+                /* 外圈细边紧贴输入框，右侧留 1px 与收藏按钮分开 */
+                SetRect(&g_rcFilterFrame, ex + 1, by, ex2 + 1, by + 24);
+            } else {
+                SetRectEmpty(&g_rcFilterFrame);
+            }
         }
         x += w1 + GAP_W;
         g_rcPanel[1].left = x;           g_rcPanel[1].top = by + 28;
@@ -11234,6 +11286,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DrawEdge(hdc, &b, EDGE_SUNKEN, BF_RECT);
             }
         }
+        /* 过滤输入框外圈 1px：让输入框与右侧两个开关在视觉上成组 */
+        if (g_editFilter && g_rcFilterFrame.right > g_rcFilterFrame.left) {
+            HBRUSH fb = CreateSolidBrush(g_darkMode ? RGB(86, 86, 96) : RGB(160, 160, 166));
+            RECT fr = g_rcFilterFrame;
+            FrameRect(hdc, &fr, fb);
+            DeleteObject(fb);
+        }
 
         /* 第一行状态文本：超长时跑马灯循环，用双缓冲避免闪烁 */
         {
@@ -11525,7 +11584,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
             else if (cmd == 5) {
                 wchar_t path[MAX_PATH];
-                CachePathFor(e->url, path, MAX_PATH);
+                /* 缓存视图里 url 本身就是本地文件路径 */
+                if (e->localFile) wcscpy(path, e->url);
+                else CachePathFor(e->url, path, MAX_PATH);
                 RevealInExplorer(path);
             }
             else if (cmd == 3) {
