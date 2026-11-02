@@ -139,6 +139,8 @@ typedef struct {
     int      loadFailed; /* 1=订阅获取/解析失败的占位条目（无剧集，可删除/重试） */
     int      refreshFailed; /* 1=联网刷新失败、退回旧缓存（内容可能过期，列表提示） */
     int      newCount;   /* 新剧集数（超过“已看”水位的集数，列表角标） */
+    int      refreshMin; /* 本播客自动刷新间隔：-1=跟随全局 0=关闭 >0=分钟 */
+    int      lastRefreshMin; /* 上次自动刷新时刻（time(NULL)/60），瞬时 */
 } Podcast;
 
 typedef struct {
@@ -159,6 +161,7 @@ enum {
     IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
     IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
+    IDC_EDIT_FILTER, IDC_BTN_FAVONLY,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
     IDC_TAB_DESC
 };
@@ -184,6 +187,8 @@ static HWND     g_sldSeek, g_stTime;
 static HWND     g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute;
 static HWND     g_sldVol, g_stVol, g_stFormat;
 static HWND     g_listPod, g_listEp, g_editDesc;
+static HWND     g_editFilter;      /* 剧集标题即时过滤框 */
+static HWND     g_btnFavOnly;      /* “只显示已收藏”开关按钮 */
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
 static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAINT 统一画边框 */
 static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
@@ -201,6 +206,7 @@ static int      g_speed = 100;
 /* 托盘图标已创建标志 */
 static int      g_trayAdded = 0;
 static HICON    g_trayIco = NULL;    /* 托盘小图标（资源加载，退出时销毁） */
+static HICON    g_trayBadgeIco = NULL; /* 带新剧集数字角标的托盘图标（动态合成） */
 #define WM_TRAYICON (WM_APP + 100)
 
 /* 媒体键：多数键盘发 WM_APPCOMMAND 广播而非 VK_MEDIA_* 虚拟键，
@@ -320,6 +326,33 @@ typedef struct {
 static SeenEp  *g_seenEps = NULL;
 static int      g_seenEpCount = 0, g_seenEpCap = 0;
 
+/* 剧集收藏：键同 LastEp（feed URL 哈希），值为剧集 URL；ini 行 fav=<hex>,<utf8url> */
+typedef struct {
+    unsigned int  hash;
+    wchar_t      *epUrl;
+} FavEp;
+static FavEp   *g_favs = NULL;
+static int      g_favCount = 0, g_favCap = 0;
+
+/* 每播客自动刷新间隔：-1 跟随全局 / 0 关闭 / >0 分钟；ini 行 podrefresh=<hex>,<min> */
+typedef struct {
+    unsigned int hash;
+    int          min;
+} PodRefresh;
+static PodRefresh *g_podRefs = NULL;
+static int         g_podRefCount = 0, g_podRefCap = 0;
+
+/* 剧集 ListView 行 → Podcast.eps 下标映射（过滤后行号不再等于剧集下标） */
+static int *g_epMap = NULL;
+static int  g_epMapCount = 0, g_epMapCap = 0;
+
+/* 剧集过滤：标题子串（空=不过滤）+ 只显示已收藏 */
+static wchar_t g_epFilter[128] = L"";
+static int     g_favOnly = 0;
+
+static int EpIdxOfRow(int row);
+static int RowOfEpIdx(int ep);
+
 /* 手机播放/遥控 HTTP 服务 */
 /* 端口优先用 80（Windows 防火墙常已放行，手机最容易连上），占用再依次降级 */
 static const unsigned short PHONE_PORTS[] = { 80, 8080, 17532 };
@@ -408,6 +441,9 @@ enum {
     TR_M_AUTOREFRESH, TR_AR_MIN_FMT, TR_AR_SET_FMT,
     TR_M_TRAY_SOUND, TR_SOUND_ON, TR_SOUND_OFF,
     TR_BALLOON_NEW_FMT,
+    TR_TIP_FILTER, TR_FAV_ONLY_TIP,
+    TR_CTX_FAV, TR_CTX_UNFAV, TR_FAV_ON, TR_FAV_OFF,
+    TR_M_REFRESH_INT, TR_RI_FOLLOW, TR_TRAY_NEW_FMT,
     TR_N
 };
 
@@ -509,7 +545,10 @@ static const wchar_t *tr(int id)
         L"已复制到剪贴板", L"复制失败",
         L"自动刷新", L"%d 分钟", L"自动刷新：%ls",
         L"新剧集提示音", L"提示音已开启", L"提示音已关闭",
-        L"发现 %d 集新剧集"
+        L"发现 %d 集新剧集",
+        L"按标题过滤剧集", L"只显示已收藏",
+        L"收藏", L"取消收藏", L"已收藏", L"已取消收藏",
+        L"刷新间隔", L"跟随全局设置", L"LiteTune - %d 集新剧集"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -624,7 +663,12 @@ static const wchar_t *tr(int id)
         L"Auto-Refresh", L"%d min", L"Auto-refresh: %ls",
         L"New episode sound", L"Notification sound on",
         L"Notification sound off",
-        L"Found %d new episode(s)"
+        L"Found %d new episode(s)",
+        L"Filter episodes by title", L"Show favorites only",
+        L"Add to favorites", L"Remove from favorites",
+        L"Added to favorites", L"Removed from favorites",
+        L"Refresh interval", L"Use global setting",
+        L"LiteTune - %d new episode(s)"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -1761,12 +1805,13 @@ static void ApplyFontsToControls(void)
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_sldVol, g_stVol, g_stFormat,
         g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
-        g_listPod, g_listEp, g_editDesc
+        g_listPod, g_listEp, g_editDesc, g_editFilter
     };
     int i;
     for (i = 0; i < (int)(sizeof(ctrls)/sizeof(ctrls[0])); i++)
         if (ctrls[i]) SendMessageW(ctrls[i], WM_SETFONT, (WPARAM)g_font, TRUE);
     if (g_stFormat) SendMessageW(g_stFormat, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
+    if (g_btnFavOnly) SendMessageW(g_btnFavOnly, WM_SETFONT, (WPARAM)g_fontSmall, TRUE);
 }
 
 /* 直接设定字号级别 0/1/2 并重建三套字体、刷新界面 */
@@ -3144,6 +3189,163 @@ static void SeenFreeAll(void)
     g_seenEps = NULL; g_seenEpCount = 0; g_seenEpCap = 0;
 }
 
+/* ---------- 剧集收藏 ---------- */
+
+static FavEp* FavFind(unsigned int hash, const wchar_t *url)
+{
+    int i;
+    if (!url) return NULL;
+    for (i = 0; i < g_favCount; i++)
+        if (g_favs[i].hash == hash && g_favs[i].epUrl &&
+            wcscmp(g_favs[i].epUrl, url) == 0)
+            return &g_favs[i];
+    return NULL;
+}
+
+static int FavHas(unsigned int hash, const wchar_t *url)
+{
+    return FavFind(hash, url) != NULL;
+}
+
+/* 收藏/取消收藏（on=0 删除，on!=0 添加） */
+static void FavSet(unsigned int hash, const wchar_t *url, int on)
+{
+    FavEp *fe;
+    int i;
+    if (!url || !*url || hash == 0) return;
+    fe = FavFind(hash, url);
+    if (!on) {
+        if (fe) {
+            i = (int)(fe - g_favs);
+            free(fe->epUrl);
+            memmove(&g_favs[i], &g_favs[i + 1],
+                    (g_favCount - i - 1) * sizeof(FavEp));
+            g_favCount--;
+        }
+        return;
+    }
+    if (fe) return;
+    if (g_favCount >= 512) return;
+    if (g_favCount >= g_favCap) {
+        int nc = g_favCap ? g_favCap * 2 : 32;
+        FavEp *nb = (FavEp*)realloc(g_favs, nc * sizeof(FavEp));
+        if (!nb) return;
+        g_favs = nb; g_favCap = nc;
+    }
+    g_favs[g_favCount].epUrl = _wcsdup(url);
+    if (!g_favs[g_favCount].epUrl) return;
+    g_favs[g_favCount].hash = hash;
+    g_favCount++;
+}
+
+/* 删除某播客的全部收藏（删订阅时调用） */
+static void FavDrop(unsigned int hash)
+{
+    int i = 0;
+    while (i < g_favCount) {
+        if (g_favs[i].hash == hash) {
+            free(g_favs[i].epUrl);
+            memmove(&g_favs[i], &g_favs[i + 1],
+                    (g_favCount - i - 1) * sizeof(FavEp));
+            g_favCount--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* 启动清理：哈希对不上任何现有订阅的收藏删除 */
+static void FavPurgeOrphans(void)
+{
+    int i, keep = 0;
+    for (i = 0; i < g_favCount; i++) {
+        unsigned int h = g_favs[i].hash;
+        int j, found = 0;
+        for (j = 0; j < g_podCount && !found; j++)
+            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
+        if (found) g_favs[keep++] = g_favs[i];
+        else free(g_favs[i].epUrl);
+    }
+    g_favCount = keep;
+}
+
+static void FavFreeAll(void)
+{
+    int i;
+    for (i = 0; i < g_favCount; i++) free(g_favs[i].epUrl);
+    free(g_favs);
+    g_favs = NULL; g_favCount = 0; g_favCap = 0;
+}
+
+/* ---------- 每播客刷新间隔 ---------- */
+
+/* 返回间隔分钟：-1=跟随全局（未记录），0=关闭，>0=自定义 */
+static int PodRefreshFind(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_podRefCount; i++)
+        if (g_podRefs[i].hash == hash) return g_podRefs[i].min;
+    return -1;
+}
+
+/* min<0 删除记录；否则写入 */
+static void PodRefreshSet(unsigned int hash, int min)
+{
+    int i;
+    if (hash == 0) return;
+    for (i = 0; i < g_podRefCount; i++) {
+        if (g_podRefs[i].hash == hash) {
+            if (min < 0) {
+                memmove(&g_podRefs[i], &g_podRefs[i + 1],
+                        (g_podRefCount - i - 1) * sizeof(PodRefresh));
+                g_podRefCount--;
+            } else {
+                g_podRefs[i].min = min;
+            }
+            return;
+        }
+    }
+    if (min < 0) return;
+    if (g_podRefCount >= 512) return;
+    if (g_podRefCount >= g_podRefCap) {
+        int nc = g_podRefCap ? g_podRefCap * 2 : 16;
+        PodRefresh *nb = (PodRefresh*)realloc(g_podRefs, nc * sizeof(PodRefresh));
+        if (!nb) return;
+        g_podRefs = nb; g_podRefCap = nc;
+    }
+    g_podRefs[g_podRefCount].hash = hash;
+    g_podRefs[g_podRefCount].min = min;
+    g_podRefCount++;
+}
+
+static void PodRefreshPurgeOrphans(void)
+{
+    int i, keep = 0;
+    for (i = 0; i < g_podRefCount; i++) {
+        unsigned int h = g_podRefs[i].hash;
+        int j, found = 0;
+        for (j = 0; j < g_podCount && !found; j++)
+            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
+        if (found) g_podRefs[keep++] = g_podRefs[i];
+    }
+    g_podRefCount = keep;
+}
+
+static void PodRefreshFreeAll(void)
+{
+    free(g_podRefs);
+    g_podRefs = NULL; g_podRefCount = 0; g_podRefCap = 0;
+}
+
+/* 是否存在自定义间隔>0（决定自动刷新心跳定时器要不要武装） */
+static int PodRefreshAnyPositive(void)
+{
+    int i;
+    for (i = 0; i < g_podRefCount; i++)
+        if (g_podRefs[i].min > 0) return 1;
+    return 0;
+}
+
 /* 播客当前最大 dateKey（忽略未知日期的 0） */
 static long long PodMaxDateKey(const Podcast *p)
 {
@@ -3168,6 +3370,13 @@ static void UpdateNewCount(Podcast *p)
     p->newCount = n;
 }
 
+/* 从持久化记录初始化本播客刷新间隔与计时起点 */
+static void PodInitRefresh(Podcast *p)
+{
+    p->refreshMin = p->feedUrl ? PodRefreshFind(LastEpHash(p->feedUrl)) : -1;
+    p->lastRefreshMin = (int)(time(NULL) / 60);
+}
+
 /* 托盘气泡：刷新发现新剧集（仅窗口藏到托盘时弹，可见时角标已足够） */
 static void TrayBalloonNewEpisodes(int total)
 {
@@ -3185,6 +3394,103 @@ static void TrayBalloonNewEpisodes(int total)
     /* 系统通知音（跟随用户的 Windows 声音方案；未配置该事件时保持安静） */
     if (g_traySound)
         PlaySoundW(L"SystemNotification", NULL, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+}
+
+/* ================= 托盘新剧集数字角标 ================= */
+
+static int g_lastAutoRefreshMin = 0;   /* 上次全局自动刷新的分钟数，0=未初始化 */
+static int g_trayBadgeN = -1;          /* 当前角标数字，-1=未初始化 */
+
+/* 合成“红色圆 + 白色数字”的托盘图标；total<=0 或失败返回 NULL */
+static HICON MakeBadgeIcon(int total)
+{
+    int cx = GetSystemMetrics(SM_CXSMICON), cy = GetSystemMetrics(SM_CYSMICON);
+    HDC hdc, mem;
+    BITMAPV5HEADER bi;
+    void *bits = NULL;
+    HBITMAP bmp, mask, old;
+    HICON ico = NULL;
+    int x, y;
+    if (total <= 0 || cx <= 0 || cy <= 0) return NULL;
+    hdc = GetDC(NULL);
+    mem = CreateCompatibleDC(hdc);
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = cx; bi.bV5Height = -cy;
+    bi.bV5Planes = 1; bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
+    bmp = CreateDIBSection(hdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    old = (HBITMAP)SelectObject(mem, bmp);
+    if (bits) {
+        /* 红色圆铺满整个图标 + 白色数字 */
+        HBRUSH br = CreateSolidBrush(RGB(210, 45, 45));
+        HBRUSH obr = (HBRUSH)SelectObject(mem, br);
+        wchar_t num[8];
+        HFONT f, of;
+        RECT rc = { 0, 0, cx, cy };
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, RGB(255, 255, 255));
+        Ellipse(mem, 0, 0, cx, cy);
+        SelectObject(mem, obr);
+        DeleteObject(br);
+        if (total > 99) wcscpy_s(num, 8, L"99+");
+        else            swprintf(num, 8, L"%d", total);
+        f = CreateFontW(-cy * 60 / 100 - 1, 0, 0, 0, FW_BOLD, 0, 0, 0,
+                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                        ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+        of = (HFONT)SelectObject(mem, f);
+        DrawTextW(mem, num, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(mem, of);
+        DeleteObject(f);
+        /* GDI 绘制不写 alpha：把“有颜色但 alpha=0”的像素补成不透明 */
+        {
+            unsigned char *p = (unsigned char*)bits;
+            for (y = 0; y < cy; y++)
+                for (x = 0; x < cx; x++) {
+                    unsigned char *q = p + (y * cx + x) * 4;
+                    if (q[3] == 0 && (q[0] | q[1] | q[2])) q[3] = 255;
+                }
+        }
+    }
+    SelectObject(mem, old);
+    mask = CreateBitmap(cx, cy, 1, 1, NULL);   /* 32bpp 图标下掩码被忽略 */
+    if (mask) {
+        ICONINFO ii;
+        ZeroMemory(&ii, sizeof(ii));
+        ii.fIcon = TRUE;
+        ii.hbmColor = bmp;
+        ii.hbmMask = mask;
+        ico = CreateIconIndirect(&ii);
+        DeleteObject(mask);
+    }
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(NULL, hdc);
+    return ico;
+}
+
+/* 汇总所有播客 newCount → 更新托盘图标与提示（无新剧集恢复基础图标） */
+static void UpdateTrayBadge(void)
+{
+    NOTIFYICONDATAW nid;
+    int i, total = 0;
+    if (!g_trayAdded) return;
+    for (i = 0; i < g_podCount; i++) total += g_pods[i].newCount;
+    if (total == g_trayBadgeN) return;
+    g_trayBadgeN = total;
+    if (g_trayBadgeIco) { DestroyIcon(g_trayBadgeIco); g_trayBadgeIco = NULL; }
+    if (total > 0) g_trayBadgeIco = MakeBadgeIcon(total);
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_TIP;
+    nid.hIcon = g_trayBadgeIco ? g_trayBadgeIco : g_trayIco;
+    if (total > 0) swprintf(nid.szTip, 128, tr(TR_TRAY_NEW_FMT), total);
+    else           wcscpy_s(nid.szTip, 128, L"LiteTune");
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 /* ================= 订阅 XML / 封面缓存（cache\feed_*.xml、cover_*.img） ================= */
@@ -3598,6 +3904,32 @@ static void ParseConfigLine(char *line)
                 }
             }
         }
+        else if (strcmp(s, "fav") == 0) {
+            /* 格式 fav=<hash hex>,<utf8url 余下整段>（URL 可含逗号，只按第一个逗号切） */
+            char *c1 = strchr(val, ',');
+            if (c1) {
+                unsigned int h;
+                wchar_t *w;
+                *c1 = 0;
+                h = (unsigned int)strtoul(val, NULL, 16);
+                w = U8ToW(c1 + 1);
+                if (h != 0 && w) { FavSet(h, w, 1); free(w); }
+            }
+        }
+        else if (strcmp(s, "podrefresh") == 0) {
+            /* 格式 podrefresh=<hash hex>,<min> */
+            char *c1 = strchr(val, ',');
+            if (c1) {
+                unsigned int h;
+                int m;
+                *c1 = 0;
+                h = (unsigned int)strtoul(val, NULL, 16);
+                m = atoi(c1 + 1);
+                if (m < 0) m = 0;
+                if (m > 1440) m = 1440;
+                if (h != 0) PodRefreshSet(h, m);
+            }
+        }
         else if (strcmp(s, "cachedir") == 0) {
             wchar_t *w = U8ToW(val);
             if (w) { wcsncpy(g_cacheDir, w, MAX_PATH - 1); g_cacheDir[MAX_PATH - 1] = 0; free(w); }
@@ -3807,6 +4139,8 @@ static void LoadConfig(void)
     g_resumePaused = 0;
     LastEpFreeAll();
     SeenFreeAll();
+    FavFreeAll();
+    PodRefreshFreeAll();
 
     /* 上次保存残留的改名副本（此时已无占用），顺手删除 */
     {
@@ -3941,6 +4275,27 @@ static char *BuildConfigText(DWORD *lenOut)
                        (unsigned int)(g_seenEps[li].seenKey & 0xFFFFFFFFu));
             }
         }
+    }
+    /* 每播客收藏的剧集（fav=<hash>,<utf8url>，URL 可含逗号，解析按第一个逗号切） */
+    {
+        int li;
+        for (li = 0; li < g_favCount; li++) {
+            if (g_favs[li].hash != 0 && g_favs[li].epUrl) {
+                char *u8 = WToU8(g_favs[li].epUrl);
+                if (u8) {
+                    SbAddf(&sb, "fav=%x,%s\n", g_favs[li].hash, u8);
+                    free(u8);
+                }
+            }
+        }
+    }
+    /* 每播客自动刷新间隔（podrefresh=<hash>,<min>；跟随全局不写） */
+    {
+        int li;
+        for (li = 0; li < g_podRefCount; li++)
+            if (g_podRefs[li].hash != 0)
+                SbAddf(&sb, "podrefresh=%x,%d\n",
+                       g_podRefs[li].hash, g_podRefs[li].min);
     }
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
@@ -4619,15 +4974,17 @@ static void StartBatchCache(void)
     if (g_viewCached || g_curPod < 0 || g_curPod >= g_podCount) return;
     p = &g_pods[g_curPod];
 
-    /* 收集所有选中行（最多 256，超出部分不收集并在完成时提示） */
+    /* 收集所有选中行（最多 256，超出部分不收集并在完成时提示）。
+     * 列表行号经 g_epMap 转成剧集下标（过滤后二者不再一致） */
     sel = -1;
     while ((sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                      (WPARAM)sel, LVNI_SELECTED)) >= 0) {
-        if (sel < p->epCount && p->eps[sel].url) {
-            if (total < 256) indices[total++] = sel;
+        int ep = EpIdxOfRow(sel);
+        if (ep >= 0 && ep < p->epCount && p->eps[ep].url) {
+            if (total < 256) indices[total++] = ep;
             else truncated = 1;
         }
-        if (sel >= p->epCount - 1) break;
+        if (sel >= (int)SendMessageW(g_listEp, LVM_GETITEMCOUNT, 0, 0) - 1) break;
     }
 
     if (total == 0) {
@@ -5901,6 +6258,61 @@ static Podcast* ActivePodcast(void)
     return NULL;
 }
 
+/* ---------- 剧集行映射（过滤后列表行号不再等于剧集下标） ---------- */
+
+static void EpMapPush(int ep)
+{
+    if (g_epMapCount >= g_epMapCap) {
+        int nc = g_epMapCap ? g_epMapCap * 2 : 128;
+        int *nb = (int*)realloc(g_epMap, nc * sizeof(int));
+        if (!nb) return;
+        g_epMap = nb; g_epMapCap = nc;
+    }
+    g_epMap[g_epMapCount++] = ep;
+}
+
+/* 列表行 → 剧集下标；越界/无映射返回 -1 */
+static int EpIdxOfRow(int row)
+{
+    return (row >= 0 && row < g_epMapCount) ? g_epMap[row] : -1;
+}
+
+/* 剧集下标 → 列表行；未显示（被过滤掉）返回 -1 */
+static int RowOfEpIdx(int ep)
+{
+    int i;
+    for (i = 0; i < g_epMapCount; i++)
+        if (g_epMap[i] == ep) return i;
+    return -1;
+}
+
+/* 列表标题：订阅视图里已收藏的剧集加 ★ 前缀（静态缓冲，插入即被 ListView 复制） */
+static const wchar_t* EpListTitle(const Podcast *p, int ep)
+{
+    static wchar_t buf[2048];
+    Episode *e = &p->eps[ep];
+    const wchar_t *t = (e->title && *e->title) ? e->title : L"";
+    if (g_viewCached || !p->feedUrl) return t;
+    if (!FavHas(LastEpHash(p->feedUrl), e->url)) return t;
+    swprintf(buf, 2048, L"★ %ls", t);
+    return buf;
+}
+
+/* 过滤判定：标题子串（大小写不敏感）+ 可选“只看已收藏” */
+static int EpMatchesFilter(const Podcast *p, int ep)
+{
+    Episode *e = &p->eps[ep];
+    if (g_favOnly) {
+        if (g_viewCached || !p->feedUrl) return 0;
+        if (!FavHas(LastEpHash(p->feedUrl), e->url)) return 0;
+    }
+    if (g_epFilter[0]) {
+        const wchar_t *t = (e->title && *e->title) ? e->title : L"";
+        if (!StrStrIW(t, g_epFilter)) return 0;
+    }
+    return 1;
+}
+
 /* 用当前播客的剧集填充 ListView（调用前数组应已排序）。
  * WM_SETREDRAW 括起来：几百条时逐条插入的中间重绘既闪又慢，一次画完秒出 */
 static void FillEpisodeList(void)
@@ -5908,20 +6320,27 @@ static void FillEpisodeList(void)
     Podcast *p = ActivePodcast();
     int i;
     if (!p) return;
+    g_epMapCount = 0;
     SendMessageW(g_listEp, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     for (i = 0; i < p->epCount; i++) {
         wchar_t dur[16];
         LVITEMW lvi;
+        int row;
+        if (!EpMatchesFilter(p, i)) continue;
         ZeroMemory(&lvi, sizeof(lvi));
-        lvi.mask = LVIF_TEXT;
-        lvi.iItem = i;
+        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.iItem = g_epMapCount;
+        lvi.lParam = i;
         /* 缓存视图列序是 播客/标题/时长，普通视图是 标题/日期/时长 */
-        lvi.pszText = g_viewCached
+        lvi.pszText = (wchar_t*)(g_viewCached
             ? (p->eps[i].author ? p->eps[i].author : L"")
-            : p->eps[i].title;
-        SendMessageW(g_listEp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+            : EpListTitle(p, i));
+        row = (int)SendMessageW(g_listEp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+        if (row < 0) continue;
+        EpMapPush(i);
 
+        lvi.iItem = row;
         lvi.iSubItem = 1;
         lvi.pszText = g_viewCached
             ? p->eps[i].title
@@ -5945,6 +6364,7 @@ static void BuildEpisodeTipText(wchar_t *buf, int bufMax, int i)
     wchar_t dur[16];
     int pos = 0;
     buf[0] = 0;
+    i = EpIdxOfRow(i);   /* 入参是列表行号，转成剧集下标 */
     if (!p || i < 0 || i >= p->epCount) return;
     e = &p->eps[i];
     if (e->title && *e->title)
@@ -6119,15 +6539,19 @@ static void ChangeSort(int col)
     p = ActivePodcast();
     if (!p) return;
     sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+    sel = EpIdxOfRow(sel);
     if (sel >= 0 && sel < p->epCount) oldOrig = p->eps[sel].origIdx;
 
     SortPodcast(p);
     FillEpisodeList();
 
     for (i = 0; i < p->epCount; i++) {
+        int row;
         if (p->eps[i].origIdx == oldOrig) {
-            SendMessageW(g_listEp, LVM_ENSUREVISIBLE, i, FALSE);
-            SendMessageW(g_listEp, LVM_SETITEMSTATE, i,
+            row = RowOfEpIdx(i);
+            if (row < 0) break;   /* 被过滤掉：不再恢复选中 */
+            SendMessageW(g_listEp, LVM_ENSUREVISIBLE, row, FALSE);
+            SendMessageW(g_listEp, LVM_SETITEMSTATE, row,
                 (LPARAM)&(LVITEMW){ .state = LVIS_SELECTED|LVIS_FOCUSED,
                                     .stateMask = LVIS_SELECTED|LVIS_FOCUSED });
             break;
@@ -6139,13 +6563,15 @@ static void ChangeSort(int col)
 static void HighlightEpisodeRow(int ep)
 {
     LVITEMW lvi;
+    int row = RowOfEpIdx(ep);
+    if (row < 0) return;   /* 该集被过滤隐藏，无需高亮 */
     ZeroMemory(&lvi, sizeof(lvi));
     lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
     lvi.state = 0;
     SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)-1, (LPARAM)&lvi);
     lvi.state = LVIS_SELECTED | LVIS_FOCUSED;
-    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)ep, (LPARAM)&lvi);
-    SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)ep, FALSE);
+    SendMessageW(g_listEp, LVM_SETITEMSTATE, (WPARAM)row, (LPARAM)&lvi);
+    SendMessageW(g_listEp, LVM_ENSUREVISIBLE, (WPARAM)row, FALSE);
     InvalidateRect(g_listEp, NULL, TRUE);
 }
 
@@ -6401,6 +6827,9 @@ static void FreePodcasts(void)
 static void ReloadFeeds(int netFirst)
 {
     if (g_feedsLoading) return;
+    /* 整表重载：清空过滤条件，列表回到完整内容 */
+    g_epFilter[0] = 0; g_favOnly = 0;
+    if (g_editFilter) SetWindowTextW(g_editFilter, L"");
     if (g_downloading) CancelCurrentDownload();   /* 刷新时中止正在进行的下载 */
     PlayerStop();
     /* 退出可能正处于的离线“已缓存”视图，列头恢复成 标题/日期/时长 */
@@ -6504,6 +6933,8 @@ static void RemovePodcast(int i)
         }
         LastEpDrop(LastEpHash(g_pods[i].feedUrl));
         SeenDrop(LastEpHash(g_pods[i].feedUrl));
+        FavDrop(LastEpHash(g_pods[i].feedUrl));
+        PodRefreshSet(LastEpHash(g_pods[i].feedUrl), -1);
     }
     FreePodcast(&g_pods[i]);
     memmove(&g_pods[i], &g_pods[i + 1], (g_podCount - i - 1) * sizeof(Podcast));
@@ -6528,6 +6959,7 @@ static void RemovePodcast(int i)
         SelectPodcast(sel);
     }
     InvalidateRect(g_listPod, NULL, TRUE);
+    UpdateTrayBadge();
 }
 
 /* ================= 单播客刷新队列 =================
@@ -6553,23 +6985,29 @@ static void PumpRefreshQueue(void)
     free(url);
 }
 
-/* 右键"刷新播客"：入队，串行原位刷新 */
-static void RefreshSinglePodcast(int i)
+/* 入队一个 feed URL，串行原位刷新 */
+static void EnqueueRefreshUrl(const char *url)
 {
-    char *url;
+    char *u;
     int q;
-    if (i < 0 || i >= g_podCount || !g_pods[i].feedUrl) return;
-    if (g_refreshQN >= 32) return;
+    if (!url || g_refreshQN >= 32) return;
     for (q = 0; q < g_refreshQN; q++)   /* 已在队列：不重复排 */
-        if (strcmp(g_refreshQ[q], g_pods[i].feedUrl) == 0) {
+        if (strcmp(g_refreshQ[q], url) == 0) {
             SetStatusTemp(tr(TR_REFRESH_QUEUED));
             return;
         }
-    url = _strdup(g_pods[i].feedUrl);
-    if (!url) return;
-    g_refreshQ[g_refreshQN++] = url;
+    u = _strdup(url);
+    if (!u) return;
+    g_refreshQ[g_refreshQN++] = u;
     if (g_refreshQN == 1) PumpRefreshQueue();
     else SetStatusTemp(tr(TR_REFRESH_QUEUED));
+}
+
+/* 右键"刷新播客"：入队，串行原位刷新 */
+static void RefreshSinglePodcast(int i)
+{
+    if (i < 0 || i >= g_podCount) return;
+    EnqueueRefreshUrl(g_pods[i].feedUrl);
 }
 
 /* 删除某播客全部已缓存的音频文件 */
@@ -7956,14 +8394,19 @@ static void LayoutControls(HWND hwnd)
         g_rcPanel[0].right = x + w1;     g_rcPanel[0].bottom = by + bh;
         MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
         if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
-        /* 缓存按钮：剧集面板内右上、竖向滚条带左侧，边框内侧 */
+        /* 剧集面板顶部：过滤框 + 星形收藏开关 + 缓存按钮，列表向下让出 28px */
         if (g_btnCache)
             MoveWindow(g_btnCache, x + w1 + GAP_W + w2 - 28 - DSB_W, by + 2, 24, 24, TRUE);
+        if (g_btnFavOnly)
+            MoveWindow(g_btnFavOnly, x + w1 + GAP_W + w2 - 28 - DSB_W - 27, by + 2, 24, 24, TRUE);
+        if (g_editFilter)
+            MoveWindow(g_editFilter, x + w1 + GAP_W + 2, by + 3,
+                w2 - sbw - 4 - 54 - 2, 22, TRUE);
         x += w1 + GAP_W;
         g_rcPanel[1].left = x;           g_rcPanel[1].top = by;
         g_rcPanel[1].right = x + w2;     g_rcPanel[1].bottom = by + bh;
-        MoveWindow(g_listEp, x + 2, by + 2, w2 - sbw - 4, bh - sbh - 4, TRUE);
-        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 2, sbw, bh - sbh - 4, TRUE);
+        MoveWindow(g_listEp, x + 2, by + 28, w2 - sbw - 4, bh - sbh - 30, TRUE);
+        if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 28, sbw, bh - sbh - 30, TRUE);
         if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
         x += w2 + GAP_W;
         if (g_descHidden) {
@@ -8002,6 +8445,9 @@ static void LayoutControls(HWND hwnd)
      * 配合列表的 WS_CLIPSIBLINGS，列表重绘不会再盖住按钮） */
     if (g_btnCache)
         SetWindowPos(g_btnCache, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (g_btnFavOnly)
+        SetWindowPos(g_btnFavOnly, g_btnCache ? g_btnCache : HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
@@ -9059,8 +9505,12 @@ static void MenuDrawItem(const DRAWITEMSTRUCT *di)
 static void ArmAutoRefreshTimer(void)
 {
     KillTimer(g_hwnd, 6);
-    if (g_autoRefreshMin > 0)
-        SetTimer(g_hwnd, 6, (UINT)g_autoRefreshMin * 60000, NULL);
+    if (g_autoRefreshMin > 0 || PodRefreshAnyPositive()) {
+        SetTimer(g_hwnd, 6, 60000, NULL);        /* 60 秒心跳，到点各自判断 */
+        g_lastAutoRefreshMin = (int)(time(NULL) / 60);
+    } else {
+        g_lastAutoRefreshMin = 0;
+    }
 }
 
 static void OnSettingsButton(void)
@@ -10005,6 +10455,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
         }
 
+        /* “只显示已收藏”星形开关（自绘） */
+        g_btnFavOnly = CreateWindowExW(0, L"BUTTON", NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_FAVONLY, NULL, NULL);
+
         g_sldVol = CreateWindowExW(0, TRACKBAR_CLASSW, NULL,
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
             0,0,0,0, hwnd, (HMENU)IDC_SLD_VOL, NULL, NULL);
@@ -10055,6 +10510,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
+        /* 剧集标题过滤框：即时过滤，空串=不过滤 */
+        g_editFilter = CreateWindowExW(0, L"EDIT", NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | ES_AUTOHSCROLL,
+            0,0,0,0, hwnd, (HMENU)IDC_EDIT_FILTER, NULL, NULL);
+
         /* 自绘滚动条（唯一滚动条；剧集列表另有水平条） */
         g_vsPod  = CreateDarkScrollBar(hwnd, g_listPod,  0, 0, IDC_SB_POD);
         g_vsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 0, IDC_SB_EP);
@@ -10090,6 +10550,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnPlayMode);
         SubclassForFontWheel(g_btnDir);
         SubclassForFontWheel(g_btnCache);
+        SubclassForFontWheel(g_editFilter);
+        SubclassForFontWheel(g_btnFavOnly);
 
         SetTimer(hwnd, 1, 500, NULL);
         SetTimer(hwnd, 5, 150, NULL);   /* 简介折叠按钮的悬停探测 */
@@ -10142,6 +10604,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             AddButtonTip(g_btnDir,    tr(TR_TIP_SETTINGS));
             AddButtonTip(g_btnSpeed,  tr(TR_TIP_SPEED));
             AddButtonTip(g_btnCache,   tr(TR_TIP_CACHE));
+            AddButtonTip(g_editFilter, tr(TR_TIP_FILTER));
+            AddButtonTip(g_btnFavOnly, tr(TR_FAV_ONLY_TIP));
         }
         /* 剧集列表 tracking tooltip：不依赖标题截断，悬停即显示 */
         {
@@ -10215,6 +10679,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DrawTextW(di->hDC, txt, -1, &rc,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(di->hDC, oldf);
+                return TRUE;
+            }
+            /* 星形收藏开关：开=实心橙星，关=灰描边 */
+            if (di->CtlID == IDC_BTN_FAVONLY) {
+                RECT rc = di->rcItem;
+                int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
+                int i;
+                POINT star[10];
+                HPEN pen;
+                HGDIOBJ oldPen, oldBrush;
+                FillRectColor(di->hDC, &rc, ThWinBg());
+                if (di->itemState & ODS_SELECTED)
+                    DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
+                else
+                    DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
+                for (i = 0; i < 10; i++) {
+                    double a = (-90.0 + i * 36.0) * 3.14159265358979 / 180.0;
+                    int r = (i & 1) ? 4 : 9;
+                    star[i].x = cx + (int)(r * cos(a));
+                    star[i].y = cy + (int)(r * sin(a));
+                }
+                pen = CreatePen(PS_SOLID, 1, g_favOnly ? RGB(255,190,60) : ThDim());
+                oldPen = SelectObject(di->hDC, pen);
+                if (g_favOnly) {
+                    HBRUSH br = CreateSolidBrush(RGB(255,190,60));
+                    oldBrush = SelectObject(di->hDC, br);
+                    Polygon(di->hDC, star, 10);
+                    SelectObject(di->hDC, oldBrush);
+                    DeleteObject(br);
+                } else {
+                    oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                    Polygon(di->hDC, star, 10);
+                    SelectObject(di->hDC, oldBrush);
+                }
+                SelectObject(di->hDC, oldPen);
+                DeleteObject(pen);
                 return TRUE;
             }
             int on, kind = IconKindOf(di->CtlID, &on);
@@ -10639,6 +11139,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ? g_bgBrush : GetSysColorBrush(COLOR_BTNFACE));
         }
 
+    /* 剧集过滤框：与面板同色，暗色主题下也可读 */
+    case WM_CTLCOLOREDIT:
+        if ((HWND)lParam == g_editFilter) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, ThPanel());
+            SetTextColor(hdc, ThText());
+            return (LRESULT)g_whiteBrush;
+        }
+        break;
+
     case WM_GETMINMAXINFO: {
         /* 客户区最小 480x360，外框 = 客户区 + 自绘标题栏 + 四周窄边框 */
         MINMAXINFO *mm = (MINMAXINFO*)lParam;
@@ -10715,6 +11225,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 MenuAdd(m, 0, 1, tr(TR_CTX_REFRESH));
                 MenuAdd(m, 0, 2, tr(TR_CTX_DELETE_POD));
                 MenuAdd(m, 0, 3, tr(TR_CTX_DEL_POD_CACHE));
+                {
+                    /* 每播客刷新间隔：跟随全局 / 关 / 固定分钟 */
+                    HMENU ri = CreatePopupMenu();
+                    int cur = g_pods[item].refreshMin;
+                    static const int rs[] = { 30, 60, 120, 360 };
+                    int ai;
+                    MenuAdd(ri, cur < 0 ? MF_CHECKED : 0, 20, tr(TR_RI_FOLLOW));
+                    MenuAdd(ri, cur == 0 ? MF_CHECKED : 0, 21, tr(TR_CC_OFF));
+                    for (ai = 0; ai < 4; ai++) {
+                        wchar_t t[32];
+                        swprintf(t, 32, tr(TR_AR_MIN_FMT), rs[ai]);
+                        MenuAdd(ri, cur == rs[ai] ? MF_CHECKED : 0, 22 + ai, t);
+                    }
+                    MenuAddPopup(m, ri, tr(TR_M_REFRESH_INT), 0);
+                }
                 MenuAddSep(m);
                 MenuAdd(m, 0, 6, tr(TR_CTX_COPY_FEED_URL));
             } else {
@@ -10736,7 +11261,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (cmd == 1) RefreshSinglePodcast(item);
                 else if (cmd == 2) RemovePodcast(item);
                 else if (cmd == 3) DeletePodcastCache(item);
-                else if (cmd == 6) {
+                else if (cmd >= 20 && cmd <= 25) {
+                    /* 每播客刷新间隔：-1 跟随全局 / 0 关 / >0 分钟 */
+                    static const int vals[] = { -1, 0, 30, 60, 120, 360 };
+                    int nm = vals[cmd - 20];
+                    g_pods[item].refreshMin = nm;
+                    g_pods[item].lastRefreshMin = (int)(time(NULL) / 60);
+                    if (g_pods[item].feedUrl)
+                        PodRefreshSet(LastEpHash(g_pods[item].feedUrl), nm);
+                    ArmAutoRefreshTimer();
+                } else if (cmd == 6) {
                     wchar_t *fu = U8ToW(g_pods[item].feedUrl);
                     if (fu) {
                         if (CopyToClipboardW(fu)) SetStatusTemp(tr(TR_CLIP_OK));
@@ -10754,10 +11288,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             HMENU m;
             int cmd, ep, cached;
             Episode *e = NULL;
+            Podcast *vp = (g_curPod == g_podCount) ? &g_cachePod :
+                (g_curPod >= 0 && g_curPod < g_podCount ? &g_pods[g_curPod] : NULL);
+            unsigned int fh = 0;   /* 所属播客收藏哈希（菜单/命令同一作用域） */
             ZeroMemory(&hti, sizeof(hti));
             hti.pt = pt;
             ScreenToClient(g_listEp, &hti.pt);
             ep = (int)SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hti);
+            ep = EpIdxOfRow(ep);   /* 列表行号 → 剧集下标 */
             if (ep < 0 || g_curPod < 0 || g_curPod > g_podCount) break;
             if (g_curPod == g_podCount) {
                 if (ep >= g_cachePod.epCount) break;
@@ -10773,6 +11311,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
             MenuAddSep(m);
             MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
+            if (vp && vp->feedUrl && !g_viewCached) {
+                fh = LastEpHash(vp->feedUrl);
+                MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
+            }
             SetForegroundWindow(hwnd);
             {
                 HBRUSH bg = ApplyMenuTheme(m);
@@ -10788,6 +11330,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (cmd == 3) {
                 if (CopyToClipboardW(e->url)) SetStatusTemp(tr(TR_CLIP_OK));
                 else SetStatusTemp(tr(TR_CLIP_FAIL));
+            }
+            else if (cmd == 4 && vp) {
+                if (FavHas(fh, e->url)) { FavSet(fh, e->url, 0); SetStatusTemp(tr(TR_FAV_OFF)); }
+                else { FavSet(fh, e->url, 1); SetStatusTemp(tr(TR_FAV_ON)); }
+                if (g_favOnly) FillEpisodeList();   /* 取消收藏后该行需消失 */
+                else {
+                    int row = RowOfEpIdx(ep);
+                    if (row >= 0) {
+                        LVITEMW li;
+                        ZeroMemory(&li, sizeof(li));
+                        li.mask = LVIF_TEXT;
+                        li.iItem = row; li.iSubItem = 0;
+                        li.pszText = (wchar_t*)EpListTitle(vp, ep);
+                        SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&li);
+                    }
+                }
             }
         }
         return 0;
@@ -10812,6 +11370,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
+        if (LOWORD(wParam) == IDC_EDIT_FILTER && HIWORD(wParam) == EN_CHANGE) {
+            GetWindowTextW(g_editFilter, g_epFilter, 128);
+            FillEpisodeList();
+            SyncScrollBar(g_vsEp);
+            return 0;
+        }
         if (HIWORD(wParam) == LBN_SELCHANGE) {
             if (LOWORD(wParam) == IDC_LIST_POD) {
                 int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
@@ -10823,6 +11387,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             PodMaxDateKey(&g_pods[sel]));
                     g_pods[sel].newCount = 0;
                     InvalidateRect(g_listPod, NULL, TRUE);
+                    UpdateTrayBadge();
                 }
                 SelectPodcast(sel);
             }
@@ -10849,6 +11414,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_DIR) OnSettingsButton();
             else if (id == IDC_BTN_SPEED) CycleSpeed();
             else if (id == IDC_BTN_CACHE) StartBatchCache();
+            else if (id == IDC_BTN_FAVONLY) {
+                g_favOnly = !g_favOnly;
+                InvalidateRect(g_btnFavOnly, NULL, TRUE);
+                FillEpisodeList();
+                SyncScrollBar(g_vsEp);
+            }
         }
         return 0;
 
@@ -10874,39 +11445,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (nm->code == LVN_ITEMCHANGED) {
                 LPNMLISTVIEW lv = (LPNMLISTVIEW)lParam;
                 if ((lv->uNewState & LVIS_SELECTED) && lv->iItem >= 0)
-                    SelectEpisode(lv->iItem);
+                    SelectEpisode(EpIdxOfRow(lv->iItem));
             } else if (nm->code == NM_DBLCLK) {
                 int sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                             (WPARAM)-1, LVNI_SELECTED);
+                int ep = EpIdxOfRow(sel);
                 /* 命中该播客“上次听到”的那集 → 双击即从记录位置续播；
                  * 点其它集则从头播（清掉待定位，避免继承残留） */
-                if (sel >= 0 && g_curPod >= 0 && g_curPod < g_podCount) {
+                if (sel >= 0 && ep >= 0 && g_curPod >= 0 && g_curPod < g_podCount) {
                     Podcast *p = &g_pods[g_curPod];
                     LastEp *le = p->feedUrl ? LastEpFind(LastEpHash(p->feedUrl))
                                             : NULL;
-                    if (le && le->sec > 0 && sel < p->epCount &&
-                        p->eps[sel].url && le->epUrl &&
-                        wcscmp(p->eps[sel].url, le->epUrl) == 0)
+                    if (le && le->sec > 0 && ep < p->epCount &&
+                        p->eps[ep].url && le->epUrl &&
+                        wcscmp(p->eps[ep].url, le->epUrl) == 0)
                         g_resumeSeek100ns = ResumeSeek100ns(le->sec);
                     else
                         g_resumeSeek100ns = 0;
                 } else if (sel >= 0) {
                     g_resumeSeek100ns = 0;   /* 缓存聚合视图无单一 feed，从头播 */
                 }
-                if (sel >= 0) RequestPlayEpisode(g_curPod, sel);
+                if (sel >= 0 && ep >= 0) RequestPlayEpisode(g_curPod, ep);
             } else if (nm->code == NM_CUSTOMDRAW) {
                 /* 正在播放 → 绿；已缓存（非播放）→ 黄 */
                 LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
                 if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) {
                     return CDRF_NOTIFYITEMDRAW;   /* 必须，否则收不到 ITEMPREPAINT */
                 } else if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-                    int i = (int)cd->nmcd.dwItemSpec;
+                    int row = (int)cd->nmcd.dwItemSpec;   /* 列表行号 */
+                    int ep  = EpIdxOfRow(row);            /* 剧集下标 */
                     Podcast *p = ActivePodcast();
                     int playing = 0;
                     /* 正在播放目标（下载准备中/播放中/暂停中均算）标绿。
                      * 用独立的 g_playEp，用户点选其他行不会让绿色乱跑；
                      * g_playPod 在 PlayerStop 或播放失败时清空。 */
-                    if (g_playPod >= 0 && i >= 0 && i == g_playEp) {
+                    if (g_playPod >= 0 && ep >= 0 && ep == g_playEp) {
                         if (g_viewCached)
                             playing = (g_playPod == g_podCount);
                         else if (g_curPod >= 0 && g_curPod < g_podCount)
@@ -10915,22 +11488,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     int cached = 0;
                     int queued = 0;
                     int lastmark = 0;
-                    int sel = (ListView_GetItemState(g_listEp, i, LVIS_SELECTED)
+                    int sel = (ListView_GetItemState(g_listEp, row, LVIS_SELECTED)
                                & LVIS_SELECTED) != 0;
-                    if (p && i >= 0 && i < p->epCount) {
-                        cached = p->eps[i].localFile || EpisodeIsCached(&p->eps[i]);
+                    if (p && ep >= 0 && ep < p->epCount) {
+                        cached = p->eps[ep].localFile || EpisodeIsCached(&p->eps[ep]);
                         /* 批量下载队列中尚未完成的剧集标蓝，下完即转黄 */
-                        if (!cached && !playing) queued = EpisodeBatchQueued(i);
+                        if (!cached && !playing) queued = EpisodeBatchQueued(ep);
                     }
                     /* “上次听到哪”标记：该集 == 此播客记录的最近播放集（橙）。
                      * 播放中绿色优先；缓存黄次之（标记是更强的“听过”信号） */
-                    if (p && i >= 0 && i < p->epCount && !playing &&
+                    if (p && ep >= 0 && ep < p->epCount && !playing &&
                         g_curPod >= 0 && g_curPod < g_podCount &&
                         g_pods[g_curPod].feedUrl) {
                         LastEp *le = LastEpFind(
                             LastEpHash(g_pods[g_curPod].feedUrl));
-                        if (le && le->sec > 0 && le->epUrl && p->eps[i].url &&
-                            wcscmp(p->eps[i].url, le->epUrl) == 0)
+                        if (le && le->sec > 0 && le->epUrl && p->eps[ep].url &&
+                            wcscmp(p->eps[ep].url, le->epUrl) == 0)
                             lastmark = 1;
                     }
                     if (playing) {
@@ -11013,10 +11586,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (wParam == 6) {
-            /* 自动刷新：播放/下载/批量/加载中跳过，下个周期自然重试 */
-            if (g_playState == 0 && !g_downloading && !g_batchActive &&
-                !g_feedsLoading)
-                ReloadFeeds(1);
+            /* 自动刷新心跳：播放/下载/批量/加载中跳过，下个周期自然重试 */
+            int nowMin, i;
+            if (g_playState != 0 || g_downloading || g_batchActive || g_feedsLoading)
+                return 0;
+            nowMin = (int)(time(NULL) / 60);
+            if (g_autoRefreshMin > 0) {
+                if (g_lastAutoRefreshMin == 0) g_lastAutoRefreshMin = nowMin;
+                else if (nowMin - g_lastAutoRefreshMin >= g_autoRefreshMin) {
+                    g_lastAutoRefreshMin = nowMin;
+                    ReloadFeeds(1);
+                    return 0;
+                }
+            }
+            for (i = 0; i < g_podCount; i++) {
+                Podcast *p = &g_pods[i];
+                if (p->refreshMin <= 0 || !p->feedUrl) continue;
+                if (p->lastRefreshMin == 0) { p->lastRefreshMin = nowMin; continue; }
+                if (nowMin - p->lastRefreshMin >= p->refreshMin) {
+                    p->lastRefreshMin = nowMin;
+                    EnqueueRefreshUrl(p->feedUrl);   /* 静默入队，不打断播放 */
+                }
+            }
             return 0;
         }
         if (wParam == 7) {
@@ -11218,6 +11809,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 free(pod);
                 pod = NULL;
                 UpdateNewCount(&g_pods[idx]);   /* 刷新后重算新剧集角标 */
+                PodInitRefresh(&g_pods[idx]);
+                UpdateTrayBadge();
                 if (g_playPod == idx && g_playEp >= g_pods[idx].epCount)
                     g_playEp = -1;
                 if (g_curPod == idx) SelectPodcast(idx);
@@ -11236,6 +11829,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (incremental == 1 && pod->feedUrl)
                     SeenSet(LastEpHash(pod->feedUrl), PodMaxDateKey(pod));
                 UpdateNewCount(&g_pods[newIdx]);
+                PodInitRefresh(&g_pods[newIdx]);
                 /* 插入到"已缓存"虚拟行之前（无虚拟行时等同末尾追加）。
                  * owner-draw 列表真正显示在 WM_DRAWITEM 里画，这里 lParam 仅作占位 */
                 SendMessageW(g_listPod, LB_INSERTSTRING, newIdx,
@@ -11254,6 +11848,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     /* 启动时预置了“已缓存”选中：插入真实播客后选中跟随虚拟行 */
                     SendMessageW(g_listPod, LB_SETCURSEL, g_podCount, 0);
                 }
+                UpdateTrayBadge();
             } else {
                 FreePodcast(pod);   /* 超过上限：丢弃并释放 */
             }
@@ -11286,6 +11881,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         TryResumePlayback();   /* 启动续播：有记忆位置时自动恢复上次播放 */
         LastEpPurgeOrphans();  /* 清掉对不上现有订阅的“上次听到”记录 */
         SeenPurgeOrphans();    /* 同上：清“已看”水位的孤儿记录 */
+        FavPurgeOrphans();     /* 清理已删除订阅的收藏记录 */
+        PodRefreshPurgeOrphans();  /* 清理已删除订阅的刷新间隔记录 */
         /* 联网全量刷新（手动/自动）完成且窗口在托盘：有新剧集时弹气泡 */
         if (g_fullReload && lParam == 1 && !IsWindowVisible(g_hwnd)) {
             int i, total = 0;
@@ -11294,6 +11891,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         g_fullReload = 0;
         PumpRefreshQueue();    /* 单播客刷新队列：接续下一条 */
+        UpdateTrayBadge();
+        ArmAutoRefreshTimer(); /* 加载完成后按“是否有每播客间隔”重新武装 */
         return 0;
 
     case WM_APP_EP_READY: {
@@ -11325,12 +11924,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 /* 探测到时长：补进剧集列表 */
                 if (pd > 0 && e->durationSec <= 0) {
                     e->durationSec = (int)(pd / 10000000);
-                    {
+                    int row = RowOfEpIdx(epIdx);
+                    if (row >= 0) {   /* 被过滤隐藏的行不补 */
                         wchar_t dur[16];
                         LVITEMW li;
                         FmtTime(e->durationSec, dur, 16);
                         ZeroMemory(&li, sizeof(li));
-                        li.iItem = epIdx;
+                        li.iItem = row;
                         li.iSubItem = 2;
                         li.pszText = dur;
                         SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&li);
@@ -11544,6 +12144,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_trayAdded = 0;
         }
         if (g_trayIco) { DestroyIcon(g_trayIco); g_trayIco = NULL; }
+        if (g_trayBadgeIco) { DestroyIcon(g_trayBadgeIco); g_trayBadgeIco = NULL; }
         /* 迷你控制浮窗 */
         if (g_fly) { DestroyWindow(g_fly); g_fly = NULL; }
         PhoneServerStop();   /* 手机服务随程序退出关闭 */
