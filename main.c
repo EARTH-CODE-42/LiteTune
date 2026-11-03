@@ -495,7 +495,7 @@ static const wchar_t *tr(int id)
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
         L"切换字号（当前：%ls）", L"小", L"中", L"大",
         L"关于 LiteTune",
-        L"LiteTune  版本 1.4.1\r\n\r\n"
+        L"LiteTune  版本 1.5.0\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
             L"纯 C + Win32 API 编写，单文件绿色便携，\r\n不依赖任何第三方 DLL。",
         L"夜间模式已开启", L"夜间模式已关闭", L"字号已切换",
@@ -604,7 +604,7 @@ static const wchar_t *tr(int id)
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
         L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
-        L"LiteTune  version 1.4.1\r\n\r\n"
+        L"LiteTune  version 1.5.0\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
             L"auto-cache episodes and listen offline.\r\n\r\n"
             L"Written in pure C with Win32 API. One portable executable,\r\n"
@@ -2006,7 +2006,7 @@ static HINTERNET WinHttpOpenUser(void)
     ZeroMemory(&ie, sizeof(ie));
     if (WinHttpGetIEProxyConfigForCurrentUser(&ie)) {
         if (ie.lpszProxy && ie.lpszProxy[0]) {
-            s = WinHttpOpen(L"LiteTune/1.4", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            s = WinHttpOpen(L"LiteTune/1.5", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
                 ie.lpszProxy, ie.lpszProxyBypass, 0);
         }
         if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl);
@@ -2014,7 +2014,7 @@ static HINTERNET WinHttpOpenUser(void)
         if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass);
     }
     if (s) return s;
-    return WinHttpOpen(L"LiteTune/1.4",
+    return WinHttpOpen(L"LiteTune/1.5",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 }
@@ -8795,42 +8795,46 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill
         break;
     }
     case ICO_DOWNLOAD: {
-        /* 下载：箭头 + 底线。fill=1（按钮开启态）时箭头实心填充 */
+        /* 下载箭头：关=空心轮廓（1px pen + 空 Brush），开=实心填充。
+         * 上下左右完全对称：竖杆居中、三角形底边等于顶边、上下各 2px 留白 */
         int mid = x0 + s / 2;
-        int top = y0 + 3, bot = y0 + s - 5;
-        if (fill) {
-            Rectangle(hdc, mid - 1, top, mid + 2, bot - 3);
-            {
-                POINT t[3] = { {mid - 5, bot - 4}, {mid + 5, bot - 4}, {mid + 0, bot} };
-                Polygon(hdc, t, 3);
-            }
-            Rectangle(hdc, x0 + 3, bot + 2, x0 + s - 3, bot + 4);
-            break;
-        }
-        SelectObject(hdc, pen2);
-        MoveToEx(hdc, mid, top, NULL);
-        LineTo(hdc, mid, bot - 2);
-        MoveToEx(hdc, mid - 4, bot - 6, NULL);
-        LineTo(hdc, mid, bot - 2);
-        LineTo(hdc, mid + 4, bot - 6);
+        int top = y0 + 2, bot = y0 + s - 6;
+        int arrow_w = 5, arrow_h = 4;
+        HGDIOBJ oldBrush2 = SelectObject(hdc,
+            fill ? br : GetStockObject(NULL_BRUSH));
         SelectObject(hdc, pen1);
-        MoveToEx(hdc, x0 + 3, bot, NULL);
-        LineTo(hdc, x0 + s - 3, bot);
+        /* 竖杆：居中 1px × arrow_h 以上部分 */
+        Rectangle(hdc, mid - 1, top, mid + 1, bot - arrow_h);
+        /* 箭头：顶点 mid 下 1px，底边左右对称 */
+        {
+            POINT t[3] = {
+                {mid - arrow_w, bot - arrow_h},
+                {mid + arrow_w, bot - arrow_h},
+                {mid, bot + 1}
+            };
+            Polygon(hdc, t, 3);
+        }
+        /* 底线：贯穿整个图标宽 */
+        Rectangle(hdc, x0 + 2, bot + 2, x0 + s - 2, bot + 4);
+        SelectObject(hdc, oldBrush2);
         break;
     }
     case ICO_PHONE: {
-        /* 简洁手机图标：圆角机身 + 顶部听筒短线 + 底部椭圆按键。
-         * 圆角必须远小于半宽，否则 Win32 圆弧越界，图形扭曲 */
-        int l = x0 + 4, r = x0 + s - 4;   /* 机身宽 = s-8，半宽 = (s-8)/2 */
-        int t = y0 + 2, b = y0 + s - 2;   /* 机身高 = s-4 */
+        /* 简洁手机图标：直角矩形机身 + 顶部听筒 + 底部椭圆按键。
+         * 彻底不圆角——避免任何 RoundRect 越界导致的畸形 */
+        int l = x0 + 4, r = x0 + s - 4;   /* 机身宽 = s-8 */
+        int t = y0 + 1, b = y0 + s - 1;   /* 机身高 = s-2，上下各 1px 留白 */
         int mid = (l + r) / 2;
-        SelectObject(hdc, pen2);
+        SelectObject(hdc, pen1);
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, l, t, r, b, 2, 2);  /* 圆角 2 < 半宽 (s-8)/2，安全 */
+        /* 机身：直角矩形 */
+        Rectangle(hdc, l, t, r, b);
+        /* 顶部听筒：一条短线 */
         MoveToEx(hdc, mid - 2, t + 4, NULL);
         LineTo(hdc, mid + 2, t + 4);
+        /* 底部按键：实心椭圆 */
         SelectObject(hdc, br);
-        Ellipse(hdc, mid - 1, b - 6, mid + 1, b - 4);
+        Ellipse(hdc, mid - 1, b - 5, mid + 1, b - 3);
         break;
     }
     }

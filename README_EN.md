@@ -2,10 +2,10 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 280 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 292 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![version](https://img.shields.io/badge/Version-1.4.1-blue)
-![size](https://img.shields.io/badge/Size-280%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.5.0-blue)
+![size](https://img.shields.io/badge/Size-292%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -166,7 +166,8 @@ The primary build is **32-bit** (one exe for Windows 7–11, 32/64-bit). The rep
 ```powershell
 .\mingw32\bin\windres.exe resource.rc -O coff -o resource32.o
 .\mingw32\bin\gcc.exe -Os -s -mwindows -municode -std=gnu17 -Wall -Wextra `
-    '-D_WIN32_WINNT=0x0601' '-Wl,--subsystem,windows:6.01' `
+    '-D_WIN32_WINNT=0x0601' '-fno-unwind-tables' '-fno-asynchronous-unwind-tables' `
+    '-Wl,--subsystem,windows:6.01' `
     -o LiteTune.exe main.c resource32.o `
     -lwinhttp -lwinmm -lole32 -luuid -lshlwapi -lcomctl32 -lshell32 `
     -lpropsys -lws2_32 -liphlpapi -lgdiplus -ladvapi32 -lcomdlg32 `

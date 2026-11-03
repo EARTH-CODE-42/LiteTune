@@ -2,10 +2,10 @@
 
 [English](README_EN.md) | 简体中文
 
-**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 280 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 292 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![version](https://img.shields.io/badge/Version-1.4.1-blue)
-![size](https://img.shields.io/badge/Size-280%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.5.0-blue)
+![size](https://img.shields.io/badge/Size-292%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -172,7 +172,8 @@ https://example.com/feed2.xml
 ```powershell
 .\mingw32\bin\windres.exe resource.rc -O coff -o resource32.o
 .\mingw32\bin\gcc.exe -Os -s -mwindows -municode -std=gnu17 -Wall -Wextra `
-    '-D_WIN32_WINNT=0x0601' '-Wl,--subsystem,windows:6.01' `
+    '-D_WIN32_WINNT=0x0601' '-fno-unwind-tables' '-fno-asynchronous-unwind-tables' `
+    '-Wl,--subsystem,windows:6.01' `
     -o LiteTune.exe main.c resource32.o `
     -lwinhttp -lwinmm -lole32 -luuid -lshlwapi -lcomctl32 -lshell32 `
     -lpropsys -lws2_32 -liphlpapi -lgdiplus -ladvapi32 -lcomdlg32 `
