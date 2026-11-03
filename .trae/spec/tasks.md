@@ -62,4 +62,12 @@
 - [x] #9 `BuildConfigText` 按 `[settings]/[lastplayed]/[favorites]/[seen]/[podrefresh]/[feeds]` 分节
 - [x] #9 `ParseConfigLine` 忽略节行，旧文件仍可读
 - [x] 批次 5 编译零警告 + 自审
-- [ ] 交付用户实机测试清单（不提交 git）
+- [x] 交付用户实机测试清单（不提交 git）
+
+## 批次 6：第二轮反馈（5 条）
+- [x] 刷新按钮移入设置菜单（cmd 46），播客工具栏变为 +/×/目录/手机，删除 g_btnRefresh/ICO_REFRESH/TR_TIP_REFRESH/TR_M_PHONE 死代码
+- [x] 滚轮：WheelRouted 内联处理简介（EM_LINESCROLL），主窗口 WM_MOUSEWHEEL 复用统一路由，焦点在简介时 KatMouse 也能滚
+- [x] 手机图标对称化（RoundRect 四边留白 4/4、2/2，圆角 5）
+- [x] 收藏开关开态改为与缓存/手机同款按下底色 + 凹边（保留橙星）
+- [x] 托盘浮窗：按钮 28px 整体变小、点击不再消失、图标 GX(16格) 等比缩放居中加宽、tracking tooltip、离开判定外扩 10px 容错
+- [x] 编译零警告 + 自审

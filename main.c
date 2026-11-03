@@ -158,7 +158,7 @@ enum {
     IDC_ST_TIME = 100, IDC_ST_FORMAT, IDC_ST_VOL,
     IDC_SLD_SEEK, IDC_SLD_VOL,
     IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
-    IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
+    IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_PLAYMODE,
     IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE,
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_EDIT_FILTER, IDC_BTN_FAVONLY, IDC_BTN_PHONE,
@@ -193,7 +193,7 @@ static HWND     g_btnFavOnly;      /* “只显示已收藏”开关按钮 */
 static int      g_cacheOnly;       /* “只显示已缓存”开关（缓存按钮） */
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
 static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAINT 统一画边框 */
-static HWND     g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode;
+static HWND     g_btnAdd, g_btnDel, g_btnPlayMode;
 static HWND     g_btnDir;
 static HWND     g_btnSpeed;        /* 倍速按钮，显示当前倍率如 1.0x */
 static HWND     g_btnCache;        /* “只显示已缓存”开关（批量下载在多选右键菜单） */
@@ -222,10 +222,11 @@ static HICON    g_trayBadgeIco = NULL; /* 带新剧集数字角标的托盘图�
  * 体验对齐任务栏缩略图工具栏；左键单击托盘图标弹出，再点收起 */
 #define FLY_CLASS L"LiteTuneFlyout"
 static HWND     g_fly = NULL;        /* 浮窗（popup，平时隐藏） */
+static HWND     g_flyTip = NULL;     /* 浮窗按钮 tooltip（tracking） */
 static int      g_flyHover = -1;     /* 悬停的按钮下标，-1=无 */
 static DWORD    g_trayClickTick;     /* 上次托盘单击时刻（过滤双击的第二击） */
-#define FLY_PAD   6                  /* 浮窗内边距 */
-#define FLY_BTN   32                 /* 按钮边长 */
+#define FLY_PAD   5                  /* 浮窗内边距 */
+#define FLY_BTN   28                 /* 按钮边长 */
 #define FLY_GAP   2                  /* 按钮间距 */
 #define FLY_W   (FLY_PAD * 2 + FLY_BTN * 5 + FLY_GAP * 4)
 #define FLY_H   (FLY_PAD * 2 + FLY_BTN)
@@ -418,10 +419,10 @@ enum {
     TR_MOVE_Q_NEW_FMT, TR_MOVE_Q_DEF_FMT, TR_MOVE_CACHE, TR_BROWSE_CACHE,
     TR_TB_PREV, TR_TB_PLAY, TR_TB_PAUSE, TR_TB_NEXT, TR_TB_SHUFFLE,
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
-    TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_REFRESH, TR_TIP_SETTINGS,
+    TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_SETTINGS,
     TR_TIP_SPEED,
     TR_PM_ORDER, TR_PM_SHUFFLE, TR_PM_REPEAT, TR_PM_ONCE,
-    TR_M_PHONE, TR_PHONE_TITLE, TR_PHONE_FAIL,
+    TR_PHONE_TITLE, TR_PHONE_FAIL,
     TR_PHONE_ON, TR_PHONE_OFF, TR_PHONE_FW,
     TR_SPEED_SET,
     TR_TIP_CACHE, TR_BATCH_PROGRESS_FMT, TR_BATCH_DONE_FMT, TR_BATCH_NOSEL, TR_BATCH_RUNNING,
@@ -451,6 +452,7 @@ enum {
     TR_TIP_PHONE, TR_CTX_REVEAL,
     TR_CTX_FAV_N_FMT, TR_CTX_UNFAV_N_FMT, TR_CTX_DL_N_FMT,
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
+    TR_TB_EXIT, TR_M_REFRESH_NOW,
     TR_N
 };
 
@@ -505,9 +507,9 @@ static const wchar_t *tr(int id)
         L"移动缓存", L"选择缓存目录",
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
-        L"添加播客", L"删除播客", L"调整顺序", L"刷新", L"设置", L"倍速",
+        L"添加播客", L"删除播客", L"调整顺序", L"设置", L"倍速",
         L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放",
-        L"手机播放/遥控", L"手机播放/遥控",
+        L"手机播放/遥控",
         L"手机服务启动失败（端口被占用？）",
         L"手机服务已开启", L"手机服务已关闭",
         L"服务已在本机开启，但防火墙未放行，手机连不上。\r\n\r\n"
@@ -558,7 +560,8 @@ static const wchar_t *tr(int id)
         L"最小化到任务栏", L"最小化到托盘", L"最大化", L"向下还原", L"关闭",
         L"手机播放/遥控", L"打开文件位置",
         L"收藏选中的 %d 集", L"取消收藏选中的 %d 集", L"下载选中的 %d 集",
-        L"已收藏 %d 集", L"已取消收藏 %d 集"
+        L"已收藏 %d 集", L"已取消收藏 %d 集",
+        L"退出", L"立即刷新全部订阅"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -615,9 +618,9 @@ static const wchar_t *tr(int id)
         L"Move Cache", L"Select Cache Folder",
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
-        L"Add podcast", L"Delete podcast", L"Reorder", L"Refresh", L"Settings", L"Speed",
+        L"Add podcast", L"Delete podcast", L"Reorder", L"Settings", L"Speed",
         L"Sequential", L"Shuffle", L"Repeat one", L"Play once",
-        L"Phone Speaker/Remote", L"Phone Speaker/Remote",
+        L"Phone Speaker/Remote",
         L"Failed to start phone service (port in use?)",
         L"Phone service on", L"Phone service off",
         L"The service is running on this PC, but the firewall was not opened, "
@@ -681,7 +684,8 @@ static const wchar_t *tr(int id)
         L"Minimize", L"Minimize to tray", L"Maximize", L"Restore", L"Close",
         L"Phone play/remote", L"Show in folder",
         L"Favorite %d selected", L"Unfavorite %d selected", L"Download %d selected",
-        L"Favorited %d episode(s)", L"Unfavorited %d episode(s)"
+        L"Favorited %d episode(s)", L"Unfavorited %d episode(s)",
+        L"Exit", L"Refresh all feeds now"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -1213,7 +1217,7 @@ static void ApplyTheme(void)
     HWND ctrls[] = {
         g_sldSeek, g_sldVol, g_stTime, g_stVol, g_stFormat,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
-        g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
+        g_btnAdd, g_btnDel, g_btnPlayMode, g_btnDir, g_btnCache,
         g_listPod, g_listEp, g_editDesc, g_vsPod, g_vsEp, g_vsDesc,
         g_btnDescTab
     };
@@ -1836,7 +1840,7 @@ static void ApplyFontsToControls(void)
         g_sldSeek, g_stTime,
         g_btnPrev, g_btnPlay, g_btnNext, g_btnStop, g_btnMute,
         g_sldVol, g_stVol, g_stFormat,
-        g_btnAdd, g_btnDel, g_btnRefresh, g_btnPlayMode, g_btnDir, g_btnCache,
+        g_btnAdd, g_btnDel, g_btnPlayMode, g_btnDir, g_btnCache,
         g_btnPhone, g_listPod, g_listEp, g_editDesc, g_editFilter
     };
     int i;
@@ -8016,44 +8020,12 @@ static int PodListModeClick(POINT pt)
     return 1;
 }
 
-/* ================= 滚轮统一路由 ================= */
-/* 焦点在哪个控件，滚轮消息就发给谁；若光标实际悬停在别的可滚控件上，
- * 转交给它（否则“焦点在列表时简介滚不动”）。返回 1=已转交。 */
-static int WheelRouted(HWND self, WPARAM wp, LPARAM lp)
-{
-    POINT sp;
-    HWND under;
-    if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) return 0;   /* Ctrl+滚轮=字号，各自处理 */
-    GetCursorPos(&sp);
-    under = WindowFromPoint(sp);
-    if (!under || GetAncestor(under, GA_ROOT) != g_hwnd || under == self) return 0;
-    if (g_editDesc && IsWindowVisible(g_editDesc) &&
-        (under == g_editDesc || IsChild(g_editDesc, under))) {
-        SendMessageW(g_editDesc, WM_MOUSEWHEEL, wp, lp);
-        return 1;
-    }
-    if (under == g_sldSeek || under == g_sldVol) {
-        SendMessageW(under, WM_MOUSEWHEEL, wp, lp);
-        return 1;
-    }
-    if (g_listEp && (under == g_listEp || IsChild(g_listEp, under))) {
-        SendMessageW(g_listEp, WM_MOUSEWHEEL, wp, lp);
-        return 1;
-    }
-    if (g_listPod && (under == g_listPod || IsChild(g_listPod, under))) {
-        SendMessageW(g_listPod, WM_MOUSEWHEEL, wp, lp);
-        return 1;
-    }
-    return 0;
-}
-
 /* ================= 滑块滚轮修正 ================= */
 /* trackbar 默认滚轮方向是反的（向上滚反而减小），子类化后自己处理 */
 
 static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
-    if (msg == WM_MOUSEWHEEL && WheelRouted(hwnd, wp, lp)) return 0;
     if (msg == WM_MOUSEWHEEL) {
         /* Ctrl+滚轮：调全局字号（普通滚轮才是调滑块） */
         if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
@@ -8095,8 +8067,6 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
-    /* 滚轮先按光标位置路由：焦点控件不一定是鼠标下那个 */
-    if (msg == WM_MOUSEWHEEL && WheelRouted(hwnd, wp, lp)) return 0;
     /* 暗色表头：ODT_HEADER 的 WM_DRAWITEM 发给表头的父窗口 ListView */
     if (g_darkMode && msg == WM_DRAWITEM &&
         (hwnd == g_listEp || hwnd == g_ibList)) {
@@ -8459,13 +8429,12 @@ static void LayoutControls(HWND hwnd)
     totalW = W - 2*MARGIN - 2*GAP_W;
     PanelWidthsPx(totalW, &w1, &w2, &w3);
 
-    /* 播客列顶部工具栏（+/×/刷新/目录），列表向下让出 28px */
+    /* 播客列顶部工具栏（+/×/目录/手机），列表向下让出 28px */
     x = MARGIN;
-    MoveWindow(g_btnAdd,     x,      by, 24, 24, TRUE);
-    MoveWindow(g_btnDel,     x + 27, by, 24, 24, TRUE);
-    MoveWindow(g_btnRefresh, x + 54, by, 24, 24, TRUE);
-    MoveWindow(g_btnDir,     x + 81, by, 24, 24, TRUE);
-    if (g_btnPhone) MoveWindow(g_btnPhone, x + 108, by, 24, 24, TRUE);
+    MoveWindow(g_btnAdd, x,      by, 24, 24, TRUE);
+    MoveWindow(g_btnDel, x + 27, by, 24, 24, TRUE);
+    MoveWindow(g_btnDir, x + 54, by, 24, 24, TRUE);
+    if (g_btnPhone) MoveWindow(g_btnPhone, x + 81, by, 24, 24, TRUE);
     /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
     {
@@ -8641,13 +8610,13 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* ================= 方形图标按钮（owner-draw） ================= */
 enum {
     ICO_PREV, ICO_PLAY, ICO_PAUSE, ICO_NEXT, ICO_STOP,
-    ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_CROSS, ICO_SORT, ICO_REFRESH,
+    ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_CROSS, ICO_SORT,
     ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_GEAR,
     ICO_DOWNLOAD, ICO_PHONE
 };
 
 /* 在按钮矩形内绘制单个矢量图标 */
-static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
+static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill)
 {
     int w = rc->right - rc->left, h = rc->bottom - rc->top;
     int s = (w < h ? w : h) - 8;                 /* 24px 按钮 → 16px 图标 */
@@ -8660,30 +8629,40 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
     HBRUSH br = CreateSolidBrush(col);
     HGDIOBJ op = SelectObject(hdc, pen1);
     HGDIOBJ ob = SelectObject(hdc, br);
+    /* 图标横向坐标按 16 格设计，随 s 等比缩放（16px 设计在任意按钮上都居中） */
+    #define GX(k) (x0 + (k) * s / 16)
 
     switch (kind) {
+    /* 运输类图标按 16 格设计（GX(k)=x0+k*s/16），随按钮尺寸等比缩放，
+     * 保证在 28~32px 大按钮（托盘浮窗）里依然居中不偏左 */
     case ICO_PLAY: {
-        POINT t[3] = { {x0+3,y0+1},{x0+3,y0+s-1},{x0+s-2,cy} };
+        POINT t[3] = { {GX(3),y0+1},{GX(3),y0+s-1},{x0+s-2,cy} };
         Polygon(hdc, t, 3);
         break;
     }
-    case ICO_PAUSE:
-        Rectangle(hdc, x0+3, y0+2, x0+7, y0+s-2);
-        Rectangle(hdc, x0+9, y0+2, x0+13, y0+s-2);
+    case ICO_PAUSE: {
+        /* 双竖杠：宽度随 s 缩放并整体居中 */
+        int bw = s * 3 / 16, gap = s * 2 / 16;
+        int px = x0 + (s - (bw * 2 + gap) + 1) / 2;
+        Rectangle(hdc, px, y0 + 2, px + bw, y0 + s - 2);
+        Rectangle(hdc, px + bw + gap, y0 + 2, px + bw * 2 + gap, y0 + s - 2);
         break;
+    }
     case ICO_STOP:
         Rectangle(hdc, x0+3, y0+3, x0+s-3, y0+s-3);
         break;
     case ICO_PREV: {
-        POINT t[3] = { {x0+13,y0+2},{x0+5,cy},{x0+13,y0+s-2} };
-        Rectangle(hdc, x0+2, y0+2, x0+5, y0+s-2);
+        /* 竖杠 + 左向三角，三角随 s 拉宽 */
+        POINT t[3] = { {GX(14),y0+2},{GX(5),cy},{GX(14),y0+s-2} };
+        Rectangle(hdc, GX(2), y0+2, GX(5), y0+s-2);
         Polygon(hdc, t, 3);
         break;
     }
     case ICO_NEXT: {
-        POINT t[3] = { {x0+3,y0+2},{x0+11,cy},{x0+3,y0+s-2} };
+        /* PREV 的镜像 */
+        POINT t[3] = { {GX(2),y0+2},{GX(11),cy},{GX(2),y0+s-2} };
         Polygon(hdc, t, 3);
-        Rectangle(hdc, x0+11, y0+2, x0+14, y0+s-2);
+        Rectangle(hdc, GX(11), y0+2, GX(14), y0+s-2);
         break;
     }
     case ICO_MUTE:
@@ -8731,45 +8710,6 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
         POINT down[3] = { {cx-5,y0+s-9},{cx+5,y0+s-9},{cx,y0+s-2} };
         Polygon(hdc, up, 3);
         Polygon(hdc, down, 3);
-        break;
-    }
-    case ICO_REFRESH: {
-        /* 标准刷新图标：两段圆弧各带一个箭头，首尾相追围成圆环 */
-        double cxx = x0 + s / 2.0 + 0.5, cyy = y0 + s / 2.0 + 0.5, r = 5.6;
-        int k;
-        /* arcPts: 沿角度增大方向采样一段弧（屏幕上呈逆时针走笔） */
-        #define LP_ARC(pts, a0, a1, n) do { \
-            for (k = 0; k < (n); k++) { \
-                double deg = (a0) + ((a1) - (a0)) * k / ((n) - 1); \
-                double rad = deg * 3.14159265358979 / 180.0; \
-                (pts)[k].x = (int)(cxx + r * cos(rad) + 0.5); \
-                (pts)[k].y = (int)(cyy - r * sin(rad) + 0.5); \
-            } } while (0)
-        /* 在角度 a 处画一个沿“角度减小”（顺时针）方向的箭头 */
-        #define LP_ARROW(a) do { \
-            double rad = (a) * 3.14159265358979 / 180.0; \
-            double dx = sin(rad), dy = cos(rad);          /* 顺时针切向 */ \
-            double px = -cos(rad), py = sin(rad);         /* 法向 */ \
-            int hx = (int)(cxx + r * cos(rad) + 0.5); \
-            int hy = (int)(cyy - r * sin(rad) + 0.5); \
-            POINT ah2[3]; \
-            ah2[0].x = hx; ah2[0].y = hy; \
-            ah2[1].x = (int)(hx - dx * 5 + px * 3 + 0.5); \
-            ah2[1].y = (int)(hy - dy * 5 + py * 3 + 0.5); \
-            ah2[2].x = (int)(hx - dx * 5 - px * 3 + 0.5); \
-            ah2[2].y = (int)(hy - dy * 5 - py * 3 + 0.5); \
-            Polygon(hdc, ah2, 3); } while (0)
-        POINT arc[16];
-        SelectObject(hdc, pen2);
-        LP_ARC(arc, 60, 210, 16);     /* 上段弧：从右上绕左侧到左下 */
-        Polyline(hdc, arc, 16);
-        LP_ARC(arc, 240, 390, 16);    /* 下段弧：从左下绕右侧回右上 */
-        Polyline(hdc, arc, 16);
-        SelectObject(hdc, pen1);
-        LP_ARROW(60);                 /* 上端箭头朝右 */
-        LP_ARROW(240);                /* 下端箭头朝左 */
-        #undef LP_ARC
-        #undef LP_ARROW
         break;
     }
     case ICO_ORDER: {
@@ -8855,9 +8795,18 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
         break;
     }
     case ICO_DOWNLOAD: {
-        /* 下载图标：向下的箭头 + 底线 */
+        /* 下载：箭头 + 底线。fill=1（按钮开启态）时箭头实心填充 */
         int mid = x0 + s / 2;
         int top = y0 + 3, bot = y0 + s - 5;
+        if (fill) {
+            Rectangle(hdc, mid - 1, top, mid + 2, bot - 3);
+            {
+                POINT t[3] = { {mid - 5, bot - 4}, {mid + 5, bot - 4}, {mid + 0, bot} };
+                Polygon(hdc, t, 3);
+            }
+            Rectangle(hdc, x0 + 3, bot + 2, x0 + s - 3, bot + 4);
+            break;
+        }
         SelectObject(hdc, pen2);
         MoveToEx(hdc, mid, top, NULL);
         LineTo(hdc, mid, bot - 2);
@@ -8870,44 +8819,42 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col)
         break;
     }
     case ICO_PHONE: {
-        /* 手机：圆角竖屏机身 + 底部圆点 */
+        /* 简洁手机图标：圆角机身 + 顶部听筒短线 + 底部椭圆按键。
+         * 圆角必须远小于半宽，否则 Win32 圆弧越界，图形扭曲 */
+        int l = x0 + 4, r = x0 + s - 4;   /* 机身宽 = s-8，半宽 = (s-8)/2 */
+        int t = y0 + 2, b = y0 + s - 2;   /* 机身高 = s-4 */
+        int mid = (l + r) / 2;
         SelectObject(hdc, pen2);
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, x0 + 4, y0 + 1, x0 + s - 3, y0 + s - 1, 6, 6);
+        RoundRect(hdc, l, t, r, b, 2, 2);  /* 圆角 2 < 半宽 (s-8)/2，安全 */
+        MoveToEx(hdc, mid - 2, t + 4, NULL);
+        LineTo(hdc, mid + 2, t + 4);
         SelectObject(hdc, br);
-        Ellipse(hdc, x0 + s / 2 - 1, y0 + s - 5, x0 + s / 2 + 2, y0 + s - 2);
+        Ellipse(hdc, mid - 1, b - 6, mid + 1, b - 4);
         break;
     }
     }
 
     SelectObject(hdc, op);
     SelectObject(hdc, ob);
+    #undef GX
     DeleteObject(pen1);
     DeleteObject(pen2);
     DeleteObject(pen3);
     DeleteObject(br);
 }
 
-/* 默认主题色版本（主窗口按钮用） */
-static void DrawGlyph(HDC hdc, const RECT *rc, int kind)
-{
-    DrawGlyphC(hdc, rc, kind, ThDim());
-}
-
-/* on=1：模式按钮已按下（浅蓝底 + 凹陷边） */
+/* 开关型按钮统一风格：关=灰色镂空图标+凸起边，开=主色实心图标+凹陷边
+ * （反转边框阴影，表达"按下/激活"态） */
 static void DrawIconButton(DRAWITEMSTRUCT *di, int kind, int on)
 {
     RECT rc = di->rcItem;
-    HBRUSH bg;
-    if (on) bg = CreateSolidBrush(g_darkMode ? RGB(56,74,100) : RGB(180, 215, 255));
-    else bg = CreateSolidBrush(ThWinBg());
-    FillRect(di->hDC, &rc, bg);
-    DeleteObject(bg);
-    if (on || (di->itemState & ODS_SELECTED))
+    FillRectColor(di->hDC, &rc, ThWinBg());
+    if (di->itemState & ODS_SELECTED || on)
         DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
     else
         DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
-    DrawGlyph(di->hDC, &rc, kind);
+    DrawGlyphC(di->hDC, &rc, kind, on ? ThAccent() : ThDim(), on);
 }
 
 /* 控件 ID → 图标种类；*on 返回是否按下态，不认识返回 -1 */
@@ -8922,7 +8869,6 @@ static int IconKindOf(int id, int *on)
     case IDC_BTN_MUTE:  *on = g_muted; return g_muted ? ICO_MUTED : ICO_MUTE;
     case IDC_BTN_ADD:   return ICO_PLUS;
     case IDC_BTN_DEL:   *on = (g_podMode == 1); return ICO_CROSS;
-    case IDC_BTN_REFRESH: return ICO_REFRESH;
     case IDC_BTN_PLAYMODE:
         return (g_playMode == 1) ? ICO_SHUFFLE :
                (g_playMode == 2) ? ICO_REPEATONE :
@@ -9084,7 +9030,6 @@ static void ApplyLanguage(void)
     UpdateTipText(g_btnMute,     tr(TR_TIP_MUTE));
     UpdateTipText(g_btnAdd,      tr(TR_TIP_ADD));
     UpdateTipText(g_btnDel,      tr(TR_TIP_DEL));
-    UpdateTipText(g_btnRefresh,  tr(TR_TIP_REFRESH));
     UpdateTipText(g_btnPlayMode, PlayModeTipText());
     UpdateTipText(g_btnDir,      tr(TR_TIP_SETTINGS));
     UpdateTipText(g_btnCache,    tr(TR_TIP_CACHE));
@@ -9416,10 +9361,11 @@ static void CfgSwitchMode(int external)
     }
 }
 
-/* ================= 下拉菜单（亮色原生 / 暗色全自绘） ================= */
-/* 暗色模式下所有菜单项（含子菜单）都用 MF_OWNERDRAW，由 MenuMeasureItem /
- * MenuDrawItem 统一绘制。这样文字颜色、勾选符号、子菜单箭头完全可控，
- * 不会出现系统在深色底上叠黑字、彩色 ✓ emoji、或无法染色的 ▶ 三角。 */
+/* ================= 下拉菜单（全自绘，亮/暗共用一套） ================= */
+/* 所有菜单项（含子菜单）都用 MF_OWNERDRAW，由 MenuMeasureItem / MenuDrawItem
+ * 统一绘制，配色随主题（ThPanel/ThText/ThSel/ThDim）。这样文字颜色、勾选符号、
+ * 子菜单箭头完全可控，不会出现系统在深色底上叠黑字、彩色 ✓ emoji、
+ * 或无法染色的 ▶ 三角，也省掉「亮色走系统原生」的第二套分支。 */
 typedef struct MenuItemDataS {
     wchar_t *text;      /* 纯文本（自绘项不使用系统存储的文本） */
     int isPopup;        /* MF_POPUP：右侧画 chevron */
@@ -9445,14 +9391,10 @@ static HFONT MenuFont(void)
     return g_menuFont;
 }
 
-/* 追加普通项/子菜单项：暗色转成自绘项，亮色保持系统原生 */
+/* 追加普通项/子菜单项：统一转成自绘项 */
 static void MenuAdd(HMENU m, UINT flags, UINT_PTR id, const wchar_t *text)
 {
     MenuItemData *md;
-    if (!g_darkMode) {
-        AppendMenuW(m, flags | MF_STRING, id, text);
-        return;
-    }
     md = calloc(1, sizeof(*md));
     if (!md) {
         AppendMenuW(m, flags | MF_STRING, id, text);   /* 极端情况退回原生项 */
@@ -9471,7 +9413,7 @@ static void MenuAddPopup(HMENU m, HMENU sub, const wchar_t *text, UINT flags)
 
 static void MenuAddSep(HMENU m)
 {
-    AppendMenuW(m, MF_SEPARATOR | (g_darkMode ? MF_OWNERDRAW : 0), 0, NULL);
+    AppendMenuW(m, MF_SEPARATOR | MF_OWNERDRAW, 0, NULL);
 }
 
 /* 递归释放自绘项数据 */
@@ -9494,12 +9436,11 @@ static void ThemeMenuCleanup(HMENU m)
     }
 }
 
-/* 暗色菜单背景：填满菜单窗口和项之间的间隙，MIM_APPLYTOSUBMENUS 同时作用于子菜单 */
+/* 菜单背景：填满菜单窗口和项之间的间隙，MIM_APPLYTOSUBMENUS 同时作用于子菜单 */
 static HBRUSH ApplyMenuTheme(HMENU m)
 {
     HBRUSH bg;
     MENUINFO mi;
-    if (!g_darkMode) return NULL;
     bg = CreateSolidBrush(ThPanel());
     ZeroMemory(&mi, sizeof(mi));
     mi.cbSize = sizeof(mi);
@@ -9678,6 +9619,7 @@ static void OnSettingsButton(void)
         MenuAddPopup(menu, ar, tr(TR_M_AUTOREFRESH), 0);
     }
     MenuAdd(menu, g_traySound ? MF_CHECKED : 0, 45, tr(TR_M_TRAY_SOUND));
+    MenuAdd(menu, 0, 46, tr(TR_M_REFRESH_NOW));   /* 原工具栏刷新按钮移到这里 */
     MenuAddSep(menu);
     MenuAdd(menu, 0, 22, tr(TR_M_IMPORT));
     MenuAdd(exp, 0, 23, tr(TR_M_EXP_OPML));
@@ -9721,6 +9663,7 @@ static void OnSettingsButton(void)
 
     /* 外观/语言/定时类命令先处理，不涉及缓存目录 */
     if (cmd == 22) { DoImport(); return; }
+    if (cmd == 46) { ReloadFeeds(1); return; }   /* 立即刷新全部订阅 */
     if (cmd == 23) { DoExportOpml(); return; }
     if (cmd == 24) { DoExportIni(); return; }
     if (cmd == 25) { CfgSwitchMode(0); return; }
@@ -9862,7 +9805,9 @@ static int FlyBtnAt(int x, int y)
     return (id >= FLY_BTN_N) ? -1 : id;
 }
 
-/* 点击执行；退出用 WM_CLOSE 走正常收尾（保存配置、销毁托盘图标） */
+/* 点击执行；退出用 WM_CLOSE 走正常收尾（保存配置、销毁托盘图标）。
+ * 其余动作执行后浮窗保持显示（移开才消失），但播放状态可能变了，
+ * 需要重绘刷新播放/暂停图标 */
 static void FlyAction(int id)
 {
     if (id == 0) PlayAdjacent(-1);
@@ -9875,10 +9820,43 @@ static void FlyAction(int id)
         n = (pod == g_podCount) ? g_cachePod.epCount : g_pods[pod].epCount;
         if (n > 0) RequestPlayEpisode(pod, rand() % n);
     } else if (id == 4) {
+        if (g_flyTip) ShowWindow(g_flyTip, SW_HIDE);
+        if (g_fly) ShowWindow(g_fly, SW_HIDE);
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
         return;
     }
-    if (g_fly) ShowWindow(g_fly, SW_HIDE);
+    if (g_fly) InvalidateRect(g_fly, NULL, TRUE);
+}
+
+/* 浮窗按钮 tooltip 文案（复用任务栏缩略图按钮的名字） */
+static const wchar_t *FlyTipText(int id)
+{
+    if (id == 0) return tr(TR_TB_PREV);
+    if (id == 1) return (g_playState == 1) ? tr(TR_TB_PAUSE) : tr(TR_TB_PLAY);
+    if (id == 2) return tr(TR_TB_NEXT);
+    if (id == 3) return tr(TR_TB_SHUFFLE);
+    return tr(TR_TB_EXIT);
+}
+
+static void FlyTipShow(HWND hwnd, int id)
+{
+    TOOLINFOW ti;
+    POINT sp;
+    if (!g_flyTip) return;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = hwnd;
+    ti.uId = 1;
+    if (id < 0) {
+        SendMessageW(g_flyTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+        return;
+    }
+    ti.lpszText = (LPWSTR)FlyTipText(id);
+    SendMessageW(g_flyTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    GetCursorPos(&sp);
+    SendMessageW(g_flyTip, TTM_TRACKPOSITION, 0,
+        MAKELPARAM(sp.x + 12, sp.y + 22));
+    SendMessageW(g_flyTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
 }
 
 static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -9904,7 +9882,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                  : (i == 2) ? ICO_NEXT
                  : (i == 3) ? ICO_SHUFFLE : ICO_CROSS;
             DrawGlyphC(hdc, &br, kind,
-                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255));
+                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255), 0);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -9915,6 +9893,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id != g_flyHover) {
             g_flyHover = id;
             InvalidateRect(hwnd, NULL, TRUE);
+            FlyTipShow(hwnd, id);   /* tooltip 跟随悬停按钮 */
         }
         {
             TRACKMOUSEEVENT tme;
@@ -9931,6 +9910,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_flyHover = -1;
             InvalidateRect(hwnd, NULL, TRUE);
         }
+        FlyTipShow(hwnd, -1);
         return 0;
     case WM_LBUTTONUP: {
         int id = FlyBtnAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -9952,6 +9932,22 @@ static void CreateFlyout(HINSTANCE hInst)
     /* 圆角窗口：客户端整体裁成圆角矩形，WM_PAINT 直接填满 */
     rgn = CreateRoundRectRgn(0, 0, FLY_W + 1, FLY_H + 1, 10, 10);
     SetWindowRgn(g_fly, rgn, TRUE);   /* 成功后 region 归系统所有，不再删除 */
+    /* tracking tooltip：跟随光标显示按钮名（同标题栏 CapTip 方案） */
+    g_flyTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
+        g_fly, NULL, hInst, NULL);
+    if (g_flyTip) {
+        TOOLINFOW ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+        ti.hwnd = g_fly;
+        ti.uId = 1;
+        ti.lpszText = L"";
+        SendMessageW(g_flyTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        SendMessageW(g_flyTip, TTM_SETMAXTIPWIDTH, 0, 160);
+        ThemeTipSubclass(g_flyTip);
+    }
 }
 
 /* 托盘图标屏幕矩形；拿不到时用光标位置估计 */
@@ -10623,16 +10619,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 全部方形图标按钮 */
         {
-            const int ids[13] = {
+            const int ids[12] = {
                 IDC_BTN_PREV, IDC_BTN_PLAY, IDC_BTN_NEXT, IDC_BTN_STOP, IDC_BTN_MUTE,
-                IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_REFRESH, IDC_BTN_PLAYMODE,
+                IDC_BTN_ADD, IDC_BTN_DEL, IDC_BTN_PLAYMODE,
                 IDC_BTN_DIR, IDC_BTN_SPEED, IDC_BTN_CACHE, IDC_BTN_PHONE };
-            HWND *p[13] = {
+            HWND *p[12] = {
                 &g_btnPrev, &g_btnPlay, &g_btnNext, &g_btnStop, &g_btnMute,
-                &g_btnAdd, &g_btnDel, &g_btnRefresh, &g_btnPlayMode,
+                &g_btnAdd, &g_btnDel, &g_btnPlayMode,
                 &g_btnDir, &g_btnSpeed, &g_btnCache, &g_btnPhone };
             int bi;
-            for (bi = 0; bi < 13; bi++)
+            for (bi = 0; bi < 12; bi++)
                 *p[bi] = CreateWindowExW(0, L"BUTTON", NULL,
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                     0,0,0,0, hwnd, (HMENU)(INT_PTR)ids[bi], NULL, NULL);
@@ -10728,7 +10724,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnMute);
         SubclassForFontWheel(g_btnAdd);
         SubclassForFontWheel(g_btnDel);
-        SubclassForFontWheel(g_btnRefresh);
         SubclassForFontWheel(g_btnPlayMode);
         SubclassForFontWheel(g_btnDir);
         SubclassForFontWheel(g_btnCache);
@@ -10782,7 +10777,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             AddButtonTip(g_btnMute,   tr(TR_TIP_MUTE));
             AddButtonTip(g_btnAdd,    tr(TR_TIP_ADD));
             AddButtonTip(g_btnDel,    tr(TR_TIP_DEL));
-            AddButtonTip(g_btnRefresh,tr(TR_TIP_REFRESH));
             AddButtonTip(g_btnPlayMode, PlayModeTipText());
             AddButtonTip(g_btnDir,    tr(TR_TIP_SETTINGS));
             AddButtonTip(g_btnSpeed,  tr(TR_TIP_SPEED));
@@ -10882,8 +10876,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SelectObject(di->hDC, oldf);
                 return TRUE;
             }
-            /* 星形收藏开关：开=实心橙星，关=灰描边 */
+            /* 星形收藏开关：关=灰色镂空星+凸起边，开=黄色实心星+凹陷边
+             * （与缓存/手机按钮同款——图标填充色保持黄色不变，仅下载用主色蓝） */
             if (di->CtlID == IDC_BTN_FAVONLY) {
+                static const COLORREF STAR_ON = RGB(255, 190, 60);
                 RECT rc = di->rcItem;
                 int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
                 int i;
@@ -10891,7 +10887,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 HPEN pen;
                 HGDIOBJ oldPen, oldBrush;
                 FillRectColor(di->hDC, &rc, ThWinBg());
-                if (di->itemState & ODS_SELECTED)
+                if (di->itemState & ODS_SELECTED || g_favOnly)
                     DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
                 else
                     DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
@@ -10901,10 +10897,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     star[i].x = cx + (int)(r * cos(a));
                     star[i].y = cy + (int)(r * sin(a));
                 }
-                pen = CreatePen(PS_SOLID, 1, g_favOnly ? RGB(255,190,60) : ThDim());
+                pen = CreatePen(PS_SOLID, 1, g_favOnly ? STAR_ON : ThDim());
                 oldPen = SelectObject(di->hDC, pen);
                 if (g_favOnly) {
-                    HBRUSH br = CreateSolidBrush(RGB(255,190,60));
+                    HBRUSH br = CreateSolidBrush(STAR_ON);
                     oldBrush = SelectObject(di->hDC, br);
                     Polygon(di->hDC, star, 10);
                     SelectObject(di->hDC, oldBrush);
@@ -11127,38 +11123,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         PaintCaption(hwnd);   /* 标题栏几何随窗口变化 */
         return 0;
 
-    case WM_MOUSEWHEEL: {
-        POINT sp;
-        HWND under, target;
-        /* 在播放区/按钮等空白处 Ctrl+滚轮也能调字号 */
-        if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
+    case WM_MOUSEWHEEL:
+        /* Ctrl+滚轮=调全局字号，其余交给各控件自身处理 */
+        if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL)
             ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1));
-            return 0;
-        }
-        /* 统一按光标下真实控件分发。KatMouse 之类的工具会把滚轮消息
-         * 转给主窗口，且 lParam 可能是 (0,0)，不能依赖消息里的坐标 */
-        GetCursorPos(&sp);
-        under = WindowFromPoint(sp);
-        if (!under || GetAncestor(under, GA_ROOT) != hwnd) break;
-        if (g_editDesc && IsWindowVisible(g_editDesc) &&
-            (under == g_editDesc || IsChild(g_editDesc, under))) {
-            int d = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -3 : 3;
-            SendMessageW(g_editDesc, EM_LINESCROLL, 0, (LPARAM)d);
-            SyncScrollBar(g_vsDesc);
-            return 0;
-        }
-        target = NULL;
-        if (under == g_sldSeek || under == g_sldVol) target = under;
-        else if (g_listEp && (under == g_listEp || IsChild(g_listEp, under)))
-            target = g_listEp;
-        else if (g_listPod && (under == g_listPod || IsChild(g_listPod, under)))
-            target = g_listPod;
-        if (target) {
-            SendMessageW(target, WM_MOUSEWHEEL, wParam, 0);
-            return 0;
-        }
         break;
-    }
 
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
@@ -11700,7 +11669,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (id == IDC_BTN_MUTE) ToggleMute();
             else if (id == IDC_BTN_ADD) AskAddFeed();
             else if (id == IDC_BTN_DEL) SetPodMode(1);
-            else if (id == IDC_BTN_REFRESH) ReloadFeeds(1);
             else if (id == IDC_BTN_PLAYMODE) CyclePlayMode();
             else if (id == IDC_BTN_DIR) OnSettingsButton();
             else if (id == IDC_BTN_SPEED) CycleSpeed();
@@ -11908,15 +11876,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (wParam == 7) {
-            /* 悬停浮窗：光标同时离开图标与浮窗后收起（留 150ms 容错） */
+            /* 悬停浮窗：光标同时离开图标与浮窗后收起。
+             * 两块矩形各外扩 10px：浮窗与图标间有 6px 空隙，慢速移动时
+             * 不至于在缝隙里被判为离开而提前消失 */
             POINT p;
             RECT ir, fr;
             GetCursorPos(&p);
             TrayIconRect(hwnd, &ir);
             if (g_fly && IsWindowVisible(g_fly)) GetWindowRect(g_fly, &fr);
             else SetRectEmpty(&fr);
+            InflateRect(&ir, 10, 10);
+            InflateRect(&fr, 10, 10);
             if (!PtInRect(&ir, p) && !PtInRect(&fr, p)) {
                 if (g_fly) ShowWindow(g_fly, SW_HIDE);
+                FlyTipShow(g_fly, -1);
                 KillTimer(hwnd, 7);
             }
             return 0;
