@@ -722,12 +722,77 @@ static COLORREF ThBlue(void)    { return g_darkMode ? RGB(96,175,255)  : RGB(0,9
 static COLORREF ThTrack(void)   { return g_darkMode ? RGB(58,58,64)   : RGB(229,229,232); }  /* 滑块滑槽 */
 static COLORREF ThAccent(void)  { return RGB(0,120,215);  }                                 /* 进度/滑块把手主色 */
 
-/* 用纯色填满矩形（临时画刷即用即删） */
+/* ---- 按钮主题（DrawDarkBtn / 过滤框边框 / 删除模式） ---- */
+static COLORREF ThBtnBg(void)       { return g_darkMode ? RGB(50,50,58) : RGB(240,240,242); }
+static COLORREF ThBtnPressed(void)  { return g_darkMode ? RGB(24,24,28) : RGB(205,205,210); }
+static COLORREF ThBtnBorder(void)   { return g_darkMode ? RGB(86,86,96) : RGB(160,160,166); }
+
+/* ---- 表头主题（DrawHeaderItem / HeaderProc WM_PAINT 补白） ---- */
+static COLORREF ThHeaderBg(void)     { return g_darkMode ? RGB(46,46,52) : RGB(240,240,242); }
+static COLORREF ThHeaderSep(void)    { return g_darkMode ? RGB(28,28,32) : RGB(200,200,205); }
+static COLORREF ThHeaderText(void)   { return g_darkMode ? RGB(210,210,214) : RGB(30,30,30); }
+
+/* ---- 自绘滚动条（从 L1385-1386 移来） ---- */
+static COLORREF ThSbThumb(void)      { return g_darkMode ? RGB(104,104,112) : RGB(202,202,208); }
+static COLORREF ThSbArrow(void)      { return g_darkMode ? RGB(175,175,183) : RGB(120,120,128); }
+
+/* ---- 滑块把手浅边（不随主题：蓝色把手在两种背景上都需浅色描边衬托） ---- */
+static COLORREF ThSliderEdge(void)   { return RGB(235,240,248); }
+
+/* ---- 播客列表 ---- */
+static COLORREF ThPodCoverBg(void)   { return g_darkMode ? RGB(24,24,28) : RGB(245,245,245); }
+static COLORREF ThCacheRowBg(void)   { return g_darkMode ? RGB(48,54,64) : RGB(236,241,248); }
+static COLORREF ThCacheRowFg(void)   { return g_darkMode ? RGB(120,170,230) : RGB(70,120,200); }
+static COLORREF ThWarn(void)         { return g_darkMode ? RGB(255,200,60) : RGB(200,140,0); }
+static COLORREF ThLastListen(void)   { return g_darkMode ? RGB(235,165,80) : RGB(184,106,0); } /* "上次听到"橙色标记 */
+static COLORREF ThSelText(void)      { return g_darkMode ? RGB(236,242,250) : RGB(0,30,80); }   /* 选中行上的正常前景色 */
+
+/* ---- 托盘浮窗 ---- */
+static COLORREF ThFlyBg(void)        { return g_darkMode ? RGB(40,40,46) : RGB(245,245,247); }
+static COLORREF ThFlyHover(void)     { return g_darkMode ? RGB(64,64,74) : RGB(228,235,245); }
+
+/* ---- 标题栏（自绘 WM_NCPAINT） ---- */
+static COLORREF ThCapBar(void)       { return g_darkMode ? RGB(30,30,34) : RGB(246,246,246); }
+static COLORREF ThCapLine(void)      { return g_darkMode ? RGB(64,64,70) : RGB(178,178,182); }
+static COLORREF ThCapTextIdle(void)  { return g_darkMode ? RGB(140,140,146) : RGB(118,118,122); }
+static COLORREF ThCapCloseHot(void)  { return g_darkMode ? RGB(196,43,28) : RGB(196,43,28); } /* 关闭按钮悬停红：固定危险语义 */
+static COLORREF ThCapBtnIdle(void)   { return g_darkMode ? RGB(58,58,64) : RGB(226,226,230); }
+
+/* ---- FillRectColor 小型画刷缓存（8 槽 ring buffer） ----
+ * 高频绘制路径（列表行、滚动条、滑条）调用 FillRectColor 时避免反复 Create/Delete GDI 对象。
+ * 主题切换时 FillRectBrushesReset() 清空重建。 */
+#define FRC_CACHE_N 8
+static HBRUSH  g_frcBr[FRC_CACHE_N] = {0};
+static COLORREF g_frcCol[FRC_CACHE_N];
+static int     g_frcNext = 0;
+
+static void FillRectBrushesReset(void)
+{
+    int i;
+    for (i = 0; i < FRC_CACHE_N; i++) {
+        if (g_frcBr[i]) { DeleteObject(g_frcBr[i]); g_frcBr[i] = NULL; }
+    }
+    g_frcNext = 0;
+}
+
+static HBRUSH FillRectGetBrush(COLORREF col)
+{
+    int i;
+    for (i = 0; i < FRC_CACHE_N; i++)
+        if (g_frcBr[i] && g_frcCol[i] == col) return g_frcBr[i];
+    /* 未命中：用 ring buffer 最旧槽替换 */
+    if (g_frcBr[g_frcNext]) DeleteObject(g_frcBr[g_frcNext]);
+    g_frcBr[g_frcNext] = CreateSolidBrush(col);
+    g_frcCol[g_frcNext] = col;
+    i = g_frcNext;
+    g_frcNext = (g_frcNext + 1) % FRC_CACHE_N;
+    return g_frcBr[i];
+}
+
+/* 用纯色填满矩形（画刷走内部缓存，避免频繁 Create/Delete） */
 static void FillRectColor(HDC dc, const RECT *rc, COLORREF col)
 {
-    HBRUSH b = CreateSolidBrush(col);
-    FillRect(dc, rc, b);
-    DeleteObject(b);
+    FillRect(dc, rc, FillRectGetBrush(col));
 }
 
 /* 把一个 Unicode 字符串复制到系统剪贴板。成功返回 1，失败返回 0。 */
@@ -806,12 +871,8 @@ static void DrawDarkBtn(const DRAWITEMSTRUCT *di)
     wchar_t txt[128];
     HFONT f, of;
     RECT rc = di->rcItem, fr;
-    COLORREF bg = (di->itemState & ODS_SELECTED)
-        ? (g_darkMode ? RGB(24,24,28) : RGB(205,205,210))
-        : (g_darkMode ? RGB(50,50,58) : RGB(240,240,242));
-    COLORREF bd = (di->itemState & ODS_DEFAULT)
-        ? ThAccent()
-        : (g_darkMode ? RGB(86,86,96) : RGB(160,160,166));
+    COLORREF bg = (di->itemState & ODS_SELECTED) ? ThBtnPressed() : ThBtnBg();
+    COLORREF bd = (di->itemState & ODS_DEFAULT) ? ThAccent() : ThBtnBorder();
     HBRUSH b = CreateSolidBrush(bg);
     HBRUSH bo = CreateSolidBrush(bd);
     FillRect(di->hDC, &rc, b);
@@ -1080,8 +1141,8 @@ static LRESULT CALLBACK HeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (hdc && SendMessageW(hwnd, HDM_GETITEMRECT, 2, (LPARAM)&last)
             && last.right < rc.right) {
             RECT gap = { last.right, rc.top, rc.right, rc.bottom };
-            HBRUSH b = CreateSolidBrush(RGB(46, 46, 52));
-            HPEN pn = CreatePen(PS_SOLID, 1, RGB(28, 28, 32));
+            HBRUSH b = CreateSolidBrush(ThHeaderBg());
+            HPEN pn = CreatePen(PS_SOLID, 1, ThHeaderSep());
             HGDIOBJ ob1 = SelectObject(hdc, b);
             HGDIOBJ ob2 = SelectObject(hdc, pn);
             FillRect(hdc, &gap, b);
@@ -1230,7 +1291,8 @@ static void ApplyTheme(void)
     }
     if (g_whiteBrush) DeleteObject(g_whiteBrush);
     g_whiteBrush = CreateSolidBrush(ThPanel());
-    DlgBrushesReset();   /* 弹窗缓存刷随新配色重建 */
+    DlgBrushesReset();       /* 弹窗缓存刷随新配色重建 */
+    FillRectBrushesReset();  /* FillRectColor 内部缓存也清掉 */
     if (g_listEp) {
         SendMessageW(g_listEp, LVM_SETBKCOLOR, 0, (LPARAM)ThPanel());
         SendMessageW(g_listEp, LVM_SETTEXTBKCOLOR, 0, (LPARAM)ThPanel());
@@ -1327,7 +1389,7 @@ static int DrawSliderTrack(LPNMCUSTOMDRAW cd)
     /* 把手：主题色圆角块 + 浅边，保证在蓝色进度上也能看清 */
     acb = CreateSolidBrush(ThAccent());
     SelectObject(hdc, acb);
-    edge = CreatePen(PS_SOLID, 1, RGB(235, 240, 248));
+    edge = CreatePen(PS_SOLID, 1, ThSliderEdge());
     oldPen_p = SelectObject(hdc, edge);
     RoundRect(hdc, th.left, th.top, th.right, th.bottom, 3, 3);
     SelectObject(hdc, oldPen_p);
@@ -1380,10 +1442,6 @@ typedef struct {
     int repeatPage;    /* 1=滑槽翻页 0=箭头单行 */
     HWND target;       /* 关联的内容控件 */
 } DarkScrollBar;
-
-/* 两种主题同一造型，仅配色不同 */
-static COLORREF ThSbThumb(void) { return g_darkMode ? RGB(104,104,112) : RGB(202,202,208); }
-static COLORREF ThSbArrow(void) { return g_darkMode ? RGB(175,175,183) : RGB(120,120,128); }
 
 /* 用可见项的实际矩形测行高（顶部项一定已布局，比第 0 项可靠；
  * 绝不在两种取法之间来回摇摆——否则把手长度会忽长忽短） */
@@ -1753,8 +1811,8 @@ static int DrawHeaderItem(DRAWITEMSTRUCT *di)
 {
     wchar_t htext[64] = L"";
     RECT rc = di->rcItem, tr;
-    HBRUSH bg = CreateSolidBrush(RGB(46, 46, 52));
-    HPEN sep = CreatePen(PS_SOLID, 1, RGB(28, 28, 32));
+    HBRUSH bg = CreateSolidBrush(ThHeaderBg());
+    HPEN sep = CreatePen(PS_SOLID, 1, ThHeaderSep());
     HGDIOBJ op;
     /* 列文本直接向表头控件取，普通/缓存两种列序都能正确显示 */
     if (di->itemID < 3) {
@@ -1779,7 +1837,7 @@ static int DrawHeaderItem(DRAWITEMSTRUCT *di)
     SelectObject(di->hDC, op);
     DeleteObject(sep);
     SetBkMode(di->hDC, TRANSPARENT);
-    SetTextColor(di->hDC, RGB(210, 210, 214));
+    SetTextColor(di->hDC, ThHeaderText());
     SelectObject(di->hDC, g_font);
     tr = rc; tr.left += 8; tr.right -= 14;
     if (htext[0])
@@ -1802,7 +1860,7 @@ static int DrawHeaderItem(DRAWITEMSTRUCT *di)
         }
         if ((int)di->itemID == sortColIdx && GetParent(di->hwndItem) == g_listEp) {
             int cx = rc.right - 9, cy = rc.top + (rc.bottom - rc.top) / 2;
-            HBRUSH ab = CreateSolidBrush(RGB(210, 210, 214));
+            HBRUSH ab = CreateSolidBrush(ThHeaderText());
             HGDIOBJ ob = SelectObject(di->hDC, ab);
             POINT tri[3];
             if (g_sortDir < 0) {  /* 降序 ▼ */
@@ -7471,8 +7529,8 @@ static LRESULT CALLBACK IbHeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (hdc && cols > 0 && SendMessageW(hwnd, HDM_GETITEMRECT, cols - 1, (LPARAM)&last)
             && last.right < rc.right) {
             RECT gap = { last.right, rc.top, rc.right, rc.bottom };
-            HBRUSH b = CreateSolidBrush(RGB(46, 46, 52));
-            HPEN pn = CreatePen(PS_SOLID, 1, RGB(28, 28, 32));
+            HBRUSH b = CreateSolidBrush(ThHeaderBg());
+            HPEN pn = CreatePen(PS_SOLID, 1, ThHeaderSep());
             HGDIOBJ ob1 = SelectObject(hdc, b);
             HGDIOBJ ob2 = SelectObject(hdc, pn);
             FillRect(hdc, &gap, b);
@@ -9872,7 +9930,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         RECT rc;
         int i;
         GetClientRect(hwnd, &rc);
-        FillRectColor(hdc, &rc, RGB(40, 40, 46));
+        FillRectColor(hdc, &rc, ThFlyBg());
         for (i = 0; i < FLY_BTN_N; i++) {
             RECT br;
             int kind;
@@ -9880,7 +9938,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             br.top   = FLY_PAD;
             br.right = br.left + FLY_BTN;
             br.bottom = br.top + FLY_BTN;
-            if (i == g_flyHover) FillRectColor(hdc, &br, RGB(64, 64, 74));
+            if (i == g_flyHover) FillRectColor(hdc, &br, ThFlyHover());
             kind = (i == 0) ? ICO_PREV
                  : (i == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
                  : (i == 2) ? ICO_NEXT
@@ -10250,14 +10308,14 @@ static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                     int dh = (int)(bm.bmHeight * r + 0.5);
                     int dx = rci.left + (coverW - dw) / 2;
                     int dy = rci.top + (coverW - dh) / 2;
-                    FillRectColor(hdc, &rci, g_darkMode ? RGB(24,24,28) : RGB(245,245,245));
+                    FillRectColor(hdc, &rci, ThPodCoverBg());
                     SetStretchBltMode(hdc, HALFTONE);
                     StretchBlt(hdc, dx, dy, dw, dh, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
                 }
                 SelectObject(mem, old);
                 DeleteDC(mem);
             } else {
-                FillRectColor(hdc, &rci, g_darkMode ? RGB(24,24,28) : RGB(245,245,245));
+                FillRectColor(hdc, &rci, ThPodCoverBg());
             }
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, ThText());
@@ -10440,10 +10498,9 @@ static void PaintCaption(HWND hwnd)
     RECT band, wr, r;
     HBRUSH hb;
     int i, ww, wh;
-    COLORREF cBar  = g_darkMode ? RGB(30, 30, 34) : RGB(246, 246, 246);
-    COLORREF cLine = g_darkMode ? RGB(64, 64, 70) : RGB(178, 178, 182);
-    COLORREF cTxt  = g_capActive ? ThText()
-                                 : (g_darkMode ? RGB(140, 140, 146) : RGB(118, 118, 122));
+    COLORREF cBar  = ThCapBar();
+    COLORREF cLine = ThCapLine();
+    COLORREF cTxt  = g_capActive ? ThText() : ThCapTextIdle();
 
     if (IsIconic(hwnd)) return;
     hdc = GetWindowDC(hwnd);
@@ -10511,9 +10568,7 @@ static void PaintCaption(HWND hwnd)
             br.top = band.top;
             br.bottom = band.bottom;
             if (g_capHover == i) {
-                COLORREF hl = (i == CAP_CLOSE)
-                    ? RGB(196, 43, 28)
-                    : (g_darkMode ? RGB(58, 58, 64) : RGB(226, 226, 230));
+                COLORREF hl = (i == CAP_CLOSE) ? ThCapCloseHot() : ThCapBtnIdle();
                 HBRUSH hh = CreateSolidBrush(hl);
                 FillRect(hdc, &br, hh);
                 DeleteObject(hh);
@@ -10940,8 +10995,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (isCache) {
                 /* "已缓存"虚拟行：柔和底色 + 下载箭头图标 */
                 RECT ib = { rc.left + 2, rc.top + 3, rc.left + 50, rc.top + 51 };
-                COLORREF bg = g_darkMode ? RGB(48,54,64) : RGB(236,241,248);
-                COLORREF fg = g_darkMode ? RGB(120,170,230) : RGB(70,120,200);
+                COLORREF bg = ThCacheRowBg();
+                COLORREF fg = ThCacheRowFg();
                 HPEN gp = CreatePen(PS_SOLID, 1, fg);
                 HBRUSH ab = CreateSolidBrush(fg);
                 HGDIOBJ oldPen, oldBrush;
@@ -10975,7 +11030,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 textLeft = rc.left + 56;
             } else if (!isCache && p->loadFailed) {
                 /* 加载失败占位：琥珀色警告三角（无灰色底框，直接画在面板上） */
-                COLORREF warn = g_darkMode ? RGB(255,200,60) : RGB(200,140,0);
+                COLORREF warn = ThWarn();
                 HPEN wp = CreatePen(PS_SOLID, 2, warn);
                 HBRUSH wb = CreateSolidBrush(warn);
                 HGDIOBJ oldPen, oldBrush;
@@ -11261,7 +11316,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         /* 过滤输入框外圈 1px：让输入框与右侧两个开关在视觉上成组 */
         if (g_editFilter && g_rcFilterFrame.right > g_rcFilterFrame.left) {
-            HBRUSH fb = CreateSolidBrush(g_darkMode ? RGB(86, 86, 96) : RGB(160, 160, 166));
+            HBRUSH fb = CreateSolidBrush(ThBtnBorder());
             RECT fr = g_rcFilterFrame;
             FrameRect(hdc, &fr, fb);
             DeleteObject(fb);
@@ -11787,12 +11842,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         /* 优先级：批量队列蓝 > 上次听到橙 > 已缓存黄 */
                         cd->clrText = queued
                             ? ThBlue()
-                            : lastmark
-                            ? (g_darkMode ? RGB(235, 165, 80) : RGB(184, 106, 0))
+                            : lastmark ? ThLastListen()
                             : cached ? ThYellow()
-                            : (sel ? (g_darkMode ? RGB(236, 242, 250)
-                                                 : RGB(0, 30, 80))
-                                   : ThText());
+                            : (sel ? ThSelText() : ThText());
                     }
                     return CDRF_NEWFONT;
                 }
@@ -12557,7 +12609,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.hInstance = hInst;
     wc.lpszClassName = FLY_CLASS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(RGB(45, 45, 52));   /* 暗底与按钮一致 */
+    wc.hbrBackground = CreateSolidBrush(ThFlyBg());   /* 暗底与按钮一致 */
     RegisterClassExW(&wc);
 
     /* 注册简介折叠按钮窗口类 */
