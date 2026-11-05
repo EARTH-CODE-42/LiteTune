@@ -1400,29 +1400,12 @@ static int DrawSliderTrack(LPNMCUSTOMDRAW cd)
     return 1;
 }
 
-/* 在按钮矩形内画一个方向三角形：dir 0=上 1=下 2=左 3=右 */
-static void DrawScrollArrow(HDC hdc, const RECT *r, int dir, COLORREF col)
-{
-    int cx = (r->left + r->right) / 2, cy = (r->top + r->bottom) / 2;
-    POINT tri[3];
-    HBRUSH b = CreateSolidBrush(col);
-    HGDIOBJ ob = SelectObject(hdc, b);
-    HPEN p = CreatePen(PS_SOLID, 1, col);
-    HGDIOBJ op = SelectObject(hdc, p);
-    switch (dir) {
-    case 0: tri[0].x=cx-3; tri[0].y=cy+2; tri[1].x=cx+3; tri[1].y=cy+2;
-            tri[2].x=cx;   tri[2].y=cy-3; break;           /* ▲ */
-    case 1: tri[0].x=cx-3; tri[0].y=cy-2; tri[1].x=cx+3; tri[1].y=cy-2;
-            tri[2].x=cx;   tri[2].y=cy+3; break;           /* ▼ */
-    case 2: tri[0].x=cx+2; tri[0].y=cy-3; tri[1].x=cx+2; tri[1].y=cy+3;
-            tri[2].x=cx-3; tri[2].y=cy; break;             /* ◀ */
-    default:tri[0].x=cx-2; tri[0].y=cy-3; tri[1].x=cx-2; tri[1].y=cy+3;
-            tri[2].x=cx+3; tri[2].y=cy; break;             /* ▶ */
-    }
-    Polygon(hdc, tri, 3);
-    SelectObject(hdc, ob); SelectObject(hdc, op);
-    DeleteObject(b); DeleteObject(p);
-}
+/* DrawGlyph 统一图标绘制前置声明（完整定义见后文统一枚举处） */
+#define DIR_UP_IC    26
+#define DIR_DOWN_IC  27
+#define DIR_LEFT_IC  28
+#define DIR_RIGHT_IC 29
+static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill, int param);
 
 /* ================= 自绘滚动条控件 ================= */
 /* 真正的子窗口，不是事后覆盖。直接画暗色，永不闪白。 */
@@ -1620,15 +1603,15 @@ static void DSB_Draw(HWND hwnd, DarkScrollBar *dsb)
     if (horiz) {
         btn.top = 0; btn.bottom = rc.bottom;
         btn.left = 0; btn.right = DSB_W;
-        DrawScrollArrow(hdc, &btn, 2, ThSbArrow());
+        DrawGlyph(hdc, &btn, DIR_LEFT_IC, ThSbArrow(), 0, 0);
         btn.left = rc.right - DSB_W; btn.right = rc.right;
-        DrawScrollArrow(hdc, &btn, 3, ThSbArrow());
+        DrawGlyph(hdc, &btn, DIR_RIGHT_IC, ThSbArrow(), 0, 0);
     } else {
         btn.left = 0; btn.right = rc.right;
         btn.top = 0; btn.bottom = DSB_W;
-        DrawScrollArrow(hdc, &btn, 0, ThSbArrow());
+        DrawGlyph(hdc, &btn, DIR_UP_IC, ThSbArrow(), 0, 0);
         btn.top = rc.bottom - DSB_W; btn.bottom = rc.bottom;
-        DrawScrollArrow(hdc, &btn, 1, ThSbArrow());
+        DrawGlyph(hdc, &btn, DIR_DOWN_IC, ThSbArrow(), 0, 0);
     }
 
     /* 把手（内容不满一屏时只画空轨道） */
@@ -8665,22 +8648,34 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-/* ================= 方形图标按钮（owner-draw） ================= */
+/* ================= 统一图标枚举 ================= */
+/* 坐标系分三组，DrawIcon 内部按 kind 值域自动选：
+ *  [0..16]  ICO_*     → 16×16 等比缩放（DrawGlyphC 系）
+ *  [17..21] TB_*      → 固定 16×16 左上角原点（任务栏缩略图）
+ *  [22..25] CAP_*_IC  → rc 中心偏移（标题栏按钮）
+ *  [26..29] DIR_*_IC  → rc 中心偏移（滚动条箭头）
+ */
 enum {
     ICO_PREV, ICO_PLAY, ICO_PAUSE, ICO_NEXT, ICO_STOP,
     ICO_MUTE, ICO_MUTED, ICO_PLUS, ICO_CROSS, ICO_SORT,
     ICO_ORDER, ICO_SHUFFLE, ICO_REPEATONE, ICO_PLAYONCE, ICO_GEAR,
-    ICO_DOWNLOAD, ICO_PHONE
+    ICO_DOWNLOAD, ICO_PHONE,                         /* 0..16 */
+
+    TB_PREV, TB_PLAY, TB_PAUSE, TB_NEXT, TB_SHUFFLE, /* 17..21 */
+
+    CAP_MIN_IC, CAP_TRAY_IC, CAP_MAX_IC, CAP_CLOSE_IC  /* 22..25 */
+    /* DIR_*_IC 已在前置 #define 里定义（26..29） */
 };
 
-/* 在按钮矩形内绘制单个矢量图标 */
-static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill)
+/* 统一图标绘制入口（ICO_*, TB_*, CAP_*_IC, DIR_*_IC）。
+ * param 仅 CAP_MAX_IC 时传 IsZoomed(hwnd)，其余 kind 忽略。 */
+static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill, int param)
 {
     int w = rc->right - rc->left, h = rc->bottom - rc->top;
-    int s = (w < h ? w : h) - 8;                 /* 24px 按钮 → 16px 图标 */
+    int cx = rc->left + w / 2, cy = rc->top + h / 2; /* 中心偏移系 */
+    int s = (w < h ? w : h) - 8;                      /* 等比缩放系 盒尺寸 */
     int x0 = rc->left + (w - s) / 2;
     int y0 = rc->top + (h - s) / 2;
-    int cy = y0 + s / 2;
     HPEN pen2 = CreatePen(PS_SOLID, 2, col);
     HPEN pen3 = CreatePen(PS_SOLID, 3, col);
     HPEN pen1 = CreatePen(PS_SOLID, 1, col);
@@ -8895,6 +8890,91 @@ static void DrawGlyphC(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill
         Ellipse(hdc, mid - 1, b - 5, mid + 1, b - 3);
         break;
     }
+
+    /* -------- TB_* : 固定 16×16 左上角原点（任务栏缩略图） -------- */
+    case TB_PLAY: {
+        POINT t[3] = { {rc->left+3,rc->top+2},{rc->left+3,rc->top+14},{rc->left+13,rc->top+8} };
+        Polygon(hdc, t, 3); break;
+    }
+    case TB_PAUSE:
+        Rectangle(hdc, rc->left+3, rc->top+2, rc->left+7, rc->top+14);
+        Rectangle(hdc, rc->left+9, rc->top+2, rc->left+13, rc->top+14);
+        break;
+    case TB_PREV: {
+        POINT t[3] = { {rc->left+12,rc->top+2},{rc->left+4,rc->top+8},{rc->left+12,rc->top+14} };
+        Rectangle(hdc, rc->left+1, rc->top+3, rc->left+4, rc->top+13);
+        Polygon(hdc, t, 3); break;
+    }
+    case TB_NEXT: {
+        POINT t[3] = { {rc->left+4,rc->top+2},{rc->left+12,rc->top+8},{rc->left+4,rc->top+14} };
+        Polygon(hdc, t, 3);
+        Rectangle(hdc, rc->left+12, rc->top+3, rc->left+15, rc->top+13); break;
+    }
+    case TB_SHUFFLE: {
+        POINT ah[3] = { {rc->left+11,rc->top+9},{rc->left+11,rc->top+15},{rc->left+15,rc->top+12} };
+        SelectObject(hdc, pen2);
+        MoveToEx(hdc, rc->left+2, rc->top+4, NULL);
+        LineTo(hdc, rc->left+7, rc->top+4); LineTo(hdc, rc->left+12, rc->top+12);
+        MoveToEx(hdc, rc->left+2, rc->top+12, NULL);
+        LineTo(hdc, rc->left+7, rc->top+12); LineTo(hdc, rc->left+12, rc->top+4);
+        MoveToEx(hdc, rc->left+9, rc->top+12, NULL); LineTo(hdc, rc->left+14, rc->top+12);
+        SelectObject(hdc, br);
+        Polygon(hdc, ah, 3); break;
+    }
+
+    /* -------- CAP_*_IC : rc 中心偏移（标题栏按钮） -------- */
+    case CAP_MIN_IC:
+        SelectObject(hdc, pen1);
+        MoveToEx(hdc, cx - 5, cy + 4, NULL); LineTo(hdc, cx + 6, cy + 4);
+        break;
+    case CAP_TRAY_IC:
+        SelectObject(hdc, pen1);
+        MoveToEx(hdc, cx, cy - 8, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx - 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx + 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
+        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 5);
+        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx - 6, cy + 2);
+        MoveToEx(hdc, cx + 7, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 2);
+        break;
+    case CAP_MAX_IC:
+        SelectObject(hdc, pen1);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        if (param) {
+            Rectangle(hdc, cx - 7, cy - 6, cx + 1, cy + 1);
+            Rectangle(hdc, cx - 3, cy - 2, cx + 5, cy + 6);
+        } else {
+            Rectangle(hdc, cx - 5, cy - 5, cx + 6, cy + 5);
+        }
+        SelectObject(hdc, br);
+        break;
+    case CAP_CLOSE_IC: {
+        int i;
+        SelectObject(hdc, pen1);
+        for (i = 0; i <= 10; i++) {
+            SetPixel(hdc, cx - 5 + i, cy - 5 + i, col);
+            SetPixel(hdc, cx + 5 - i, cy - 5 + i, col);
+        }
+        break;
+    }
+
+    /* -------- DIR_*_IC : rc 中心偏移（滚动条箭头） -------- */
+    case DIR_UP_IC: {
+        POINT tri[3] = { {cx-3,cy+2},{cx+3,cy+2},{cx,cy-3} };
+        Polygon(hdc, tri, 3); break;
+    }
+    case DIR_DOWN_IC: {
+        POINT tri[3] = { {cx-3,cy-2},{cx+3,cy-2},{cx,cy+3} };
+        Polygon(hdc, tri, 3); break;
+    }
+    case DIR_LEFT_IC: {
+        POINT tri[3] = { {cx+2,cy-3},{cx+2,cy+3},{cx-3,cy} };
+        Polygon(hdc, tri, 3); break;
+    }
+    case DIR_RIGHT_IC: {
+        POINT tri[3] = { {cx-2,cy-3},{cx-2,cy+3},{cx+3,cy} };
+        Polygon(hdc, tri, 3); break;
+    }
+
     }
 
     SelectObject(hdc, op);
@@ -8916,7 +8996,7 @@ static void DrawIconButton(DRAWITEMSTRUCT *di, int kind, int on)
         DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
     else
         DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
-    DrawGlyphC(di->hDC, &rc, kind, on ? ThAccent() : ThDim(), on);
+    DrawGlyph(di->hDC, &rc, kind, on ? ThAccent() : ThDim(), on, 0);
 }
 
 /* 控件 ID → 图标种类；*on 返回是否按下态，不认识返回 -1 */
@@ -9943,8 +10023,8 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                  : (i == 1) ? ((g_playState == 1) ? ICO_PAUSE : ICO_PLAY)
                  : (i == 2) ? ICO_NEXT
                  : (i == 3) ? ICO_SHUFFLE : ICO_CROSS;
-            DrawGlyphC(hdc, &br, kind,
-                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255), 0);
+            DrawGlyph(hdc, &br, kind,
+                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255), 0, 0);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -10072,56 +10152,6 @@ static int TaskbarIsLight(void)
     return 0;   /* 读不到（如 Win7）按深色处理 */
 }
 
-/* 在 16x16 画布上画满幅的简洁线性图标（图形区约 14x14），颜色随任务栏主题 */
-static void DrawTbGlyph(HDC hdc, int kind)
-{
-    COLORREF col = TaskbarIsLight() ? RGB(28, 28, 28) : RGB(255, 255, 255);
-    HBRUSH wh = CreateSolidBrush(col);
-    HPEN p2 = CreatePen(PS_SOLID, 2, col);
-    HGDIOBJ ob = SelectObject(hdc, wh);
-    HGDIOBJ op = SelectObject(hdc, p2);
-
-    switch (kind) {
-    case ICO_PLAY: {
-        POINT t[3] = { {3,2},{3,14},{13,8} };
-        Polygon(hdc, t, 3);
-        break;
-    }
-    case ICO_PAUSE:
-        Rectangle(hdc, 3, 2, 7, 14);
-        Rectangle(hdc, 9, 2, 13, 14);
-        break;
-    case ICO_PREV: {
-        POINT t[3] = { {12,2},{4,8},{12,14} };
-        Rectangle(hdc, 1, 3, 4, 13);
-        Polygon(hdc, t, 3);
-        break;
-    }
-    case ICO_NEXT: {
-        POINT t[3] = { {4,2},{12,8},{4,14} };
-        Polygon(hdc, t, 3);
-        Rectangle(hdc, 12, 3, 15, 13);
-        break;
-    }
-    case ICO_SHUFFLE: {
-        /* 两条交叉折线 + 右向箭头 */
-        POINT ah[3] = { {11,9},{11,15},{15,12} };
-        MoveToEx(hdc, 2, 4, NULL);
-        LineTo(hdc, 7, 4); LineTo(hdc, 12, 12);
-        MoveToEx(hdc, 2, 12, NULL);
-        LineTo(hdc, 7, 12); LineTo(hdc, 12, 4);
-        MoveToEx(hdc, 9, 12, NULL); LineTo(hdc, 14, 12);
-        SelectObject(hdc, wh);
-        Polygon(hdc, ah, 3);
-        break;
-    }
-    }
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(wh);
-    DeleteObject(p2);
-}
-
 /* 创建 16x16 真彩带 alpha 的图标：背景全透明，图形不透明白色。
  * GDI 不写 alpha 通道，画完后扫描像素，把有色像素的 A 补成 255。 */
 static HICON CreateTbIcon(int kind)
@@ -10145,7 +10175,10 @@ static HICON CreateTbIcon(int kind)
     cb = CreateDIBSection(sc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
     cdc = CreateCompatibleDC(sc);
     ob1 = (HBITMAP)SelectObject(cdc, cb);
-    DrawTbGlyph(cdc, kind);
+    {
+        COLORREF col = TaskbarIsLight() ? RGB(28,28,28) : RGB(255,255,255);
+        DrawGlyph(cdc, &rc, kind, col, 0, 0);
+    }
     /* 补 alpha：BGRA 中任一通道非 0 即图形像素 */
     for (i = 0; i < 16 * 16; i++) {
         if (bits[i*4] | bits[i*4+1] | bits[i*4+2])
@@ -10188,11 +10221,11 @@ static void InitThumbbar(void)
     hr = g_taskbar->lpVtbl->HrInit(g_taskbar);
     if (FAILED(hr)) { g_taskbar->lpVtbl->Release(g_taskbar); g_taskbar = NULL; return; }
 
-    g_tbIco[0] = CreateTbIcon(ICO_PREV);
-    g_tbIco[1] = CreateTbIcon(ICO_PLAY);
-    g_tbIco[2] = CreateTbIcon(ICO_PAUSE);
-    g_tbIco[3] = CreateTbIcon(ICO_NEXT);
-    g_tbIco[4] = CreateTbIcon(ICO_SHUFFLE);
+    g_tbIco[0] = CreateTbIcon(TB_PREV);
+    g_tbIco[1] = CreateTbIcon(TB_PLAY);
+    g_tbIco[2] = CreateTbIcon(TB_PAUSE);
+    g_tbIco[3] = CreateTbIcon(TB_NEXT);
+    g_tbIco[4] = CreateTbIcon(TB_SHUFFLE);
 
     ZeroMemory(tb, sizeof(tb));
     tb[0].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS;
@@ -10404,44 +10437,6 @@ static int CaptionButtonAt(HWND hwnd, POINT sp)
     return -1;
 }
 
-/* 按钮图形：全部线条自绘，不依赖字体/图标资源 */
-static void CapGlyph(HDC hdc, int idx, const RECT *rc, int zoomed, COLORREF clr)
-{
-    int cx = (rc->left + rc->right) / 2;
-    int cy = (rc->top + rc->bottom) / 2;
-    switch (idx) {
-    case CAP_MIN:
-        MoveToEx(hdc, cx - 5, cy + 4, NULL);
-        LineTo(hdc, cx + 6, cy + 4);
-        break;
-    case CAP_TRAY:  /* 向下箭头落入托盘 */
-        MoveToEx(hdc, cx, cy - 8, NULL); LineTo(hdc, cx, cy - 1);
-        MoveToEx(hdc, cx - 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
-        MoveToEx(hdc, cx + 4, cy - 4, NULL); LineTo(hdc, cx, cy - 1);
-        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 5);
-        MoveToEx(hdc, cx - 6, cy + 5, NULL); LineTo(hdc, cx - 6, cy + 2);
-        MoveToEx(hdc, cx + 7, cy + 5, NULL); LineTo(hdc, cx + 7, cy + 2);
-        break;
-    case CAP_MAX:
-        if (zoomed) {   /* 还原：两个错开的方框 */
-            Rectangle(hdc, cx - 7, cy - 6, cx + 1, cy + 1);
-            Rectangle(hdc, cx - 3, cy - 2, cx + 5, cy + 6);
-        } else {
-            Rectangle(hdc, cx - 5, cy - 5, cx + 6, cy + 5);
-        }
-        break;
-    case CAP_CLOSE: {
-        int i;
-        /* 两条对角逐像素镜像，避免 LineTo 不画终点造成上下不对称 */
-        for (i = 0; i <= 10; i++) {
-            SetPixel(hdc, cx - 5 + i, cy - 5 + i, clr);
-            SetPixel(hdc, cx + 5 - i, cy - 5 + i, clr);
-        }
-        break;
-    }
-    }
-}
-
 /* 标题栏按钮文案（悬停 tooltip 用） */
 static const wchar_t *CapTipText(int idx)
 {
@@ -10555,14 +10550,11 @@ static void PaintCaption(HWND hwnd)
         }
     }
 
-    /* 四个按钮 */
+    /* 四个按钮（DrawGlyph 自管理 GDI，这里只处理悬停填色） */
     {
-        HPEN pen = CreatePen(PS_SOLID, 1, cTxt);
-        HGDIOBJ op = SelectObject(hdc, pen);
-        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         for (i = 0; i < CAP_BTN_N; i++) {
             RECT br;
-            HPEN upen = pen;
+            COLORREF curCol;
             br.left = band.right - CAP_BTN_W * (CAP_BTN_N - i);
             br.right = br.left + CAP_BTN_W;
             br.top = band.top;
@@ -10572,21 +10564,10 @@ static void PaintCaption(HWND hwnd)
                 HBRUSH hh = CreateSolidBrush(hl);
                 FillRect(hdc, &br, hh);
                 DeleteObject(hh);
-                if (i == CAP_CLOSE) {   /* 关闭按钮悬停：白叉 */
-                    upen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-                    SelectObject(hdc, upen);
-                }
             }
-            CapGlyph(hdc, i, &br, IsZoomed(hwnd),
-                     (g_capHover == CAP_CLOSE) ? RGB(255, 255, 255) : cTxt);
-            if (upen != pen) {
-                SelectObject(hdc, pen);
-                DeleteObject(upen);
-            }
+            curCol = (g_capHover == CAP_CLOSE) ? RGB(255,255,255) : cTxt;
+            DrawGlyph(hdc, &br, CAP_MIN_IC + i, curCol, 0, IsZoomed(hwnd));
         }
-        SelectObject(hdc, ob);
-        SelectObject(hdc, op);
-        DeleteObject(pen);
     }
     ReleaseDC(hwnd, hdc);
 }
