@@ -701,6 +701,7 @@ static void ExeDir(wchar_t *out, int outMax)
 
 /* ================= 小工具 ================= */
 static void ApplyLayout(HWND hwnd, int live);   /* 前置声明，字号切换后要重排 */
+static void FitListViewHeader(HWND lv);         /* 前置声明，表头宽度对齐 ListView */
 static void UpdateMarquee(void);                /* 前置声明，字号切换后要重测文本宽 */
 static void UpdatePodTipFromPoint(POINT pt);    /* 前置声明，播客列表悬停提示 */
 static char* WToU8(const wchar_t *w);           /* 前置声明，SaveConfig 保存缓存目录 */
@@ -1133,7 +1134,28 @@ static void ApplyHeaderTheme(void)
 static WNDPROC g_origHdrProc = NULL;
 static LRESULT CALLBACK HeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* 表头擦背景用主题色：默认类背景是浅色，滚动/拖动时右边会闪出浅色块 */
+    if (g_darkMode && msg == WM_ERASEBKGND) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRectColor((HDC)wp, &rc, ThHeaderBg());
+        return 1;
+    }
     LRESULT lr = CallWindowProcW(g_origHdrProc, hwnd, msg, wp, lp);
+    /* ListView 每次重算滚动条都会把表头缩窄 17px，右边露出一条 ListView 底色。
+     * 在表头自己的 WM_SIZE 里拉回等宽，避免在滚动路径里反复 SetWindowPos */
+    if (msg == WM_SIZE) {
+        static int busy = 0;
+        HWND par = GetParent(hwnd);
+        RECT hr, wr;
+        if (par && !busy && GetWindowRect(hwnd, &hr) && GetWindowRect(par, &wr)
+            && hr.right - hr.left != wr.right - wr.left) {
+            busy = 1;
+            SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, hr.bottom - hr.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            busy = 0;
+        }
+    }
     if (g_darkMode && msg == WM_PAINT) {
         HDC hdc = GetDC(hwnd);
         RECT rc, last;
@@ -6445,6 +6467,7 @@ static void FillEpisodeList(void)
         SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&lvi);
     }
     SendMessageW(g_listEp, WM_SETREDRAW, TRUE, 0);
+    FitListViewHeader(g_listEp);   /* 条目变化会改原生滚动条状态，表头随之被压窄 */
     InvalidateRect(g_listEp, NULL, TRUE);
 }
 
@@ -8352,7 +8375,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
         if (hwnd == g_listPod)       SyncScrollBar(g_vsPod);
-        else if (hwnd == g_listEp) { SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp); }
+        else if (hwnd == g_listEp) { SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp);
+                                     /* 只在尺寸变化时对齐表头，滚动分支里绝不 SetWindowPos */
+                                     if (msg == WM_SIZE) FitListViewHeader(hwnd); }
         else if (hwnd == g_ibList) { if (g_ibSb) SyncScrollBar(g_ibSb);
                                      if (g_ibSbH) SyncScrollBar(g_ibSbH); }
         else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
@@ -8411,6 +8436,20 @@ static int SplitterHitTest(HWND hwnd, int x, int y)
     if (abs(x - s1) <= 4) return 0;
     if (!g_descHidden && abs(x - s2) <= 4) return 1;   /* 简介隐藏时没有第二条分隔 */
     return -1;
+}
+
+/* 表头宽度对齐 ListView 窗口宽：PanelProc 的 WM_NCCALCSIZE 把行绘制区
+ * 并回了原生滚动条占位，但表头仍按“减去滚动条”的宽度布局，右边会空出一条 */
+static void FitListViewHeader(HWND lv)
+{
+    HWND hdr = (HWND)SendMessageW(lv, LVM_GETHEADER, 0, 0);
+    RECT hr, wr;
+    if (!hdr) return;
+    GetWindowRect(hdr, &hr);
+    GetWindowRect(lv, &wr);
+    if (hr.right - hr.left == wr.right - wr.left) return;   /* 宽度没变就不折腾 */
+    SetWindowPos(hdr, NULL, 0, 0, wr.right - wr.left, hr.bottom - hr.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 /* 冻结重绘的整体布局，拖动/缩放共用 */
@@ -8507,6 +8546,7 @@ static void LayoutControls(HWND hwnd)
         g_rcPanel[1].left = x;           g_rcPanel[1].top = by + 28;
         g_rcPanel[1].right = x + w2;     g_rcPanel[1].bottom = by + bh;
         MoveWindow(g_listEp, x + 2, by + 30, w2 - sbw - 4, bh - sbh - 32, TRUE);
+        FitListViewHeader(g_listEp);
         if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 30, sbw, bh - sbh - 32, TRUE);
         if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
         x += w2 + GAP_W;
