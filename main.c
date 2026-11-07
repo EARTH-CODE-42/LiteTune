@@ -8870,8 +8870,9 @@ static LRESULT CALLBACK LocBtnProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         FillRect(dc, &rc, fill);   /* 类背景为 NULL，先铺满圆域避免露列表残影 */
         op = (HPEN)SelectObject(dc, ring);
         ob = (HBRUSH)SelectObject(dc, fill);
-        /* 内缩 1px：描边完全落在 SetWindowRgn 圆域内，右下弧线不再被裁 */
-        Ellipse(dc, 1, 1, rc.right - 1, rc.bottom - 1);
+        /* 内缩 2px：CreateEllipticRgn 在右/下与斜角处比 GDI 椭圆路径更靠内，
+         * 只缩 1px 仍会有 8 个环像素被裁（右下弧线缺口），缩 2px 才完整 */
+        Ellipse(dc, 2, 2, rc.right - 2, rc.bottom - 2);
         SelectObject(dc, GetStockObject(NULL_PEN));
         SelectObject(dc, dot);
         if (g_locDirUp) {
