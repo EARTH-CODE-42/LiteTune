@@ -2,10 +2,10 @@
 
 English | [简体中文](README.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 292 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 296 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![version](https://img.shields.io/badge/Version-1.5.0-blue)
-![size](https://img.shields.io/badge/Size-292%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.6.0-blue)
+![size](https://img.shields.io/badge/Size-296%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -38,7 +38,7 @@ English | [简体中文](README.md)
 ## Features
 
 - RSS podcast subscription management (add / delete / reorder / refresh), single-instance
-- **Context menus**: right-click a podcast to refresh / delete / clear its cache; right-click the Cached row to clear all cache or open the folder; right-click an episode to download or delete its cache (right-click also selects the row)
+- **Context menus**: right-click a podcast to refresh / delete / clear its cache; right-click the Cached row to clear all cache or open the folder; right-click an episode to play / download / delete its cache / open its location (right-click also selects the row); with a multi-selection the menu also offers "Delete cache of N selected", wiping the audio of every selected episode at once
 - Episode list (title, date, duration; sortable by column headers); the cached view adds a sortable Podcast column
 - **Collapsible description pane**: a slim floating handle appears at the middle of the pane's left edge only on hover — click it to hide the description on the right and let the episode list fill the space; once hidden, the handle moves to the episode list's right edge (its arrow flips to `‹`) to bring it back. The collapsed state is remembered in the config, with matching handles in both light and dark themes
 - Online playback and local caching: audio auto-downloads to the cache folder, listen offline without network
@@ -53,12 +53,14 @@ English | [简体中文](README.md)
 - Resume memory: remembers the episode and position on exit, resumes automatically next launch; if it was paused at exit, it reopens paused at the saved position (nothing is written after a manual stop)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
 - **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
+- **Download first, switch later**: double-clicking an uncached episode downloads it in the background while the current episode keeps playing, and only then does playback switch over (audio finished during a cache-folder change still lands in the new folder)
 - Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
 - **Podcast search**: type a keyword (plain text, no `://`) in the "Add Subscription" box and press Enter or hit OK — results from iTunes appear below. A single click fills the RSS URL back into the edit box (press Enter again to add); a double-click adds it immediately
 - Playback controls: previous / play-pause / next / stop / mute / volume
 - Play modes: sequential / shuffle / repeat one / play once (stop after this episode)
 - Playback speed: 0.5x–3.0x (quick presets 0.75 / 1 / 1.25 / 1.5 / 2)
-- Seekable progress bar; green while playing, yellow when cached, orange for "last heard"
+- Seekable progress bar; green while playing, yellow when cached, orange for "last heard" (green stays while paused)
+- **"Locate playing" button**: when the green row scrolls out of view and the mouse is over the episode pane, a small round button appears at the bottom-right (its arrow points toward the row); click it to scroll that row into the middle of the list
 - **Phone playback / remote**: enable in the Settings menu, open the LAN page in your phone browser — playback controls, seekable progress bar, volume, episode picker, play mode & speed, sleep timer; lock-screen media controls supported
 - System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev / play-pause / next / shuffle), double-click restores the main window
 - **Tray balloon notice**: while the window sits in the tray, a refresh that finds new episodes shows the total in a balloon tip (silent when the window is visible)
@@ -69,7 +71,7 @@ English | [简体中文](README.md)
 - Sleep timer (presets 15–120 min or custom 1–600 min, countdown in the title bar; force shutdown at the end, Windows gives a 15-second cancel window)
 - Auto-clean old cache at startup: 30 days by default, adjustable in the settings menu (Off / 7 / 30 / 90 days; only files generated by the app itself are removed, so custom folders are equally safe)
 - Three UI font sizes (Ctrl + mouse wheel)
-- Custom cache folder (open / change / move existing cache)
+- Custom cache folder (open / change / move existing cache); the switch is refused when the target folder holds same-named files so your data is never overwritten, and audio finished during a switch lands in the new folder
 - **Dual-mode config storage**: embed it in the exe (single-file portable — copying the exe takes it along) or keep it as an external `feeds.ini` next to the exe (easy upgrades / backups / manual editing); chosen on first run, switchable anytime in the Settings menu (see "Config storage")
 - Taskbar thumbnail toolbar: previous / play-pause / next / shuffle-next (icons adapt to the light / dark system taskbar theme)
 - Tooltips: button hints, full episode text, podcast cover (enlarged) + title + author
