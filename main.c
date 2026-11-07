@@ -452,6 +452,7 @@ enum {
     TR_CAP_MIN, TR_CAP_TRAY, TR_CAP_MAX, TR_CAP_RESTORE, TR_CAP_CLOSE,
     TR_TIP_PHONE, TR_CTX_REVEAL,
     TR_CTX_FAV_N_FMT, TR_CTX_UNFAV_N_FMT, TR_CTX_DL_N_FMT,
+    TR_CTX_DELCACHE_N_FMT, TR_DELCACHE_DONE_FMT,
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_TB_EXIT, TR_M_REFRESH_NOW,
     TR_N
@@ -566,6 +567,7 @@ static const wchar_t *tr(int id)
         L"最小化到任务栏", L"最小化到托盘", L"最大化", L"向下还原", L"关闭",
         L"手机播放/遥控", L"打开文件位置",
         L"收藏选中的 %d 集", L"取消收藏选中的 %d 集", L"下载选中的 %d 集",
+        L"删除选中的 %d 集缓存", L"已删除 %d 集缓存",
         L"已收藏 %d 集", L"已取消收藏 %d 集",
         L"退出", L"立即刷新全部订阅"
     };
@@ -695,6 +697,7 @@ static const wchar_t *tr(int id)
         L"Minimize", L"Minimize to tray", L"Maximize", L"Restore", L"Close",
         L"Phone play/remote", L"Show in folder",
         L"Favorite %d selected", L"Unfavorite %d selected", L"Download %d selected",
+        L"Delete cache of %d selected", L"Deleted cache of %d episode(s)",
         L"Favorited %d episode(s)", L"Unfavorited %d episode(s)",
         L"Exit", L"Refresh all feeds now"
     };
@@ -11660,10 +11663,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else if (cmd == 5) OpenCacheFolder();
             }
         } else if (src == g_listEp) {
-            /* 剧集列表右键：单选按行操作；多选提供批量收藏/取消收藏/批量下载 */
+            /* 剧集列表右键：单选按行操作；多选提供批量收藏/取消收藏/批量下载/批量删缓存 */
             LVHITTESTINFO hti;
             HMENU m;
-            int cmd, row, ep, cached = 0, selCount, nFav = 0, nUnfav = 0, nUncached = 0;
+            int cmd, row, ep, cached = 0, selCount, nFav = 0, nUnfav = 0,
+                nUncached = 0, nCached = 0;
             Episode *e = NULL;
             Podcast *vp = (g_curPod == g_podCount) ? &g_cachePod :
                 (g_curPod >= 0 && g_curPod < g_podCount ? &g_pods[g_curPod] : NULL);
@@ -11689,42 +11693,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (selCount > 1 && row >= 0 &&
                 (SendMessageW(g_listEp, LVM_GETITEMSTATE, row, LVIS_SELECTED) & LVIS_SELECTED)) {
                 /* 多选：按选中项里实际存在的类别给出批量项（收藏/取消收藏可同时出现） */
-                int r = -1;
+                int r = -1, added = 0;
                 while ((r = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                               (WPARAM)r, LVNI_SELECTED)) >= 0) {
                     int i = EpIdxOfRow(r);
                     if (i < 0 || i >= vp->epCount) continue;
                     if (fh && FavHas(fh, vp->eps[i].url)) nFav++;
                     else nUnfav++;
-                    if (!(vp->eps[i].localFile || EpisodeIsCached(&vp->eps[i]))) nUncached++;
+                    if (vp->eps[i].localFile || EpisodeIsCached(&vp->eps[i])) nCached++;
+                    else nUncached++;
                 }
                 if (!g_viewCached) {
                     wchar_t t[64];
                     if (nUnfav > 0) {
                         swprintf(t, 64, tr(TR_CTX_FAV_N_FMT), nUnfav);
-                        MenuAdd(m, 0, 7, t);
+                        MenuAdd(m, 0, 7, t); added = 1;
                     }
                     if (nFav > 0) {
                         swprintf(t, 64, tr(TR_CTX_UNFAV_N_FMT), nFav);
-                        MenuAdd(m, 0, 8, t);
+                        MenuAdd(m, 0, 8, t); added = 1;
                     }
+                    /* 下载和删除缓存同属"文件操作"组，放分隔线下面 */
                     if (nUncached > 0) {
+                        if (added) MenuAddSep(m);
                         swprintf(t, 64, tr(TR_CTX_DL_N_FMT), nUncached);
-                        MenuAdd(m, 0, 6, t);
+                        MenuAdd(m, 0, 6, t); added = 2;
                     }
-                    if (nFav || nUnfav || nUncached) MenuAddSep(m);
                 }
-                MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
+                /* 删除选中缓存：已缓存视图里同样可用（那里的条目全是本地文件） */
+                if (nCached > 0) {
+                    wchar_t t[64];
+                    if (added == 1) MenuAddSep(m);   /* 上面只有收藏组时才补分隔线 */
+                    swprintf(t, 64, tr(TR_CTX_DELCACHE_N_FMT), nCached);
+                    MenuAdd(m, 0, 10, t);
+                }
             } else {
+                /* 单选：播放 | 收藏/复制 | 删除/下载/定位 */
                 MenuAdd(m, 0, 9, tr(TR_TB_PLAY));
+                MenuAddSep(m);
+                if (vp && vp->feedUrl && !g_viewCached)
+                    MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
+                MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
                 MenuAddSep(m);
                 if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
                 else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
                 if (cached) MenuAdd(m, 0, 5, tr(TR_CTX_REVEAL));
-                MenuAddSep(m);
-                MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
-                if (vp && vp->feedUrl && !g_viewCached)
-                    MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
             }
             SetForegroundWindow(hwnd);
             {
@@ -11751,6 +11764,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else SetStatusTemp(tr(TR_CLIP_FAIL));
             }
             else if (cmd == 6) StartBatchCache();
+            else if (cmd == 10 && vp) {
+                /* 批量删除缓存：先快照选中行再逐集删，最后统一刷新一次 */
+                int list[256], n = 0, done = 0, r = -1, k;
+                wchar_t t[64];
+                while ((r = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                              (WPARAM)r, LVNI_SELECTED)) >= 0) {
+                    int i = EpIdxOfRow(r);
+                    if (i >= 0 && i < vp->epCount && vp->eps[i].url &&
+                        n < (int)(sizeof(list) / sizeof(list[0])))
+                        list[n++] = i;
+                }
+                for (k = 0; k < n; k++) {
+                    Episode *de = &vp->eps[list[k]];
+                    wchar_t path[MAX_PATH];
+                    if (g_playPod == g_curPod && g_playEp == list[k])
+                        PlayerStop();   /* 正在放的那集先停，否则文件被占用删不掉 */
+                    if (de->localFile) {
+                        if (DeleteFileW(de->url)) done++;
+                    } else {
+                        CachePathFor(de->url, path, MAX_PATH);
+                        if (DeleteFileW(path)) done++;
+                    }
+                }
+                RefreshCachedEntry();
+                if (g_viewCached) SelectPodcast(g_podCount);   /* 重建离线列表 */
+                else InvalidateRect(g_listEp, NULL, TRUE);
+                swprintf(t, 64, tr(TR_DELCACHE_DONE_FMT), done);
+                SetStatusTemp(t);
+            }
             else if ((cmd == 7 || cmd == 8) && fh && vp) {
                 /* 批量收藏/取消收藏：先快照选中行，再逐项写入收藏表 */
                 int list[256], n = 0, k, done = 0, r = -1;
