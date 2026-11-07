@@ -6760,9 +6760,17 @@ static void RequestPlayEpisode(int pod, int ep)
     if (pod < 0 || pod >= g_podCount || ep < 0 || ep >= g_pods[pod].epCount) return;
     e = &g_pods[pod].eps[ep];
 
-    /* 改主意了：立即中止旧下载、停止当前播放，转入新任务 */
+    /* 改主意了：立即中止旧下载，转入新任务。
+     * 目标已缓存 → 立即停旧播新；
+     * 未缓存 → 不打断当前播放，下载完成后 EP_READY 里
+     * PlayerPlayFile 创建新播放器时会自动接替旧音频 */
     if (g_downloading) AbortDownloadConnection();
-    PlayerStop();
+    {
+        wchar_t cache[MAX_PATH];
+        CachePathFor(e->url, cache, MAX_PATH);
+        if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES)
+            PlayerStop();
+    }
     g_playPod = pod;
     g_playEp  = ep;
     free(g_playUrl);
