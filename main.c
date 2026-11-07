@@ -204,6 +204,11 @@ static int      g_descHidden;      /* 1=简介区隐藏，剧集占满右侧 */
 static int      g_descTabShown;    /* 小按钮当前是否已显示（避免反复 ShowWindow） */
 static RECT     g_rcDescTab;       /* 小按钮矩形（LayoutControls 写入） */
 
+/* “定位正在播放”小按钮（剧集面板右下角，绿行不可见+鼠标在剧集区时出现） */
+static HWND     g_btnLocate;
+static int      g_locBtnShown;
+static int      g_locDirUp;        /* 1=绿行在视口上方（画▲），0=下方（画▼） */
+
 /* 倍速：整数存 100 倍，避免浮点；默认 100=1.0x */
 static int      g_speed = 100;
 /* 托盘图标已创建标志 */
@@ -716,6 +721,7 @@ static void ExeDir(wchar_t *out, int outMax)
 /* ================= 小工具 ================= */
 static void ApplyLayout(HWND hwnd, int live);   /* 前置声明，字号切换后要重排 */
 static void FitListViewHeader(HWND lv);         /* 前置声明，表头宽度对齐 ListView */
+static void PositionLocateButton(void);         /* 前置声明，定位按钮跟随剧集列表 */
 static void UpdateMarquee(void);                /* 前置声明，字号切换后要重测文本宽 */
 static void UpdatePodTipFromPoint(POINT pt);    /* 前置声明，播客列表悬停提示 */
 static char* WToU8(const wchar_t *w);           /* 前置声明，SaveConfig 保存缓存目录 */
@@ -1447,6 +1453,7 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill,
 /* 真正的子窗口，不是事后覆盖。直接画暗色，永不闪白。 */
 #define DSB_CLASS L"LiteTuneScrollBar"
 #define DESC_TAB_CLASS L"LiteTuneDescTab"
+#define LOC_BTN_CLASS L"LiteTuneLocBtn"   /* 剧集列表右下角“定位正在播放”按钮 */
 /* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
 #define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
 
@@ -1656,10 +1663,11 @@ static void DSB_Draw(HWND hwnd, DarkScrollBar *dsb)
         thumb = CreateSolidBrush(ThSbThumb());
         ob = SelectObject(hdc, thumb);
         op = SelectObject(hdc, GetStockObject(NULL_PEN));
+        /* RoundRect 填充只到 right/bottom-1：右/下各让 1px，滑块中心才与两端箭头对齐 */
         if (horiz)
-            RoundRect(hdc, t0, 2, t0 + dsb->thumbLen, rc.bottom - 2, 4, 4);
+            RoundRect(hdc, t0, 3, t0 + dsb->thumbLen, rc.bottom - 1, 4, 4);
         else
-            RoundRect(hdc, 2, t0, rc.right - 2, t0 + dsb->thumbLen, 4, 4);
+            RoundRect(hdc, 3, t0, rc.right - 1, t0 + dsb->thumbLen, 4, 4);
         SelectObject(hdc, op);
         SelectObject(hdc, ob);
         DeleteObject(thumb);
@@ -8606,6 +8614,7 @@ static void LayoutControls(HWND hwnd)
         FitListViewHeader(g_listEp);
         if (g_vsEp) MoveWindow(g_vsEp, x + w2 - 2 - sbw, by + 30, sbw, bh - sbh - 32, TRUE);
         if (g_hsEp) MoveWindow(g_hsEp, x + 2, by + bh - 2 - sbh, w2 - sbw - 4, sbh, TRUE);
+        PositionLocateButton();
         x += w2 + GAP_W;
         if (g_descHidden) {
             SetRectEmpty(&g_rcPanel[2]);
@@ -8738,6 +8747,148 @@ static LRESULT CALLBACK DescTabProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 SetPixel(dc, vx + sx * i, cy + i, col);
             }
         }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* ================= “定位正在播放”按钮 ================= */
+
+/* 定位按钮跟随剧集列表：右下角内缩（列表宽度已让出滚条，这里只留 8px 边距） */
+static void PositionLocateButton(void)
+{
+    RECT rc;
+    if (!g_btnLocate || !g_listEp) return;
+    GetClientRect(g_listEp, &rc);
+    MoveWindow(g_btnLocate, rc.right - 36, rc.bottom - 36, 28, 28, TRUE);
+}
+
+/* 点击：把正在播放的绿行滚到视口中央（自定义滚动条随后同步） */
+static void LocatePlayingEpisode(void)
+{
+    int row, per, top, curTop, ih;
+    if (g_playPod < 0 || g_playEp < 0) return;
+    row = RowOfEpIdx(g_playEp);
+    if (row < 0) return;
+    per = (int)SendMessageW(g_listEp, LVM_GETCOUNTPERPAGE, 0, 0);
+    if (per < 1) per = 1;
+    top = row - per / 2;
+    if (top < 0) top = 0;
+    curTop = (int)SendMessageW(g_listEp, LVM_GETTOPINDEX, 0, 0);
+    if (top != curTop) {
+        ih = DSB_RowH(g_listEp);
+        SendMessageW(g_listEp, LVM_SCROLL, 0, (LPARAM)((top - curTop) * ih));
+        SyncScrollBar(g_vsEp);
+    }
+}
+
+/* 150ms 轮询显隐：正在播放的集属于当前视图、绿行不在可视区、
+ * 且鼠标在剧集面板内时才出现（鼠标不在时就没必要打扰） */
+static void UpdateLocateButton(void)
+{
+    int show = 0;
+    if (g_btnLocate && g_hwnd && !IsIconic(g_hwnd) &&
+        g_playPod >= 0 && g_playPod == g_curPod && g_playEp >= 0) {
+        int row = RowOfEpIdx(g_playEp);
+        if (row >= 0) {
+            RECT rc, ir;
+            HWND hdr = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
+            GetClientRect(g_listEp, &rc);
+            if (hdr) {   /* 表头占客户区顶部，绿行被表头压住也算不可见 */
+                RECT hr;
+                GetWindowRect(hdr, &hr);
+                rc.top += hr.bottom - hr.top;
+            }
+            /* 完整可见才算可见：上下边缘都要落在可视区里。
+             * 注意 LVM_GETITEMRECT 要求发送前把 left 设为 LVIR_BOUNDS */
+            SetRectEmpty(&ir);
+            ir.left = LVIR_BOUNDS;
+            if (SendMessageW(g_listEp, LVM_GETITEMRECT, row, (LPARAM)&ir) &&
+                (ir.top < rc.top || ir.bottom > rc.bottom)) {
+                POINT p;
+                int dirUp = (ir.top < rc.top);   /* 绿行在视口上方 */
+                if (dirUp != g_locDirUp) {
+                    g_locDirUp = dirUp;
+                    if (g_locBtnShown) InvalidateRect(g_btnLocate, NULL, TRUE);
+                }
+                if (GetCursorPos(&p)) {
+                    ScreenToClient(g_hwnd, &p);
+                    show = PtInRect(&g_rcPanel[1], p);
+                }
+            }
+        }
+    }
+    if (g_btnLocate && show != g_locBtnShown) {
+        g_locBtnShown = show;
+        ShowWindow(g_btnLocate, show ? SW_SHOWNA : SW_HIDE);
+        if (show) {
+            SetWindowPos(g_btnLocate, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            InvalidateRect(g_btnLocate, NULL, TRUE);
+        }
+    }
+}
+
+static LRESULT CALLBACK LocBtnProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    (void)wp;
+    switch (msg) {
+    case WM_CREATE:
+        /* 裁剪成圆形，四角不遮挡列表内容（SetWindowRgn 会接管 region 所有权） */
+        SetWindowRgn(h, CreateEllipticRgn(0, 0, 28, 28), TRUE);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            SetCursor(LoadCursorW(NULL, IDC_HAND));
+            return TRUE;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        LocatePlayingEpisode();
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        HBRUSH fill, dot;
+        HPEN ring, op;
+        HBRUSH ob;
+        POINT tri[3];
+        GetClientRect(h, &rc);
+        /* 圆币：面板底色填充 + 绿色描边；中间绿色三角指向绿行方位 */
+        fill = CreateSolidBrush(ThPanel());
+        ring = CreatePen(PS_SOLID, 1, ThGreen());
+        dot = CreateSolidBrush(ThGreen());
+        FillRect(dc, &rc, fill);   /* 类背景为 NULL，先铺满圆域避免露列表残影 */
+        op = (HPEN)SelectObject(dc, ring);
+        ob = (HBRUSH)SelectObject(dc, fill);
+        /* 内缩 1px：描边完全落在 SetWindowRgn 圆域内，右下弧线不再被裁 */
+        Ellipse(dc, 1, 1, rc.right - 1, rc.bottom - 1);
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        SelectObject(dc, dot);
+        if (g_locDirUp) {
+            tri[0].x = 9;  tri[0].y = 17;
+            tri[1].x = 19; tri[1].y = 17;
+            tri[2].x = 14; tri[2].y = 9;
+        } else {
+            tri[0].x = 9;  tri[0].y = 11;
+            tri[1].x = 19; tri[1].y = 11;
+            tri[2].x = 14; tri[2].y = 19;
+        }
+        Polygon(dc, tri, 3);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(fill);
+        DeleteObject(ring);
+        DeleteObject(dot);
         EndPaint(h, &ps);
         return 0;
     }
@@ -10850,7 +11001,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
         g_listEp = CreateWindowExW(0, WC_LISTVIEWW, NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN |
             LVS_REPORT | LVS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_EP, NULL, NULL);
         {
@@ -10891,6 +11042,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_btnDescTab = CreateWindowExW(0, DESC_TAB_CLASS, L"",
             WS_CHILD | WS_CLIPSIBLINGS,
             0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_TAB_DESC, NULL, NULL);
+
+        /* “定位正在播放”按钮：g_listEp 的子窗口（配合 WS_CLIPCHILDREN，
+         * 滚动 blit 时不会被印到列表上），初始隐藏，显隐由 150ms 定时器轮询 */
+        g_btnLocate = CreateWindowExW(0, LOC_BTN_CLASS, L"",
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, 28, 28, g_listEp, NULL, NULL, NULL);
 
         ApplyFontsToControls();
 
@@ -11112,7 +11269,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int isCache = ((int)di->itemID == g_podCount);
             Podcast *p = isCache ? &g_cachePod : &g_pods[di->itemID];
             int isSel = (di->itemState & ODS_SELECTED) != 0;
-            int isPlaying = (g_playPod == (int)di->itemID && g_playState == 1);
+            int isPlaying = (g_playPod == (int)di->itemID && g_playState != 0);   /* 暂停也保持绿色 */
             RECT rc = di->rcItem;
             int textLeft;
 
@@ -12059,6 +12216,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         if (wParam == 5) {
             DescTabHoverTick(hwnd);
+            UpdateLocateButton();
             return 0;
         }
         if (wParam == 6) {
@@ -12773,6 +12931,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.lpfnWndProc = DescTabProc;
     wc.hInstance = hInst;
     wc.lpszClassName = DESC_TAB_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
+    RegisterClassExW(&wc);
+
+    /* 注册“定位正在播放”按钮窗口类 */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = LocBtnProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = LOC_BTN_CLASS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
     RegisterClassExW(&wc);
