@@ -417,6 +417,7 @@ enum {
     TR_SHUT_SET, TR_SHUT_CANCELED, TR_SHUT_DENIED,
     TR_CACHE_CHANGED, TR_CACHE_RESET,
     TR_MOVE_Q_NEW_FMT, TR_MOVE_Q_DEF_FMT, TR_MOVE_CACHE, TR_BROWSE_CACHE,
+    TR_MOVE_Q_NEW_DL_FMT, TR_DIR_CONFLICT,
     TR_TB_PREV, TR_TB_PLAY, TR_TB_PAUSE, TR_TB_NEXT, TR_TB_SHUFFLE,
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
     TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_SETTINGS,
@@ -505,6 +506,11 @@ static const wchar_t *tr(int id)
         L"当前缓存目录有 %d 个音频文件，是否移动到新目录？",
         L"当前缓存目录有 %d 个音频文件，是否移动到默认目录？",
         L"移动缓存", L"选择缓存目录",
+        L"当前缓存目录有 %d 个音频文件、%d 个正在下载。\r\n"
+            L"下载中的完成后会自动存到新目录；是否移动已有音频？",
+        L"目标文件夹里有与当前缓存同名的文件。\r\n\r\n"
+            L"为避免覆盖，请换一个文件夹，"
+            L"或先移走目标文件夹里的同名文件。",
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
         L"添加播客", L"删除播客", L"调整顺序", L"设置", L"倍速",
@@ -616,6 +622,11 @@ static const wchar_t *tr(int id)
         L"The current cache folder contains %d audio file(s). Move them to the new folder?",
         L"The current cache folder contains %d audio file(s). Move them to the default folder?",
         L"Move Cache", L"Select Cache Folder",
+        L"The current cache folder contains %d audio file(s), and %d download(s) are in progress.\r\n"
+            L"Finished downloads will land in the new folder automatically. Move existing audio files?",
+        L"The target folder contains files with the same names as the current cache.\r\n\r\n"
+            L"To avoid overwriting, please choose another folder "
+            L"or remove the conflicting files first.",
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
         L"Add podcast", L"Delete podcast", L"Reorder", L"Settings", L"Speed",
@@ -4863,6 +4874,20 @@ static void DlPathRelease(const wchar_t *path)
     LeaveCriticalSection(&g_dlCs);
 }
 
+/* 下载落盘后立即检查：下载期间用户可能切换了缓存目录，
+ * 若按当前目录算出的路径与写入路径不同，把文件归位到新目录，
+ * 保证播放时按新目录能找到（MOVEFILE_COPY_ALLOWED 支持跨盘） */
+static void CacheFileRelocate(const wchar_t *url, const wchar_t *writtenPath)
+{
+    wchar_t now[MAX_PATH];
+    CachePathFor(url, now, MAX_PATH);
+    if (_wcsicmp(now, writtenPath) != 0) {
+        EnsureCacheDir();
+        MoveFileExW(writtenPath, now,
+                    MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING);
+    }
+}
+
 /* ================= 后台线程：下载音频 ================= */
 typedef struct {
     int pod;
@@ -4946,6 +4971,8 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
                     free(data);
                 }
             }
+            /* 已存在/新写完都要归位：下载期间切过缓存目录时路径会变 */
+            if (r->ok) CacheFileRelocate(r->url, cache);
             DlPathRelease(cache);
         }
     }
@@ -5024,6 +5051,7 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
                             }
                             free(data);
                         }
+                        if (ok) CacheFileRelocate(url, cache);
                     }
                     DlPathRelease(cache);
                 }
@@ -9079,6 +9107,45 @@ static int CountMp3InDir(const wchar_t *dir)
     return n;
 }
 
+/* 新旧缓存目录是否存在同名缓存文件（.mp3/.img/.xml/.hdr 都查）：
+ * 有同名就拒绝切换，防止移动或后续下载覆盖目标文件夹里的文件。
+ * 目标里只有不同名文件（比如以前的封面/feed 缓存）则放行。 */
+static int CacheDirHasConflict(const wchar_t *oldDir, const wchar_t *newDir)
+{
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
+    wchar_t pat[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int i;
+    for (i = 0; i < 4; i++) {
+        swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
+        h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
+            if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
+                FindClose(h);
+                return 1;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return 0;
+}
+
+/* 正在下载中的数量：单集下载 + 批量队列未完成数（切换目录提示用） */
+static int ActiveDownloadCount(void)
+{
+    int n = g_downloading ? 1 : 0;
+    if (g_batch) {
+        EnterCriticalSection(&g_batch->cs);
+        n += g_batch->count - g_batch->doneCount;
+        LeaveCriticalSection(&g_batch->cs);
+    }
+    return n;
+}
+
 /* 把旧目录里所有缓存文件（.mp3）移动到新目录 */
 static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir,
                            const wchar_t *ext)
@@ -9922,20 +9989,32 @@ static void OnSettingsButton(void)
             int oldHasFiles = CountMp3InDir(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
             swprintf(newDir, MAX_PATH, L"%ls\\", newPath);
-            /* 新旧相同就不必移动 */
-            if (oldHasFiles > 0 &&
-                _wcsicmp(curDir, newDir) != 0) {
-                wchar_t msg[256];
-                swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
-                if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    CreateDirectoryW(newPath, NULL);
-                    MoveCacheFiles(curDir, newDir, L"mp3");
+            /* 目标里有与当前缓存同名的文件就拒绝切换，防止覆盖用户文件 */
+            if (_wcsicmp(curDir, newDir) != 0 &&
+                CacheDirHasConflict(curDir, newDir)) {
+                MessageBoxTh(g_hwnd, tr(TR_DIR_CONFLICT), tr(TR_M_CHANGE_CACHE),
+                             MB_OK | MB_ICONWARNING);
+            } else {
+                /* 新旧相同就不必移动 */
+                if (oldHasFiles > 0 &&
+                    _wcsicmp(curDir, newDir) != 0) {
+                    int activeDl = ActiveDownloadCount();
+                    wchar_t msg[256];
+                    if (activeDl > 0)
+                        swprintf(msg, 256, tr(TR_MOVE_Q_NEW_DL_FMT),
+                                 oldHasFiles, activeDl);
+                    else
+                        swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
+                    if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                        CreateDirectoryW(newPath, NULL);
+                        MoveCacheFiles(curDir, newDir, L"mp3");
+                    }
                 }
+                wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
+                g_cacheDir[MAX_PATH - 1] = 0;
+                EnsureCacheDir();
+                SetStatusTemp(tr(TR_CACHE_CHANGED));
             }
-            wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
-            g_cacheDir[MAX_PATH - 1] = 0;
-            EnsureCacheDir();
-            SetStatusTemp(tr(TR_CACHE_CHANGED));
         }
         if (pidl) CoTaskMemFree(pidl);
     } else if (cmd == 3) {
