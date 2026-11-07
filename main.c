@@ -6853,6 +6853,24 @@ static long long ResumeSeek100ns(long long sec)
     return (sec > 0 ? sec : 0) * 10000000LL;
 }
 
+/* 与双击等价地播放列表中的一集：命中该播客“上次听到”的集续播，否则从头 */
+static void PlayEpisodeFromList(int row)
+{
+    int ep = EpIdxOfRow(row);
+    if (ep >= 0 && g_curPod >= 0 && g_curPod < g_podCount) {
+        Podcast *p = &g_pods[g_curPod];
+        LastEp *le = p->feedUrl ? LastEpFind(LastEpHash(p->feedUrl)) : NULL;
+        g_resumeSeek100ns =
+            (le && le->sec > 0 && ep < p->epCount &&
+             p->eps[ep].url && le->epUrl &&
+             wcscmp(p->eps[ep].url, le->epUrl) == 0)
+                ? ResumeSeek100ns(le->sec) : 0;
+    } else {
+        g_resumeSeek100ns = 0;   /* 缓存聚合视图/无 feed：从头播 */
+    }
+    if (ep >= 0) RequestPlayEpisode(g_curPod, ep);
+}
+
 /* 双击播客：优先续播“上次听到哪”的橙色剧集，无记录则从第 1 集开始。
  * 与剧集列表双击同一约定：先置 g_resumeSeek100ns，再由 PLAY 事件一次性定位。 */
 static void PlayPodcastDefault(int pod)
@@ -11698,6 +11716,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
             } else {
+                MenuAdd(m, 0, 9, tr(TR_TB_PLAY));
+                MenuAddSep(m);
                 if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
                 else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
                 if (cached) MenuAdd(m, 0, 5, tr(TR_CTX_REVEAL));
@@ -11716,7 +11736,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (bg) DeleteObject(bg);
             }
             DestroyMenu(m);
-            if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
+            if (cmd == 9) PlayEpisodeFromList(row);
+            else if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
             else if (cmd == 5) {
                 wchar_t path[MAX_PATH];
@@ -11881,23 +11902,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (nm->code == NM_DBLCLK) {
                 int sel = (int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
                                             (WPARAM)-1, LVNI_SELECTED);
-                int ep = EpIdxOfRow(sel);
-                /* 命中该播客“上次听到”的那集 → 双击即从记录位置续播；
-                 * 点其它集则从头播（清掉待定位，避免继承残留） */
-                if (sel >= 0 && ep >= 0 && g_curPod >= 0 && g_curPod < g_podCount) {
-                    Podcast *p = &g_pods[g_curPod];
-                    LastEp *le = p->feedUrl ? LastEpFind(LastEpHash(p->feedUrl))
-                                            : NULL;
-                    if (le && le->sec > 0 && ep < p->epCount &&
-                        p->eps[ep].url && le->epUrl &&
-                        wcscmp(p->eps[ep].url, le->epUrl) == 0)
-                        g_resumeSeek100ns = ResumeSeek100ns(le->sec);
-                    else
-                        g_resumeSeek100ns = 0;
-                } else if (sel >= 0) {
-                    g_resumeSeek100ns = 0;   /* 缓存聚合视图无单一 feed，从头播 */
-                }
-                if (sel >= 0 && ep >= 0) RequestPlayEpisode(g_curPod, ep);
+                if (sel >= 0) PlayEpisodeFromList(sel);
             } else if (nm->code == NM_CUSTOMDRAW) {
                 /* 正在播放 → 绿；已缓存（非播放）→ 黄 */
                 LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
