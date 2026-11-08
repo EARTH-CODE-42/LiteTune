@@ -100,6 +100,7 @@ DEFINE_GUID_L(IID_ITaskbarList3_L,0xea1afb91,0x9e28,0x4b86,0x90,0xe9,0x9e,0x9f,0
 #define WM_APP_EP_READY     (WM_APP + 3)   /* lParam = EpReady* */
 #define WM_APP_DL_PROGRESS  (WM_APP + 4)   /* wParam = 0..100 */
 #define WM_APP_MF_EVENT     (WM_APP + 5)   /* wParam = MFP_EVENT_TYPE, lParam = HRESULT */
+#define WM_APP_SUB_READY    (WM_APP + 20)  /* lParam = SubRaw*（字幕下载完成，UI 线程解析） */
 
 /* 滑块几何消息（部分旧版 commctrl.h 未声明） */
 #ifndef TBM_GETTHUMBRECT
@@ -114,6 +115,7 @@ typedef struct {
     wchar_t *title;
     wchar_t *desc;
     wchar_t *url;        /* enclosure URL（离线视图里是本地 mp3 完整路径） */
+    char    *transcriptUrl;  /* podcast:transcript 的 VTT/SRT 地址，无则 NULL */
     wchar_t *author;     /* itunes:author（离线视图里是播客名称） */
     wchar_t  dateText[24];
     long long dateKey;   /* YYYYMMDDHHMM 分钟级，0=未知 */
@@ -121,6 +123,13 @@ typedef struct {
     int      origIdx;    /* RSS 原始顺序，排序 tiebreak */
     int      localFile;  /* 1=离线缓存视图：url 为本地路径，直接播放不联网 */
 } Episode;
+
+/* 字幕条目：起止时间（秒）+ 文本（可能多行） */
+typedef struct {
+    double start;
+    double end;
+    wchar_t *text;
+} SubCue;
 
 typedef struct {
     wchar_t *title;
@@ -163,7 +172,8 @@ enum {
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_EDIT_FILTER, IDC_BTN_FAVONLY, IDC_BTN_PHONE,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
-    IDC_TAB_DESC
+    IDC_TAB_DESC,
+    IDC_BTN_SUBVIEW, IDC_BTN_SUBON, IDC_LIST_SUB
 };
 
 /* ================= 全局状态 ================= */
@@ -308,6 +318,19 @@ static int  g_playEp  = -1;         /* 正在播放的剧集下标，独立于�
 static wchar_t *g_playUrl = NULL;   /* 当前请求播放的音频 URL */
 static long long g_dur100ns = 0;
 static int  g_posSec = 0, g_durSec = 0;  /* 500ms 定时器缓存的进度（秒），供手机 /status 读 */
+
+/* ================= 字幕 ================= */
+static SubCue *g_subCues = NULL;     /* 当前剧集的字幕条目 */
+static int     g_subCueCount = 0;
+static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标，-1=无 */
+static char   *g_subTransUrl = NULL; /* 当前加载字幕的 transcript URL（去重用） */
+static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
+static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕列表（按钮1） */
+static HWND    g_listSub = NULL;     /* 简介区字幕列表 */
+static HWND    g_btnSubView = NULL;  /* 按钮1：简介/字幕切换 */
+static HWND    g_btnSubOn = NULL;    /* 按钮2：字幕开关 */
+static HWND    g_hwndSubBar = NULL;  /* 外挂置顶字幕窗口 */
+static int     g_subNoSeek = 0;      /* 程序式 LB_SETCURSEL 时置 1，跳过点击跳转 */
 
 /* 续播记忆：退出时把 g_playUrl+位置写进 ini，下次启动 feeds 加载完自动续播 */
 static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径 */
@@ -509,11 +532,11 @@ static const wchar_t *tr(int id)
         L"定时关机已设定（关闭程序即可取消）", L"定时关机已取消",
         L"关机请求被系统拒绝",
         L"缓存目录已更改", L"缓存目录已恢复默认",
-        L"当前缓存目录有 %d 个音频文件，是否移动到新目录？",
-        L"当前缓存目录有 %d 个音频文件，是否移动到默认目录？",
+        L"当前缓存目录有 %d 个缓存文件，是否移动到新目录？",
+        L"当前缓存目录有 %d 个缓存文件，是否移动到默认目录？",
         L"移动缓存", L"选择缓存目录",
-        L"当前缓存目录有 %d 个音频文件、%d 个正在下载。\r\n"
-            L"下载中的完成后会自动存到新目录；是否移动已有音频？",
+        L"当前缓存目录有 %d 个缓存文件、%d 个正在下载。\r\n"
+            L"下载中的完成后会自动存到新目录；是否移动已有缓存？",
         L"目标文件夹里有与当前缓存同名的文件。\r\n\r\n"
             L"为避免覆盖，请换一个文件夹，"
             L"或先移走目标文件夹里的同名文件。",
@@ -626,11 +649,11 @@ static const wchar_t *tr(int id)
         L"Sleep timer set (quit the app to cancel)", L"Sleep timer canceled",
         L"Shutdown request denied by the system",
         L"Cache folder changed", L"Cache folder restored to default",
-        L"The current cache folder contains %d audio file(s). Move them to the new folder?",
-        L"The current cache folder contains %d audio file(s). Move them to the default folder?",
+        L"The current cache folder contains %d cache file(s). Move them to the new folder?",
+        L"The current cache folder contains %d cache file(s). Move them to the default folder?",
         L"Move Cache", L"Select Cache Folder",
-        L"The current cache folder contains %d audio file(s), and %d download(s) are in progress.\r\n"
-            L"Finished downloads will land in the new folder automatically. Move existing audio files?",
+        L"The current cache folder contains %d cache file(s), and %d download(s) are in progress.\r\n"
+            L"Finished downloads will land in the new folder automatically. Move existing cache files?",
         L"The target folder contains files with the same names as the current cache.\r\n\r\n"
             L"To avoid overwriting, please choose another folder "
             L"or remove the conflicting files first.",
@@ -1453,6 +1476,7 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill,
 /* 真正的子窗口，不是事后覆盖。直接画暗色，永不闪白。 */
 #define DSB_CLASS L"LiteTuneScrollBar"
 #define DESC_TAB_CLASS L"LiteTuneDescTab"
+#define SUBBAR_CLASS   L"LiteTuneSubBar"
 #define LOC_BTN_CLASS L"LiteTuneLocBtn"   /* 剧集列表右下角“定位正在播放”按钮 */
 /* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
 #define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
@@ -2874,6 +2898,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
         size_t segLen;
         Episode *e;
         char *encUrl = NULL;
+        char *e_transUrl = NULL;
 
         if (!itemEnd) break;
         segLen = (size_t)(itemEnd - item) + 7;
@@ -2895,6 +2920,26 @@ static int ParseFeed(const char *xml, Podcast *pod)
             }
         }
 
+        /* podcast:transcript：字幕文件地址（VTT/SRT），与 enclosure 同级 */
+        {
+            const char *tr = strstr(seg, "<podcast:transcript");
+            if (tr) {
+                const char *trClose = strchr(tr, '>');
+                if (trClose) {
+                    e_transUrl = XmlAttrRange(tr, trClose + 1, "url");
+                    /* 部分 feed 把地址写在标签文本里而非 url 属性 */
+                    if (!e_transUrl) {
+                        const char *te = strstr(trClose, "</podcast:transcript>");
+                        if (te) {
+                            int len = (int)(te - (trClose + 1));
+                            e_transUrl = (char*)malloc(len + 1);
+                            if (e_transUrl) { memcpy(e_transUrl, trClose + 1, len); e_transUrl[len] = 0; }
+                        }
+                    }
+                }
+            }
+        }
+
         if (encUrl && pod->epCount < 10000) {
             char *d;
             if (pod->epCount >= pod->epCap) {
@@ -2903,7 +2948,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
                 Episode *ne;
                 pod->epCap = pod->epCap ? pod->epCap * 2 : 32;
                 ne = (Episode*)realloc(pod->eps, pod->epCap * sizeof(Episode));
-                if (!ne) { free(encUrl); free(seg); return 0; }
+                if (!ne) { free(encUrl); free(e_transUrl); free(seg); return 0; }
                 pod->eps = ne;
             }
             e = &pod->eps[pod->epCount];
@@ -2921,10 +2966,11 @@ static int ParseFeed(const char *xml, Podcast *pod)
             if (!e->url) {
                 /* 槽位复用前释放已 dup 的字段，防止泄漏 */
                 free(e->title); free(e->desc); free(e->author);
-                free(encUrl); free(seg);
+                free(encUrl); free(e_transUrl); free(seg);
                 item = FindOpenTag(itemEnd, "item");
                 continue;
             }
+            if (e_transUrl) { CleanXmlText(e_transUrl); e->transcriptUrl = e_transUrl; e_transUrl = NULL; }
             d = XmlText(seg, "itunes:duration");
             if (!d) d = XmlText(seg, "duration");
             if (d) { e->durationSec = ParseDuration(d); free(d); }
@@ -2941,7 +2987,8 @@ static int ParseFeed(const char *xml, Podcast *pod)
             pod->epCount++;
             free(encUrl);
         } else {
-            free(encUrl);   /* 超过 10000 集上限时同样要释放 */
+            free(encUrl);     /* 超过 10000 集上限时同样要释放 */
+            free(e_transUrl); /* 没用到的字幕地址也释放 */
         }
         free(seg);
         item = FindOpenTag(itemEnd, "item");
@@ -2992,47 +3039,62 @@ static void EnsureCacheDir(void)
     CreateDirectoryW(dir, NULL);
 }
 
+/* 校验文件名是否为「前缀 + 8 位十六进制 + '.' + 扩展名」形式的缓存文件。
+ * 与 UrlCachePath/CachePathFor 的命名规则严格对齐，避免误删自定义目录里的同名扩展名文件 */
+static int IsCacheFileName(const wchar_t *name, const wchar_t *prefix, const wchar_t *ext)
+{
+    size_t pLen = wcslen(prefix), eLen = wcslen(ext), nLen = wcslen(name);
+    size_t i;
+    if (nLen != pLen + 8 + 1 + eLen) return 0;
+    if (wcsncmp(name, prefix, pLen) != 0) return 0;
+    for (i = 0; i < 8; i++) {
+        wchar_t c = name[pLen + i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return 0;
+    }
+    if (name[pLen + 8] != L'.') return 0;
+    return wcscmp(name + pLen + 9, ext) == 0;
+}
+
 /* 启动时清理 g_cacheDays 天前的旧缓存（0=关）。
- * 只删符合程序命名规则（8 位十六进制 + .mp3）的文件，
- * 因此自定义目录里有别的 mp3 也不会被误删 */
+ * 覆盖全部缓存类型：音频 *.mp3、订阅 feed_*.xml/feed_*.hdr、封面 cover_*.img。
+ * 只删符合程序命名规则的文件，因此自定义目录里有别的同名扩展名文件也不会被误删 */
 static void CacheAutoClean(void)
 {
+    static const struct { const wchar_t *prefix; const wchar_t *ext; } kinds[] = {
+        { L"",       L"mp3" },   /* 音频：<8hex>.mp3 */
+        { L"feed_",  L"xml" },   /* 订阅 XML：feed_<8hex>.xml */
+        { L"feed_",  L"hdr" },   /* 订阅验证器：feed_<8hex>.hdr */
+        { L"cover_", L"img" },   /* 封面：cover_<8hex>.img */
+    };
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
     FILETIME ftNow;
     ULARGE_INTEGER ullNow, ullFile;
+    int k;
     if (g_cacheDays <= 0) return;
     CacheDir(cdir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%ls????????.mp3", cdir);
-    h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
     GetSystemTimeAsFileTime(&ftNow);
     ullNow.LowPart = ftNow.dwLowDateTime;
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
-    do {
-        const wchar_t *n;
-        int i, ok;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        /* 通配符 ? 匹配单字符，但还要确认确实是 8 个十六进制字符 */
-        n = fd.cFileName;
-        if (wcslen(n) != 12) continue;
-        ok = 1;
-        for (i = 0; i < 8; i++) {
-            wchar_t c = n[i];
-            if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) { ok = 0; break; }
-        }
-        if (!ok) continue;
-        ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
-        ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
-        if (ullFile.QuadPart < ullNow.QuadPart) {
+    for (k = 0; k < 4; k++) {
+        swprintf(pat, MAX_PATH, L"%ls%ls*.%ls", cdir, kinds[k].prefix, kinds[k].ext);
+        h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
             wchar_t fp[MAX_PATH];
-            swprintf(fp, MAX_PATH, L"%ls%ls", cdir, n);
-            DeleteFileW(fp);
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!IsCacheFileName(fd.cFileName, kinds[k].prefix, kinds[k].ext)) continue;
+            ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+            ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            if (ullFile.QuadPart < ullNow.QuadPart) {
+                swprintf(fp, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+                DeleteFileW(fp);
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
 }
 
 /* 剧集是否已缓存到本地 */
@@ -4572,6 +4634,193 @@ static HBITMAP LoadCoverImage(const char *url)
     return hbmp;
 }
 
+/* ================= 字幕（podcast:transcript，VTT/SRT） ================= */
+
+static void FreeSubCues(void)
+{
+    int i;
+    for (i = 0; i < g_subCueCount; i++) free(g_subCues[i].text);
+    free(g_subCues);
+    g_subCues = NULL;
+    g_subCueCount = 0;
+    g_subCurIdx = -1;
+}
+
+static void AddSubCue(double start, double endT, const char *u8text)
+{
+    SubCue *nc;
+    if (g_subCueCount > 0) {
+        SubCue *prev = &g_subCues[g_subCueCount - 1];
+        /* 与上一条时间完全重合且文本相同则去重（部分 VTT 会重复） */
+        if (prev->start == start && prev->end == endT && prev->text && u8text) {
+            wchar_t *pw = U8ToW(u8text);
+            if (pw && wcscmp(prev->text, pw) == 0) { free(pw); return; }
+            free(pw);
+        }
+    }
+    if (g_subCueCount % 32 == 0) {
+        nc = (SubCue*)realloc(g_subCues, (g_subCueCount + 32) * sizeof(SubCue));
+        if (!nc) return;
+        g_subCues = nc;
+    }
+    nc = &g_subCues[g_subCueCount];
+    nc->start = start;
+    nc->end = endT;
+    nc->text = u8text ? U8ToW(u8text) : _wcsdup(L"");
+    g_subCueCount++;
+}
+
+/* 解析时间码 "HH:MM:SS.mmm" / "MM:SS.mmm"（VTT 用 .，SRT 用 ,），返回秒；失败 -1 */
+static double ParseTimecode(const char *s)
+{
+    int a = 0, b = 0, c = 0, ms = 0, n;
+    while (*s == ' ' || *s == '\t') s++;
+    n = sscanf(s, "%d:%d:%d%*[.,]%d", &a, &b, &c, &ms);
+    if (n >= 3) return a * 3600.0 + b * 60.0 + c + ms / 1000.0;
+    n = sscanf(s, "%d:%d%*[.,]%d", &a, &b, &ms);
+    if (n >= 2) return a * 60.0 + b + ms / 1000.0;
+    return -1;
+}
+
+/* 解析 VTT/SRT 文本到 g_subCues。data 以 \0 结尾（ReadUrlCache 已追加） */
+static void ParseTranscript(const char *data, int len)
+{
+    const char *p = data, *eof = data + len;
+    double start = -1, endT = -1;
+    char textBuf[8192];
+    int textLen = 0;
+
+    FreeSubCues();
+    if (!data || len <= 0) return;
+
+    /* 跳过 WEBVTT 头（到第一个空行） */
+    if (len >= 6 && strncmp(data, "WEBVTT", 6) == 0) {
+        const char *blank = strstr(data, "\n\n");
+        if (blank) p = blank + 2;
+        else p = eof;
+    }
+
+    textBuf[0] = 0;
+    while (p <= eof) {
+        char line[1024];
+        int llen = 0;
+        const char *arrow;
+        while (p < eof && *p != '\n' && llen < (int)sizeof(line) - 1) line[llen++] = *p++;
+        line[llen] = 0;
+        if (p < eof) p++;
+        while (llen > 0 && line[llen - 1] == '\r') line[--llen] = 0;
+
+        arrow = strstr(line, "-->");
+        if (arrow) {
+            if (start >= 0) AddSubCue(start, endT, textBuf);
+            start = ParseTimecode(line);
+            endT = ParseTimecode(arrow + 3);
+            if (endT < 0 && start >= 0) endT = start + 5.0;
+            textBuf[0] = 0; textLen = 0;
+        } else if (llen == 0) {
+            if (start >= 0) { AddSubCue(start, endT, textBuf); start = -1; }
+        } else if (start >= 0) {
+            int room = (int)sizeof(textBuf) - textLen - 2;
+            if (room > 0) {
+                if (textLen > 0) textBuf[textLen++] = '\n';
+                if (llen > room) llen = room;
+                memcpy(textBuf + textLen, line, llen);
+                textLen += llen;
+                textBuf[textLen] = 0;
+            }
+        }
+        /* start<0 时的非时间码行（SRT 序号、VTT NOTE/STYLE）直接忽略 */
+    }
+    if (start >= 0) AddSubCue(start, endT, textBuf);
+}
+
+/* 异步加载字幕：工作线程下载（读缓存或联网），完成后 PostMessage 回 UI 线程解析，
+ * 避免 HttpFetch 30s/60s 超时阻塞界面。同一 URL 不重复加载 */
+typedef struct {
+    char *url;     /* 该字幕对应的 transcript URL（UI 端校验是否仍为当前集） */
+    char *data;    /* 下载到的原始文本（已 \0 结尾），NULL 表示失败 */
+    int   len;
+} SubRaw;
+
+static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
+{
+    char *url = (char*)param;
+    SubRaw *sr = (SubRaw*)calloc(1, sizeof(SubRaw));
+    if (sr) {
+        sr->url = url;   /* 所有权转交 UI 端释放 */
+        if (url && url[0]) {
+            DWORD len = 0;
+            char *data = ReadUrlCache(url, L"trans_", L"vtt", &len);
+            if (!data) {
+                wchar_t *wurl = U8ToW(url);
+                if (wurl) {
+                    data = HttpFetch(wurl, &len, 0, NULL, NULL);
+                    free(wurl);
+                    if (data && len > 0) WriteUrlCache(url, L"trans_", L"vtt", data, len);
+                }
+            }
+            sr->data = data;
+            sr->len = (int)len;
+        }
+        PostMessageW(g_hwnd, WM_APP_SUB_READY, 0, (LPARAM)sr);
+    } else {
+        free(url);
+    }
+    return 0;
+}
+
+static void LoadTranscript(const char *url)
+{
+    char *urlCopy;
+    if (!url || !url[0]) {
+        FreeSubCues();
+        free(g_subTransUrl); g_subTransUrl = NULL;
+        return;
+    }
+    if (g_subTransUrl && strcmp(g_subTransUrl, url) == 0) return;   /* 同一集不重载 */
+    /* 标记正在加载（防止重复发线程），url 待 WM_APP_SUB_READY 校验后再落定 */
+    free(g_subTransUrl);
+    g_subTransUrl = _strdup(url);
+    urlCopy = _strdup(url);
+    if (!urlCopy) return;
+    {
+        HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, urlCopy, 0, NULL);
+        if (th) CloseHandle(th);
+        else { free(urlCopy); }
+    }
+}
+
+/* UI 线程：字幕下载完成 → 解析 + 刷新列表/外挂窗 */
+static void SubRefreshUI(void);   /* 定义在 UI 段 */
+static void SubUpdateBar(void);   /* 定义在 外挂字幕窗 段 */
+static void OnSubReady(SubRaw *sr)
+{
+    if (sr) {
+        /* 仅当返回的 URL 仍是当前剧集的字幕时才采用，避免快速切集时旧结果覆盖新结果 */
+        if (sr->url && g_subTransUrl && strcmp(sr->url, g_subTransUrl) == 0) {
+            if (sr->data && sr->len > 0) ParseTranscript(sr->data, sr->len);
+            else FreeSubCues();
+            SubRefreshUI();
+        }
+        free(sr->url);
+        free(sr->data);
+        free(sr);
+    }
+}
+
+/* 根据播放秒数定位当前字幕下标；未命中返回 -1 */
+static int SubCueIndexAt(double sec)
+{
+    int i;
+    for (i = 0; i < g_subCueCount; i++) {
+        if (sec >= g_subCues[i].start && sec < g_subCues[i].end) return i;
+    }
+    /* 落在所有条目之后：返回最后一条（若已过其结束时间则由调用方决定） */
+    if (g_subCueCount > 0 && sec >= g_subCues[g_subCueCount - 1].end)
+        return -1;
+    return -1;
+}
+
 /* ================= 后台线程：加载 feeds ================= */
 /* 构造一个"加载失败"占位条目：保留 feedUrl 供删除/重试用，标题由 UI 按语言绘制 */
 static Podcast* MakeFailedPod(const char *url)
@@ -5481,6 +5730,18 @@ static void PlayerSeekToFrac(int permille)
     memset(&pv, 0, sizeof(pv));
     pv.vt = VT_I8;
     pv.hVal.QuadPart = g_dur100ns * permille / 1000;
+    g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
+}
+
+/* 跳转到指定秒数（字幕点击用） */
+static void PlayerSeekToSec(double sec)
+{
+    PROPVARIANT pv;
+    if (!g_player || g_dur100ns <= 0 || sec < 0) return;
+    memset(&pv, 0, sizeof(pv));
+    pv.vt = VT_I8;
+    pv.hVal.QuadPart = (long long)(sec * 10000000.0);
+    if (pv.hVal.QuadPart > g_dur100ns) pv.hVal.QuadPart = g_dur100ns;
     g_player->lpVtbl->SetPosition(g_player, &MFP_POSITIONTYPE_100NS, &pv);
 }
 
@@ -6602,6 +6863,10 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
     ShowDetailField(buf, sizeof(buf)/sizeof(buf[0]), &pos,
                     e->localFile ? tr(TR_F_LOCALFILE) : tr(TR_F_LINK), e->url);
     SetWindowTextW(g_editDesc, buf);
+
+    /* 加载该集字幕（异步，下载完回 UI 线程解析刷新） */
+    LoadTranscript(e->transcriptUrl);
+    SubRefreshUI();
 }
 
 /* “已缓存”虚拟行被选中：扫描缓存目录，换成 播客/标题/时长 列 */
@@ -6980,6 +7245,7 @@ static void FreePodcast(Podcast *p)
         free(p->eps[j].title);
         free(p->eps[j].desc);
         free(p->eps[j].url);
+        free(p->eps[j].transcriptUrl);
         free(p->eps[j].author);
     }
     free(p->eps);
@@ -8155,6 +8421,18 @@ static int PodListModeClick(POINT pt)
 static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
+    /* 暗色下拖动主窗口时，系统先给子控件发 WM_ERASEBKGND 用白刷擦背景，
+     * 再自绘暗色内容，造成闪白。这里用面板色先填满并返回 1 表示已处理。
+     * （进度条先单点验证，有效再扩到音量条/简介框） */
+    if (msg == WM_ERASEBKGND) {
+        RECT rc;
+        HDC hdc = (HDC)wp;
+        HBRUSH br = CreateSolidBrush(ThPanel());
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, br);
+        DeleteObject(br);
+        return 1;
+    }
     if (msg == WM_MOUSEWHEEL) {
         /* Ctrl+滚轮：调全局字号（普通滚轮才是调滑块） */
         if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
@@ -8463,6 +8741,10 @@ static void SubclassForFontWheel(HWND w)
 #define SPLIT_MINPX  90    /* 每列最小像素宽 */
 #define DESC_TAB_W   14    /* 简介折叠按钮宽（跨在面板边界上，一半在缝里） */
 #define DESC_TAB_H   40    /* 简介折叠按钮高 */
+#define SUB_BTN_H    24    /* 简介区顶部字幕按钮行高 */
+#ifndef LBS_SHOWSELALWAYS
+#define LBS_SHOWSELALWAYS 0x80
+#endif
 static int g_dragSplit = -1;   /* -1=无 0=第一根 1=第二根 */
 
 static void LayoutControls(HWND hwnd);   /* 前置声明 */
@@ -8619,14 +8901,35 @@ static void LayoutControls(HWND hwnd)
         if (g_descHidden) {
             SetRectEmpty(&g_rcPanel[2]);
             ShowWindow(g_editDesc, SW_HIDE);
+            ShowWindow(g_listSub, SW_HIDE);
+            ShowWindow(g_btnSubView, SW_HIDE);
+            ShowWindow(g_btnSubOn, SW_HIDE);
             if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
         } else {
+            int contY = by + SUB_BTN_H;
+            int contH = bh - SUB_BTN_H - 4;
+            int btnW = (w3 - 6) / 2;
             g_rcPanel[2].left = x;           g_rcPanel[2].top = by;
             g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
-            MoveWindow(g_editDesc, x + 2, by + 2, w3 - sbw - 4, bh - 4, TRUE);
-            if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, by + 2, sbw, bh - 4, TRUE);
-            ShowWindow(g_editDesc, SW_SHOWNA);
-            if (g_vsDesc) ShowWindow(g_vsDesc, SW_SHOWNA);
+            /* 顶部两按钮：简介/字幕 切换、字幕开关 */
+            MoveWindow(g_btnSubView, x + 2, by + 2, btnW, SUB_BTN_H - 4, TRUE);
+            MoveWindow(g_btnSubOn, x + 4 + btnW, by + 2, w3 - btnW - 6, SUB_BTN_H - 4, TRUE);
+            ShowWindow(g_btnSubView, SW_SHOWNA);
+            ShowWindow(g_btnSubOn, SW_SHOWNA);
+            if (g_subInDesc) {
+                /* 字幕列表模式 */
+                ShowWindow(g_editDesc, SW_HIDE);
+                MoveWindow(g_listSub, x + 2, contY, w3 - sbw - 4, contH, TRUE);
+                ShowWindow(g_listSub, SW_SHOWNA);
+                if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
+            } else {
+                /* 简介模式 */
+                ShowWindow(g_listSub, SW_HIDE);
+                MoveWindow(g_editDesc, x + 2, contY, w3 - sbw - 4, contH, TRUE);
+                if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, contY, sbw, contH, TRUE);
+                ShowWindow(g_editDesc, SW_SHOWNA);
+                if (g_vsDesc) ShowWindow(g_vsDesc, SW_SHOWNA);
+            }
         }
     }
     /* 简介折叠按钮：贴在简介左缘中段；简介关闭后贴到剧集列表右缘中段 */
@@ -8647,6 +8950,190 @@ static void LayoutControls(HWND hwnd)
         SetWindowPos(g_btnDescTab, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (!g_descTabShown) ShowWindow(g_btnDescTab, SW_HIDE);
+    }
+}
+
+/* ================= 字幕 UI ================= */
+/* 把宽字符里的换行换成空格，供列表框单行显示 */
+static wchar_t* SubFlatten(const wchar_t *s)
+{
+    wchar_t *out, *p;
+    if (!s) return _wcsdup(L"");
+    out = _wcsdup(s);
+    if (!out) return NULL;
+    for (p = out; *p; p++) if (*p == L'\n' || *p == L'\r') *p = L' ';
+    return out;
+}
+
+/* 刷新简介区字幕列表 + 按钮文案 + 外挂窗；当前字幕高亮并滚到可视区 */
+static void SubRefreshUI(void)
+{
+    int i;
+    if (g_listSub) {
+        SendMessageW(g_listSub, LB_RESETCONTENT, 0, 0);
+        for (i = 0; i < g_subCueCount; i++) {
+            wchar_t *flat = SubFlatten(g_subCues[i].text);
+            SendMessageW(g_listSub, LB_ADDSTRING, 0, (LPARAM)(flat ? flat : L""));
+            free(flat);
+        }
+        if (g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
+            g_subNoSeek = 1;
+            SendMessageW(g_listSub, LB_SETCURSEL, (WPARAM)g_subCurIdx, 0);
+            SendMessageW(g_listSub, LB_SETTOPINDEX, (WPARAM)g_subCurIdx, 0);
+            g_subNoSeek = 0;
+        }
+    }
+    if (g_btnSubView)
+        SetWindowTextW(g_btnSubView, g_subInDesc ? L"简介" : L"字幕");
+    if (g_btnSubOn)
+        SetWindowTextW(g_btnSubOn, g_subEnabled ? L"字幕开" : L"字幕关");
+    SubUpdateBar();
+}
+
+/* 播放进度联动：根据当前秒数更新高亮字幕（由 500ms 定时器调用） */
+static void SubTick(double sec)
+{
+    int idx = SubCueIndexAt(sec);
+    if (idx != g_subCurIdx) {
+        g_subCurIdx = idx;
+        if (g_listSub && IsWindowVisible(g_listSub) && idx >= 0) {
+            g_subNoSeek = 1;
+            SendMessageW(g_listSub, LB_SETCURSEL, (WPARAM)idx, 0);
+            SendMessageW(g_listSub, LB_SETTOPINDEX, (WPARAM)idx, 0);
+            g_subNoSeek = 0;
+        }
+        SubUpdateBar();
+    }
+}
+
+/* 点击字幕列表某行 → 跳转到该字幕开始时间 */
+static void SubListSeek(int idx)
+{
+    if (idx < 0 || idx >= g_subCueCount) return;
+    PlayerSeekToSec(g_subCues[idx].start);
+}
+
+/* ================= 外挂置顶字幕窗（桌面歌词式） ================= */
+static POINT g_barDragStart = {0,0};
+static POINT g_barDragWin   = {0,0};
+static int   g_barMoved = 0;
+
+/* 拿到要显示的字幕文本：优先当前条目，否则取下一条，否则空 */
+static const wchar_t* SubBarText(void)
+{
+    if (g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount)
+        return g_subCues[g_subCurIdx].text;
+    if (g_subCueCount > 0) return g_subCues[0].text;
+    return NULL;
+}
+
+static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;   /* 自绘背景，避免拖动时闪白 */
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        HFONT hf, old;
+        int h;
+        const wchar_t *txt = SubBarText();
+        GetClientRect(hwnd, &rc);
+        SetBkMode(hdc, TRANSPARENT);
+        {
+            HBRUSH br = CreateSolidBrush(ThPanel());
+            FillRect(hdc, &rc, br);
+            DeleteObject(br);
+        }
+        if (txt && txt[0]) {
+            /* 字号随窗口高度自适应，最大 28 */
+            h = (rc.bottom - rc.top) / 3;
+            if (h < 12) h = 12;
+            if (h > 28) h = 28;
+            hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                             DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
+            old = (HFONT)SelectObject(hdc, hf);
+            SetTextColor(hdc, ThText());
+            InflateRect(&rc, -8, -4);
+            DrawTextW(hdc, txt, -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(hdc, old);
+            DeleteObject(hf);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        GetCursorPos(&g_barDragStart);
+        {
+            RECT r;
+            GetWindowRect(hwnd, &r);
+            g_barDragWin.x = r.left; g_barDragWin.y = r.top;
+        }
+        g_barMoved = 0;
+        return 0;
+    case WM_MOUSEMOVE:
+        if (wParam & MK_LBUTTON) {
+            POINT cur;
+            GetCursorPos(&cur);
+            if (abs(cur.x - g_barDragStart.x) + abs(cur.y - g_barDragStart.y) > 3)
+                g_barMoved = 1;
+            if (g_barMoved)
+                SetWindowPos(hwnd, HWND_TOPMOST,
+                    g_barDragWin.x + (cur.x - g_barDragStart.x),
+                    g_barDragWin.y + (cur.y - g_barDragStart.y),
+                    0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        ReleaseCapture();
+        if (!g_barMoved && g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount)
+            PlayerSeekToSec(g_subCues[g_subCurIdx].start);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        /* 滚轮切换上/下一条字幕并跳转 */
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int idx = g_subCurIdx;
+        if (idx < 0) idx = 0;
+        idx += (delta > 0) ? -1 : 1;
+        if (idx < 0) idx = 0;
+        if (idx >= g_subCueCount) idx = g_subCueCount - 1;
+        if (idx >= 0) { g_subCurIdx = idx; PlayerSeekToSec(g_subCues[idx].start); InvalidateRect(hwnd, NULL, TRUE); }
+        return 0;
+    }
+    case WM_CLOSE:
+        /* 关闭即隐藏（保留位置/尺寸），并同步字幕开关状态 */
+        ShowWindow(hwnd, SW_HIDE);
+        g_subEnabled = 0;
+        if (g_btnSubOn) SetWindowTextW(g_btnSubOn, L"字幕关");
+        return 0;
+    case WM_DESTROY:
+        if (g_hwndSubBar == hwnd) g_hwndSubBar = NULL;
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* 控制外挂字幕窗的创建/显隐/重绘；g_subEnabled=0 时隐藏但不销毁（保留位置） */
+static void SubUpdateBar(void)
+{
+    if (g_subEnabled) {
+        if (!g_hwndSubBar) {
+            int sw = GetSystemMetrics(SM_CXSCREEN);
+            int sh = GetSystemMetrics(SM_CYSCREEN);
+            g_hwndSubBar = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                SUBBAR_CLASS, L"",
+                WS_POPUP | WS_THICKFRAME | WS_CLIPSIBLINGS,
+                sw - 360, sh - 180, 340, 90,
+                g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        }
+        ShowWindow(g_hwndSubBar, SW_SHOWNA);
+        InvalidateRect(g_hwndSubBar, NULL, TRUE);
+    } else if (g_hwndSubBar) {
+        ShowWindow(g_hwndSubBar, SW_HIDE);
     }
 }
 
@@ -9272,7 +9759,7 @@ static int IconKindOf(int id, int *on)
 }
 
 /* ================= 缓存目录管理 ================= */
-/* 统计某目录下 .mp3 文件数量 */
+/* 统计某目录下 .mp3 文件数量（“已缓存 (N)”虚拟行用，只算音频） */
 static int CountMp3InDir(const wchar_t *dir)
 {
     wchar_t pat[MAX_PATH];
@@ -9285,6 +9772,26 @@ static int CountMp3InDir(const wchar_t *dir)
     do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
     while (FindNextFileW(h, &fd));
     FindClose(h);
+    return n;
+}
+
+/* 统计某目录下全部缓存文件数量（.mp3/.img/.xml/.hdr）。
+ * 切换缓存目录时用它判断是否需要提示搬家，确保只有封面/订阅缓存时也会被搬走 */
+static int CountCacheFiles(const wchar_t *dir)
+{
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int i, n = 0;
+    for (i = 0; i < 4; i++) {
+        swprintf(pat, MAX_PATH, L"%ls*.%ls", dir, exts[i]);
+        h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
+        while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
     return n;
 }
 
@@ -9327,23 +9834,26 @@ static int ActiveDownloadCount(void)
     return n;
 }
 
-/* 把旧目录里所有缓存文件（.mp3）移动到新目录 */
-static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir,
-                           const wchar_t *ext)
+/* 把旧目录里所有缓存文件（.mp3/.img/.xml/.hdr）移动到新目录 */
+static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir)
 {
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
     wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
-    swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, ext);
-    h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        swprintf(src, MAX_PATH, L"%ls%ls", oldDir, fd.cFileName);
-        swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
-        MoveFileW(src, dst);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+    int i;
+    for (i = 0; i < 4; i++) {
+        swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
+        h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf(src, MAX_PATH, L"%ls%ls", oldDir, fd.cFileName);
+            swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
+            MoveFileW(src, dst);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
 }
 
 /* 启动/取消定时关机：minutes>0 设定，0 取消；倒计时显示在窗口标题栏 */
@@ -10149,7 +10659,7 @@ static void OnSettingsButton(void)
         return;
     }
 
-    CacheDir(curDir, MAX_PATH);   /* 保留末尾反斜杠：CountMp3InDir/移动都需要它 */
+    CacheDir(curDir, MAX_PATH);   /* 保留末尾反斜杠：计数/移动都需要它 */
 
     if (cmd == 1) {
         wchar_t openDir[MAX_PATH];
@@ -10167,7 +10677,7 @@ static void OnSettingsButton(void)
         bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
         pidl = SHBrowseForFolderW(&bi);
         if (pidl && SHGetPathFromIDListW(pidl, newPath)) {
-            int oldHasFiles = CountMp3InDir(curDir);   /* curDir 带反斜杠 */
+            int oldHasFiles = CountCacheFiles(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
             swprintf(newDir, MAX_PATH, L"%ls\\", newPath);
             /* 目标里有与当前缓存同名的文件就拒绝切换，防止覆盖用户文件 */
@@ -10188,7 +10698,7 @@ static void OnSettingsButton(void)
                         swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
                     if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
                         CreateDirectoryW(newPath, NULL);
-                        MoveCacheFiles(curDir, newDir, L"mp3");
+                        MoveCacheFiles(curDir, newDir);
                     }
                 }
                 wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
@@ -10204,12 +10714,12 @@ static void OnSettingsButton(void)
         wchar_t defDir[MAX_PATH];
         g_cacheDir[0] = 0;
         CacheDir(defDir, MAX_PATH);          /* 现在返回真正的默认目录 */
-        if (CountMp3InDir(curDir) > 0 && _wcsicmp(curDir, defDir) != 0) {
+        if (CountCacheFiles(curDir) > 0 && _wcsicmp(curDir, defDir) != 0) {
             wchar_t msg[256];
-            swprintf(msg, 256, tr(TR_MOVE_Q_DEF_FMT), CountMp3InDir(curDir));
+            swprintf(msg, 256, tr(TR_MOVE_Q_DEF_FMT), CountCacheFiles(curDir));
             if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 EnsureCacheDir();            /* 确保默认目录已创建 */
-                MoveCacheFiles(curDir, defDir, L"mp3");
+                MoveCacheFiles(curDir, defDir);
             }
         }
         EnsureCacheDir();
@@ -11028,6 +11538,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
+        /* 字幕：简介区顶部两按钮（简介/字幕切换、字幕开关）+ 字幕列表 */
+        g_btnSubView = CreateWindowExW(0, L"BUTTON", L"字幕",
+            WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBVIEW, NULL, NULL);
+        g_btnSubOn = CreateWindowExW(0, L"BUTTON", L"字幕开",
+            WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBON, NULL, NULL);
+        g_listSub = CreateWindowExW(0, L"LISTBOX", NULL,
+            WS_CHILD | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+            WS_VSCROLL | LBS_HASSTRINGS | LBS_SHOWSELALWAYS,
+            0,0,0,0, hwnd, (HMENU)IDC_LIST_SUB, NULL, NULL);
+        SendMessageW(g_listSub, WM_SETFONT, (WPARAM)g_font, TRUE);
+
         /* 剧集标题过滤框：即时过滤，空串=不过滤 */
         g_editFilter = CreateWindowExW(0, L"EDIT", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | ES_AUTOHSCROLL,
@@ -11203,6 +11726,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (di->CtlType == ODT_BUTTON) {
+            /* 字幕按钮：简介/字幕 切换、字幕开关（自绘以适配暗色） */
+            if (di->CtlID == IDC_BTN_SUBVIEW || di->CtlID == IDC_BTN_SUBON) {
+                RECT rc = di->rcItem;
+                wchar_t txt[32];
+                HFONT oldf;
+                int on = (di->CtlID == IDC_BTN_SUBON) ? g_subEnabled : g_subInDesc;
+                FillRectColor(di->hDC, &rc, ThPanel());
+                if (di->itemState & ODS_SELECTED)
+                    DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
+                else
+                    DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
+                GetWindowTextW(di->hwndItem, txt, 32);
+                SetBkMode(di->hDC, TRANSPARENT);
+                SetTextColor(di->hDC, on ? ThAccent() : ThText());
+                oldf = (HFONT)SelectObject(di->hDC, g_font);
+                DrawTextW(di->hDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(di->hDC, oldf);
+                return TRUE;
+            }
             /* 倍速按钮：文字按钮，显示 "1.0x" 等 */
             if (di->CtlID == IDC_BTN_SPEED) {
                 RECT rc = di->rcItem;
@@ -11658,6 +12200,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetTextColor(hdc, ThText());
             return (LRESULT)g_whiteBrush;
         }
+        if ((HWND)lParam == g_listSub) {
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, ThPanel());
+            SetTextColor(hdc, ThText());
+            return (LRESULT)g_whiteBrush;
+        }
         break;
 
     case WM_CTLCOLORSTATIC:
@@ -12038,6 +12586,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     UpdateTrayBadge();
                 }
                 SelectPodcast(sel);
+            } else if (LOWORD(wParam) == IDC_LIST_SUB) {
+                /* 点击字幕行跳转；程序式选行（g_subNoSeek）时跳过 */
+                if (!g_subNoSeek) {
+                    int sel = (int)SendMessageW(g_listSub, LB_GETCURSEL, 0, 0);
+                    SubListSeek(sel);
+                }
             }
         } else if (HIWORD(wParam) == LBN_DBLCLK) {
             /* 双击播客：播橙色（上次听到）剧集，无记录则从第 1 集开始 */
@@ -12072,6 +12626,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 InvalidateRect(g_btnFavOnly, NULL, TRUE);
                 FillEpisodeList();
                 SyncScrollBar(g_vsEp);
+            }
+            else if (id == IDC_BTN_SUBVIEW) {
+                /* 简介/字幕 切换 */
+                g_subInDesc = !g_subInDesc;
+                LayoutControls(g_hwnd);
+                SubRefreshUI();
+            }
+            else if (id == IDC_BTN_SUBON) {
+                /* 字幕开关：控制外挂窗显隐 */
+                g_subEnabled = !g_subEnabled;
+                SubRefreshUI();
             }
         }
         return 0;
@@ -12288,6 +12853,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE,
                         (LPARAM)(pos * 1000 / g_dur100ns));
                 }
+                /* 字幕联动：按当前秒数定位高亮条目 */
+                if (g_subCueCount > 0)
+                    SubTick((double)pos / 10000000.0);
             }
         }
         return 0;
@@ -12592,6 +13160,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         InvalidateRect(g_listEp, NULL, TRUE);   /* 下载完成 → 缓存标记变黄 */
         return 0;
     }
+
+    case WM_APP_SUB_READY:
+        OnSubReady((SubRaw*)lParam);
+        return 0;
 
     case WM_APP_DL_PROGRESS: {
         wchar_t buf[64];
@@ -12944,6 +13516,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     wc.lpszClassName = LOC_BTN_CLASS;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
+    RegisterClassExW(&wc);
+
+    /* 注册外挂字幕窗类（始终置顶、可拖动缩放，类似桌面歌词） */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = SubBarProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = SUBBAR_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
     RegisterClassExW(&wc);
 
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
