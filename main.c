@@ -367,6 +367,15 @@ typedef struct {
 static FavEp   *g_favs = NULL;
 static int      g_favCount = 0, g_favCap = 0;
 
+/* 手动指定的单集字幕地址：RSS 没带 podcast:transcript 时的补救。
+ * 键为剧集音频 URL 的 FNV-1a 哈希；ini 行 trans=<hex>,<utf8url> */
+typedef struct {
+    unsigned int hash;
+    char        *url;
+} SubOv;
+static SubOv   *g_subOvs = NULL;
+static int      g_subOvCount = 0, g_subOvCap = 0;
+
 /* 每播客自动刷新间隔：-1 跟随全局 / 0 关闭 / >0 分钟；ini 行 podrefresh=<hex>,<min> */
 typedef struct {
     unsigned int hash;
@@ -483,6 +492,7 @@ enum {
     TR_CTX_DELCACHE_N_FMT, TR_DELCACHE_DONE_FMT,
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_TB_EXIT, TR_M_REFRESH_NOW,
+    TR_CTX_SET_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
     TR_N
 };
 
@@ -597,7 +607,11 @@ static const wchar_t *tr(int id)
         L"收藏选中的 %d 集", L"取消收藏选中的 %d 集", L"下载选中的 %d 集",
         L"删除选中的 %d 集缓存", L"已删除 %d 集缓存",
         L"已收藏 %d 集", L"已取消收藏 %d 集",
-        L"退出", L"立即刷新全部订阅"
+        L"退出", L"立即刷新全部订阅",
+        L"手动填写字幕地址...", L"字幕地址",
+        L"输入该集字幕地址（VTT/SRT），留空则清除：",
+        L"字幕地址已保存",
+        L"地址无效，需以 http:// 或 https:// 开头"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -727,7 +741,11 @@ static const wchar_t *tr(int id)
         L"Favorite %d selected", L"Unfavorite %d selected", L"Download %d selected",
         L"Delete cache of %d selected", L"Deleted cache of %d episode(s)",
         L"Favorited %d episode(s)", L"Unfavorited %d episode(s)",
-        L"Exit", L"Refresh all feeds now"
+        L"Exit", L"Refresh all feeds now",
+        L"Set Transcript URL...", L"Transcript URL",
+        L"Enter a VTT/SRT URL for this episode (leave empty to clear):",
+        L"Transcript URL saved",
+        L"Invalid URL. It must start with http:// or https://"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -1177,13 +1195,10 @@ static void ApplyHeaderTheme(void)
 static WNDPROC g_origHdrProc = NULL;
 static LRESULT CALLBACK HeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    /* 表头擦背景用主题色：默认类背景是浅色，滚动/拖动时右边会闪出浅色块 */
-    if (g_darkMode && msg == WM_ERASEBKGND) {
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        FillRectColor((HDC)wp, &rc, ThHeaderBg());
-        return 1;
-    }
+    /* 表头擦背景用主题色：默认类背景是浅色，滚动/拖动时右边会闪出浅色块。
+     * 但擦除阶段单独落笔会形成一帧空屏（“消失又出现”），所以直接吞掉；
+     * 表头各列在 WM_DRAWITEM/WM_PAINT 里自己铺满 */
+    if (g_darkMode && msg == WM_ERASEBKGND) return 1;
     LRESULT lr = CallWindowProcW(g_origHdrProc, hwnd, msg, wp, lp);
     /* ListView 每次重算滚动条都会把表头缩窄 17px，右边露出一条 ListView 底色。
      * 在表头自己的 WM_SIZE 里拉回等宽，避免在滚动路径里反复 SetWindowPos */
@@ -3065,6 +3080,7 @@ static void CacheAutoClean(void)
         { L"feed_",  L"xml" },   /* 订阅 XML：feed_<8hex>.xml */
         { L"feed_",  L"hdr" },   /* 订阅验证器：feed_<8hex>.hdr */
         { L"cover_", L"img" },   /* 封面：cover_<8hex>.img */
+        { L"trans_", L"vtt" },   /* 字幕：trans_<8hex>.vtt */
     };
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
@@ -3078,7 +3094,7 @@ static void CacheAutoClean(void)
     ullNow.LowPart = ftNow.dwLowDateTime;
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
-    for (k = 0; k < 4; k++) {
+    for (k = 0; k < 5; k++) {
         swprintf(pat, MAX_PATH, L"%ls%ls*.%ls", cdir, kinds[k].prefix, kinds[k].ext);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -3460,6 +3476,61 @@ static void FavFreeAll(void)
     g_favs = NULL; g_favCount = 0; g_favCap = 0;
 }
 
+/* ---------- 单集字幕地址覆盖 ---------- */
+
+/* 查找某剧集的手动字幕地址，无则 NULL */
+static const char* SubOvFind(unsigned int hash)
+{
+    int i;
+    for (i = 0; i < g_subOvCount; i++)
+        if (g_subOvs[i].hash == hash) return g_subOvs[i].url;
+    return NULL;
+}
+
+/* url 为空/NULL 删除记录，否则写入（同一哈希只留一条） */
+static void SubOvSet(unsigned int hash, const char *url)
+{
+    int i;
+    if (hash == 0) return;
+    for (i = 0; i < g_subOvCount; i++) {
+        if (g_subOvs[i].hash == hash) {
+            if (!url || !*url) {
+                free(g_subOvs[i].url);
+                memmove(&g_subOvs[i], &g_subOvs[i + 1],
+                        (g_subOvCount - i - 1) * sizeof(SubOv));
+                g_subOvCount--;
+                return;
+            }
+            {
+                char *nu = _strdup(url);
+                if (!nu) return;
+                free(g_subOvs[i].url);
+                g_subOvs[i].url = nu;
+            }
+            return;
+        }
+    }
+    if (!url || !*url || g_subOvCount >= 256) return;
+    if (g_subOvCount >= g_subOvCap) {
+        int nc = g_subOvCap ? g_subOvCap * 2 : 16;
+        SubOv *nb = (SubOv*)realloc(g_subOvs, nc * sizeof(SubOv));
+        if (!nb) return;
+        g_subOvs = nb; g_subOvCap = nc;
+    }
+    g_subOvs[g_subOvCount].url = _strdup(url);
+    if (!g_subOvs[g_subOvCount].url) return;
+    g_subOvs[g_subOvCount].hash = hash;
+    g_subOvCount++;
+}
+
+static void SubOvFreeAll(void)
+{
+    int i;
+    for (i = 0; i < g_subOvCount; i++) free(g_subOvs[i].url);
+    free(g_subOvs);
+    g_subOvs = NULL; g_subOvCount = 0; g_subOvCap = 0;
+}
+
 /* ---------- 每播客刷新间隔 ---------- */
 
 /* 返回间隔分钟：-1=跟随全局（未记录），0=关闭，>0=自定义 */
@@ -3800,6 +3871,7 @@ static void ParseSortValue(const char *v)
  *   [settings]     界面/播放/窗口/缓存目录等键值（sort、w1、vol、dark…）
  *   [lastplayed]   resume/resumeplay/resumeurl 与每播客 lastep=
  *   [favorites]    收藏的剧集 fav=
+ *   [transcripts]  手动指定的单集字幕地址 trans=
  *   [seen]         每播客已看水位 seenep=
  *   [podrefresh]   每播客刷新间隔 podrefresh=
  *   [feeds]        每行一个 RSS 地址（裸 URL，直接粘贴）
@@ -4103,6 +4175,16 @@ static void ParseConfigLine(char *line)
                 if (h != 0 && w) { FavSet(h, w, 1); free(w); }
             }
         }
+        else if (strcmp(s, "trans") == 0) {
+            /* 格式 trans=<hash hex>,<utf8url 余下整段>（手动指定的单集字幕地址） */
+            char *c1 = strchr(val, ',');
+            if (c1) {
+                unsigned int h;
+                *c1 = 0;
+                h = (unsigned int)strtoul(val, NULL, 16);
+                if (h != 0) SubOvSet(h, c1 + 1);
+            }
+        }
         else if (strcmp(s, "podrefresh") == 0) {
             /* 格式 podrefresh=<hash hex>,<min> */
             char *c1 = strchr(val, ',');
@@ -4327,6 +4409,7 @@ static void LoadConfig(void)
     LastEpFreeAll();
     SeenFreeAll();
     FavFreeAll();
+    SubOvFreeAll();
     PodRefreshFreeAll();
 
     /* 上次保存残留的改名副本（此时已无占用），顺手删除 */
@@ -4476,6 +4559,14 @@ static char *BuildConfigText(DWORD *lenOut)
                 }
             }
         }
+    }
+    /* 手动指定的单集字幕地址（trans=<hash>,<utf8url>） */
+    SbAddf(&sb, "\n[transcripts]\n");
+    {
+        int li;
+        for (li = 0; li < g_subOvCount; li++)
+            if (g_subOvs[li].hash != 0 && g_subOvs[li].url)
+                SbAddf(&sb, "trans=%x,%s\n", g_subOvs[li].hash, g_subOvs[li].url);
     }
     /* 每播客“已看”水位（新剧集角标），dateKey 拆两个 32 位写 */
     SbAddf(&sb, "\n[seen]\n");
@@ -4693,15 +4784,13 @@ static void ParseTranscript(const char *data, int len)
     FreeSubCues();
     if (!data || len <= 0) return;
 
-    /* 跳过 WEBVTT 头（到第一个空行） */
-    if (len >= 6 && strncmp(data, "WEBVTT", 6) == 0) {
-        const char *blank = strstr(data, "\n\n");
-        if (blank) p = blank + 2;
-        else p = eof;
-    }
+    /* WEBVTT 头不必单独跳过：没有 "-->" 的行在 start<0 时本来就会被忽略；
+     * 反过来若按 "\n\n" 找头，遇到 \r\n 换行的文件会整篇丢掉 */
 
     textBuf[0] = 0;
-    while (p <= eof) {
+    /* 必须是 p < eof：文件以换行结尾时 p 会走到 eof，若用 <= 则空行长读、
+     * p 不再前进 → 死循环（手动填真实字幕地址后界面卡死的原因） */
+    while (p < eof) {
         char line[1024];
         int llen = 0;
         const char *arrow;
@@ -6864,8 +6953,14 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
                     e->localFile ? tr(TR_F_LOCALFILE) : tr(TR_F_LINK), e->url);
     SetWindowTextW(g_editDesc, buf);
 
-    /* 加载该集字幕（异步，下载完回 UI 线程解析刷新） */
-    LoadTranscript(e->transcriptUrl);
+    /* 加载该集字幕（异步，下载完回 UI 线程解析刷新）。
+     * 手动指定的地址优先于 RSS 里的 podcast:transcript */
+    {
+        char *u8 = e->localFile ? NULL : WToU8(e->url);
+        const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
+        free(u8);
+        LoadTranscript(ov ? ov : e->transcriptUrl);
+    }
     SubRefreshUI();
 }
 
@@ -7930,11 +8025,22 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
             12, 36, 408, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
+        if (g_ibMode == 2 && g_ibBuf[0])
+            SetWindowTextW(e, g_ibBuf);   /* 预填当前字幕地址 */
         lab = CreateWindowExW(0, L"STATIC",
-            g_ibMode == 1 ? tr(TR_CUSTOM_LABEL) : tr(TR_SEARCH_HINT),
+            g_ibMode == 1 ? tr(TR_CUSTOM_LABEL)
+                          : (g_ibMode == 2 ? tr(TR_SUB_LABEL) : tr(TR_SEARCH_HINT)),
             WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 12, 408, 18, h, NULL, NULL, NULL);
         if (g_darkMode) btnStyle |= BS_OWNERDRAW;
-        if (g_ibMode == 0) {
+        if (g_ibMode == 2) {
+            /* 手动填字幕地址：只有确定/取消 */
+            CreateWindowExW(0, L"BUTTON", tr(TR_OK),
+                btnStyle | BS_DEFPUSHBUTTON,
+                236, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+            CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
+                btnStyle | BS_PUSHBUTTON,
+                332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+        } else if (g_ibMode == 0) {
             /* 客户区 432px，margin 12px 两边 → 可用 408px
              * OPML 160 靠左，确定/取消靠右成对：OK 88 + gap 8 + Cancel 88 */
             CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
@@ -8088,8 +8194,21 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             while (e > s && (e[-1] == L' ' || e[-1] == L'\t' ||
                              e[-1] == L'\r' || e[-1] == L'\n')) *--e = 0;
 
+            if (g_ibMode == 2) {
+                /* 字幕地址：留空=清除覆盖；非空必须是 http(s) */
+                if (s[0] && wcsncmp(s, L"http://", 7) != 0 &&
+                    wcsncmp(s, L"https://", 8) != 0) {
+                    MessageBoxTh(h, tr(TR_SUB_BAD), L"LiteTune", MB_ICONWARNING);
+                    return 0;
+                }
+                wcsncpy(g_ibBuf, s, 2047);
+                g_ibBuf[2047] = 0;
+                g_ibResult = 1;
+                DestroyWindow(h);
+                return 0;
+            }
+
             if (g_ibMode == 1) {
-                /* 分钟数：1-600（ES_NUMBER 已挡掉非数字输入） */
                 int mins = _wtoi(s);
                 if (mins < 1 || mins > 600) {
                     MessageBoxTh(h, tr(TR_CUSTOM_BAD), L"LiteTune", MB_ICONWARNING);
@@ -8285,7 +8404,7 @@ static int AskInputBox(const wchar_t *title, int mode)
 
     g_ibMode = mode;
     g_ibResult = 0;
-    g_ibBuf[0] = 0;
+    if (mode != 2) g_ibBuf[0] = 0;   /* mode 2（字幕地址）允许调用方预填当前值 */
     /* 按目标客户区 432x112 反算含边框标题栏的外尺寸（四边留出间距） */
     {
         RECT wr = { 0, 0, 432, 112 };
@@ -8373,6 +8492,48 @@ static void AskCustomShutdown(void)
         SetShutdownTimer(_wtoi(g_ibBuf));
 }
 
+/* 手动指定某集字幕地址（留空=清除）：写入覆盖表并立即重载 */
+static void SetEpisodeSubUrl(int podIdx, int epIdx)
+{
+    Podcast *p;
+    Episode *e;
+    unsigned int h;
+    char *u8;
+    const char *ov;
+    wchar_t *pre;
+
+    if (podIdx == g_podCount) p = &g_cachePod;
+    else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
+    else return;
+    if (epIdx < 0 || epIdx >= p->epCount) return;
+    e = &p->eps[epIdx];
+    if (e->localFile || !e->url) return;
+    u8 = WToU8(e->url);
+    if (!u8) return;
+    h = LastEpHash(u8);
+    free(u8);
+    if (h == 0) return;
+
+    /* 预填当前生效的地址（手动值优先） */
+    ov = SubOvFind(h);
+    g_ibBuf[0] = 0;
+    pre = U8ToW(ov ? ov : e->transcriptUrl);
+    if (pre) {
+        wcsncpy(g_ibBuf, pre, 2047);
+        g_ibBuf[2047] = 0;
+        free(pre);
+    }
+    if (!AskInputBox(tr(TR_SUB_TITLE), 2)) return;
+    u8 = WToU8(g_ibBuf);
+    SubOvSet(h, u8);          /* 空串 = 删除覆盖 */
+    free(u8);
+    SetStatusTemp(tr(TR_SUB_SAVED));
+
+    ov = SubOvFind(h);
+    LoadTranscript(ov ? ov : e->transcriptUrl);
+    SubRefreshUI();
+}
+
 /* 切换播客列表模式：0=普通 1=删除 2=排序（互斥） */
 static void SetPodMode(int mode)
 {
@@ -8421,18 +8582,10 @@ static int PodListModeClick(POINT pt)
 static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (hwnd == g_sldSeek) ? g_oldSeekProc : g_oldVolProc;
-    /* 暗色下拖动主窗口时，系统先给子控件发 WM_ERASEBKGND 用白刷擦背景，
-     * 再自绘暗色内容，造成闪白。这里用面板色先填满并返回 1 表示已处理。
-     * （进度条先单点验证，有效再扩到音量条/简介框） */
-    if (msg == WM_ERASEBKGND) {
-        RECT rc;
-        HDC hdc = (HDC)wp;
-        HBRUSH br = CreateSolidBrush(ThPanel());
-        GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, br);
-        DeleteObject(br);
-        return 1;
-    }
+    /* 暗色拖动窗口时，擦背景会被单独呈现成一帧空屏，再画内容 → “消失又出现”。
+     * 这里直接吞掉 WM_ERASEBKGND：滑块整条自绘（CDRF_SKIPDEFAULT 覆盖全区域），
+     * 内容在 WM_PAINT 里一次画完，不再有空帧 */
+    if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_MOUSEWHEEL) {
         /* Ctrl+滚轮：调全局字号（普通滚轮才是调滑块） */
         if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
@@ -8474,6 +8627,39 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old;
+    /* 暗色拖动窗口时，擦背景会被单独呈现成一帧空屏，再画内容 → “消失又出现”。
+     * 吞掉 WM_ERASEBKGND：列表/编辑框/按钮的 WM_PAINT 自身会铺满更新区，
+     * 背景与内容在同一帧内完成，不再有空帧 */
+    if (msg == WM_ERASEBKGND) return 1;
+    /* 列表类控件逐项重绘在 DWM 下会被分批呈现（闪），滚动时又可能只
+     * 重绘部分区域（条目缺失/要点击才出现）。改为整窗离屏双缓冲：
+     * 一次画进内存位图、一次 BitBlt 上屏，天然只有一帧 */
+    if (msg == WM_PAINT && (hwnd == g_listPod || hwnd == g_listSub)) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (rc.right > 0 && rc.bottom > 0) {
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            if (mem && bmp) {
+                HGDIOBJ ob = SelectObject(mem, bmp);
+                HBRUSH br = CreateSolidBrush(ThPanel());
+                FillRect(mem, &rc, br);
+                DeleteObject(br);
+                SendMessageW(hwnd, WM_PRINTCLIENT, (WPARAM)mem, PRF_CLIENT);
+                BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                       ps.rcPaint.right - ps.rcPaint.left,
+                       ps.rcPaint.bottom - ps.rcPaint.top,
+                       mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+                SelectObject(mem, ob);
+            }
+            if (bmp) DeleteObject(bmp);
+            if (mem) DeleteDC(mem);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
     /* 暗色表头：ODT_HEADER 的 WM_DRAWITEM 发给表头的父窗口 ListView */
     if (g_darkMode && msg == WM_DRAWITEM &&
         (hwnd == g_listEp || hwnd == g_ibList)) {
@@ -9031,7 +9217,7 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 {
     switch (msg) {
     case WM_ERASEBKGND:
-        return 1;   /* 自绘背景，避免拖动时闪白 */
+        return 1;   /* 背景在 WM_PAINT 里铺，拖动该窗口不闪 */
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -9775,16 +9961,16 @@ static int CountMp3InDir(const wchar_t *dir)
     return n;
 }
 
-/* 统计某目录下全部缓存文件数量（.mp3/.img/.xml/.hdr）。
+/* 统计某目录下全部缓存文件数量（.mp3/.img/.xml/.hdr/.vtt）。
  * 切换缓存目录时用它判断是否需要提示搬家，确保只有封面/订阅缓存时也会被搬走 */
 static int CountCacheFiles(const wchar_t *dir)
 {
-    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr", L"vtt" };
     wchar_t pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int i, n = 0;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         swprintf(pat, MAX_PATH, L"%ls*.%ls", dir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -9834,15 +10020,15 @@ static int ActiveDownloadCount(void)
     return n;
 }
 
-/* 把旧目录里所有缓存文件（.mp3/.img/.xml/.hdr）移动到新目录 */
+/* 把旧目录里所有缓存文件（.mp3/.img/.xml/.hdr/.vtt）移动到新目录 */
 static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir)
 {
-    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr", L"vtt" };
     wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int i;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -11599,6 +11785,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_btnPhone);
         SubclassForFontWheel(g_editFilter);
         SubclassForFontWheel(g_btnFavOnly);
+        SubclassForFontWheel(g_btnSubView);
+        SubclassForFontWheel(g_btnSubOn);
+        SubclassForFontWheel(g_listSub);
 
         SetTimer(hwnd, 1, 500, NULL);
         SetTimer(hwnd, 5, 150, NULL);   /* 简介折叠按钮的悬停探测 */
@@ -12124,11 +12313,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         break;
 
+    case WM_ERASEBKGND:
+        return 1;   /* 底色在 WM_PAINT 里铺，避免擦除单独成帧造成闪烁 */
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT r;
         GetClientRect(hwnd, &r);
+        FillRect(hdc, &r, g_bgBrush ? g_bgBrush : GetSysColorBrush(COLOR_BTNFACE));
         r.left = MARGIN; r.top = MARGIN;
         r.right -= MARGIN; r.bottom = MARGIN + TOP_H;
         /* 顶部播放区：与下方三个区域同款凹陷边框 */
@@ -12440,6 +12633,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (vp && vp->feedUrl && !g_viewCached)
                     MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
                 MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
+                if (!e->localFile) MenuAdd(m, 0, 11, tr(TR_CTX_SET_SUB));
                 MenuAddSep(m);
                 if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
                 else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
@@ -12469,6 +12663,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (CopyToClipboardW(e->url)) SetStatusTemp(tr(TR_CLIP_OK));
                 else SetStatusTemp(tr(TR_CLIP_FAIL));
             }
+            else if (cmd == 11) SetEpisodeSubUrl(g_curPod, ep);
             else if (cmd == 6) StartBatchCache();
             else if (cmd == 10 && vp) {
                 /* 批量删除缓存：先快照选中行再逐集删，最后统一刷新一次 */
