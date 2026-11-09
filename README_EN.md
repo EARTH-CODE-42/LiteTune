@@ -41,6 +41,8 @@ English | [简体中文](README.md)
 - **Context menus**: right-click a podcast to refresh / delete / clear its cache; right-click the Cached row to clear all cache or open the folder; right-click an episode to play / download / delete its cache / open its location (right-click also selects the row); with a multi-selection the menu also offers "Delete cache of N selected", wiping the audio of every selected episode at once
 - Episode list (title, date, duration; sortable by column headers); the cached view adds a sortable Podcast column
 - **Collapsible description pane**: a slim floating handle appears at the middle of the pane's left edge only on hover — click it to hide the description on the right and let the episode list fill the space; once hidden, the handle moves to the episode list's right edge (its arrow flips to `‹`) to bring it back. The collapsed state is remembered in the config, with matching handles in both light and dark themes
+- **Transcript subtitles**: automatically reads `podcast:transcript` from the feed (VTT / SRT), or set a custom URL per episode via the right-click menu; the description pane switches to a "Subtitles" view with one click (state remembered), the list highlights and follows playback, click any line to jump to that sentence, hover shows the full text, and a custom horizontal bar handles long lines
+- **Desktop subtitle window**: an always-on-top overlay shows the current sentence (keeps the previous one during gaps, no flicker); drag anywhere to move, resize from the edges; the font size follows window height ("exactly two lines" baseline) and long sentences shrink instead of being cut off; left-click replays from the current sentence, wheel switches sentences, right-click pauses/resumes; a close × appears on hover to dismiss it; unaffected when the main window is minimized
 - Online playback and local caching: audio auto-downloads to the cache folder, listen offline without network
 - **Local cache view**: the last row of the podcast list, “Cached (N)”, opens a browsable list of every downloaded episode — no network involved, ideal offline
 - **Feed cache**: RSS and cover art cached locally — instant startup from cache (no network needed), browse feeds offline; manual refresh fetches the latest and falls back to cache on failure (list is never cleared)
@@ -54,6 +56,11 @@ English | [简体中文](README.md)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
 - **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
 - **Download first, switch later**: double-clicking an uncached episode downloads it in the background while the current episode keeps playing, and only then does playback switch over (audio finished during a cache-folder change still lands in the new folder)
+- **Episode favorites**: right-click an episode to favorite it (a ★ prefix appears in the list); multi-select favorites in bulk; the star toggle above shows favorites only; favorites are saved in the config and survive restarts
+- **Instant episode filter**: type in the box above the episode pane to filter titles live (case-insensitive), stackable with "favorites / cached only"
+- **New-episode sound**: a chime plays when a refresh finds new episodes, and the tray icon gets a numeric badge; can be turned off in the Settings menu
+- **Per-feed refresh interval**: a podcast's right-click menu can override the global auto-refresh interval (follow global / off / 30–360 min)
+- Right-click copies the episode audio URL / feed URL to the clipboard
 - Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
 - **Podcast search**: type a keyword (plain text, no `://`) in the "Add Subscription" box and press Enter or hit OK — results from iTunes appear below. A single click fills the RSS URL back into the edit box (press Enter again to add); a double-click adds it immediately
 - Playback controls: previous / play-pause / next / stop / mute / volume
@@ -62,7 +69,7 @@ English | [简体中文](README.md)
 - Seekable progress bar; green while playing, yellow when cached, orange for "last heard" (green stays while paused)
 - **"Locate playing" button**: when the green row scrolls out of view and the mouse is over the episode pane, a small round button appears at the bottom-right (its arrow points toward the row); click it to scroll that row into the middle of the list
 - **Phone playback / remote**: enable in the Settings menu, open the LAN page in your phone browser — playback controls, seekable progress bar, volume, episode picker, play mode & speed, sleep timer; lock-screen media controls supported
-- System tray: click × to exit directly; minimize to tray; tray left-click pops a mini control flyout (prev / play-pause / next / shuffle), double-click restores the main window
+- System tray: click × to exit directly; minimize to tray; hovering the tray icon pops a mini control flyout (prev / play-pause / next / shuffle, auto-hides when the cursor leaves), double-click restores the main window
 - **Tray balloon notice**: while the window sits in the tray, a refresh that finds new episodes shows the total in a balloon tip (silent when the window is visible)
 - Multimedia keyboard media keys (play/pause, previous, next, stop)
 - Arrow-key shortcuts: ←/→ seek back / forward 15 s, ↑/↓ previous / next episode; lists, edit boxes, sliders and scroll bars keep their own arrow-key behavior
@@ -123,6 +130,8 @@ sort=date:desc        ; sort column: title/date/duration, direction: asc/desc
 w1=323                ; podcast column width (per-mille)
 w2=383                ; episode column width (per-mille)
 deschide=1            ; description pane collapsed (1 = hidden, written only when collapsed)
+subon=0               ; subtitles switched off (default on, written only when off)
+subview=1             ; description pane shows the subtitle list (default description, written only in subtitle view)
 cw0=110               ; episode list column widths in pixels
 cw1=88
 cw2=44
@@ -133,14 +142,22 @@ dark=0                ; dark mode 0/1
 lang=zh               ; UI language zh/en
 winw=480              ; window size (client area)
 winh=360
+winx=100              ; window position (remembered across runs)
+winy=100
 cachedir=             ; cache folder (empty = default %TEMP%\LiteTune)
 cachedays=30          ; cache auto-clean days (0 = off; default 30, written only when non-default)
 autorefresh=60        ; auto-refresh interval in minutes (0 = off; default 60, written only when non-default)
+traysound=0           ; new-episode chime off (default on, written only when off)
+podrefresh=1a2b3c4d,60 ; per-feed refresh interval (hash,minutes; -1 = follow global, 0 = off), one line per feed
+fav=1a2b3c4d,https://... ; favorited episode (feed URL hash,episode URL), one line per episode
 seenep=1a2b3c4d,0,20250812 ; per-feed "seen" watermark (hash,hi,lo) for the new-episode badge, one line per feed
 resume=1234           ; last playback position in seconds (for auto resume)
 resumeplay=1          ; playing at exit? (0 = paused; reopens paused at the saved position)
 resumeurl=...         ; URL of the episode playing at last exit
 lastep=1a2b3c4d,567,  ; per-feed "last heard" (hash,seconds,episode URL), one line per feed
+
+[transcripts]
+trans=1a2b3c4d,https://example.com/ep1.vtt ; manually set per-episode transcript URL (episode URL hash,transcript URL), one line per episode
 
 [feeds]
 https://example.com/feed1.xml
