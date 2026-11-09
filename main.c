@@ -6979,6 +6979,14 @@ static void ShowPodcastDetail(int idx)
     SetWindowTextW(g_editDesc, buf);
 }
 
+/* 浏览别的剧集时不要换掉正在播放那一集的字幕：桌面字幕和外挂窗只跟播放内容走，
+ * 字幕列表也不该自动滚到别集；真正播到这一集时（播放前已设 g_playUrl）才加载 */
+static int SubFollowsEpisode(const wchar_t *url)
+{
+    if (g_playState == 0 || !g_playUrl) return 1;
+    return url && wcscmp(g_playUrl, url) == 0;
+}
+
 static void ShowEpisodeDetail(int podIdx, int epIdx)
 {
     static wchar_t buf[32768];
@@ -7008,14 +7016,15 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
     SetWindowTextW(g_editDesc, buf);
 
     /* 加载该集字幕（异步，下载完回 UI 线程解析刷新）。
-     * 手动指定的地址优先于 RSS 里的 podcast:transcript */
-    {
+     * 手动指定的地址优先于 RSS 里的 podcast:transcript；
+     * 正在播别的一集时（只是浏览）不动字幕，桌面字幕继续跟播放内容 */
+    if (SubFollowsEpisode(e->url)) {
         char *u8 = e->localFile ? NULL : WToU8(e->url);
         const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
         free(u8);
         LoadTranscript(ov ? ov : e->transcriptUrl);
+        SubRefreshUI();
     }
-    SubRefreshUI();
 }
 
 /* “已缓存”虚拟行被选中：扫描缓存目录，换成 播客/标题/时长 列 */
@@ -8583,9 +8592,12 @@ static void SetEpisodeSubUrl(int podIdx, int epIdx)
     free(u8);
     SetStatusTemp(tr(TR_SUB_SAVED));
 
-    ov = SubOvFind(h);
-    LoadTranscript(ov ? ov : e->transcriptUrl);
-    SubRefreshUI();
+    /* 正在播别的集时只保存地址，等真正播这一集再生效 */
+    if (SubFollowsEpisode(e->url)) {
+        ov = SubOvFind(h);
+        LoadTranscript(ov ? ov : e->transcriptUrl);
+        SubRefreshUI();
+    }
 }
 
 /* 切换播客列表模式：0=普通 1=删除 2=排序（互斥） */
