@@ -172,6 +172,7 @@ enum {
     IDC_LIST_POD, IDC_LIST_EP, IDC_EDIT_DESC,
     IDC_EDIT_FILTER, IDC_BTN_FAVONLY, IDC_BTN_PHONE,
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
+    IDC_SB_SUB, IDC_SB_SUB_H,
     IDC_TAB_DESC,
     IDC_BTN_SUBVIEW, IDC_BTN_SUBON, IDC_LIST_SUB
 };
@@ -202,6 +203,7 @@ static RECT     g_rcFilterFrame;   /* 过滤框外圈 1px 细边（父窗口绘�
 static HWND     g_btnFavOnly;      /* “只显示已收藏”开关按钮 */
 static int      g_cacheOnly;       /* “只显示已缓存”开关（缓存按钮） */
 static HWND g_vsPod, g_vsEp, g_vsDesc, g_hsEp;   /* 自绘滚动条（hs=剧集水平） */
+static HWND g_vsSub, g_hsSub;                    /* 字幕列表纵/横自绘滚动条 */
 static RECT g_rcPanel[3];   /* 下方三面板矩形（含滚条带），WM_PAINT 统一画边框 */
 static HWND     g_btnAdd, g_btnDel, g_btnPlayMode;
 static HWND     g_btnDir;
@@ -257,6 +259,7 @@ static HWND     g_hwndTip = NULL;        /* 系统 tooltip：按钮 */
 static HWND     g_hwndCapTip = NULL;     /* 标题栏按钮的 tracking tooltip */
 static HWND     g_hwndPodTip = NULL;     /* 自定义 tooltip：播客封面+标题+作者 */
 static HWND     g_hwndEpTip = NULL;      /* 剧集列表 tracking tooltip（不依赖标题截断） */
+static HWND     g_hwndSubTip = NULL;     /* 字幕列表 tracking tooltip（悬停显示整条字幕） */
 static int      g_tipPodIdx = -1;        /* 当前播客提示对应的条目下标 */
 
 /* 顶栏状态文本（自绘跑马灯） */
@@ -1168,6 +1171,19 @@ static void ThemeTipSubclass(HWND tip)
     if (tip) SetWindowSubclass(tip, TipSubProc, 1, 0);
 }
 
+/* 收起字幕列表的悬停提示（列表滚动/切换条目时调用，避免停在旧文本上） */
+static void HideSubTip(void)
+{
+    TOOLINFOW ti;
+    if (!g_hwndSubTip) return;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = g_listSub;
+    ti.uId = (UINT_PTR)g_listSub;
+    SendMessageW(g_hwndSubTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+    ShowWindow(g_hwndSubTip, SW_HIDE);
+}
+
 /* 给剧集表头的 3 列设置/取消自绘格式（选中播客会重建列，必须重新应用） */
 static void SubclassHeader(void);
 static void ApplyHeaderTheme(void)
@@ -1393,9 +1409,9 @@ static void ApplyTheme(void)
     /* ApplyMenuTheme 在 TrackPopupMenu 调用点才应用（需要具体 HMENU） */
     /* 系统 tooltip 统一主题色（g_ibTip 在 InputBox 初始化处设置，因为定义在本函数之后） */
     {
-        HWND tips[] = { g_hwndTip, g_hwndEpTip };
+        HWND tips[] = { g_hwndTip, g_hwndEpTip, g_hwndSubTip };
         int k;
-        for (k = 0; k < 2; k++)
+        for (k = 0; k < 3; k++)
             ThemeTipSubclass(tips[k]);
     }
     if (g_hwnd) {
@@ -1538,7 +1554,7 @@ static int DSB_QueryState(DarkScrollBar *dsb)
     int n, ih, vis;
     if (!t) return 0;
     GetClientRect(t, &rc);
-    if (dsb->kind == 0) {                 /* ListBox：行单位 */
+    if (dsb->kind == 0 && !dsb->horizontal) {   /* ListBox：行单位 */
         n  = (int)SendMessageW(t, LB_GETCOUNT, 0, 0);
         ih = (int)SendMessageW(t, LB_GETITEMHEIGHT, 0, 0);
         if (ih <= 0) ih = 16;
@@ -1606,10 +1622,10 @@ static int DSB_QueryState(DarkScrollBar *dsb)
     }
 }
 
-/* 箭头单击滚动一步：纵向统一 1 行；listview 横向 16px */
+/* 箭头单击滚动一步：纵向统一 1 行；横向 16px */
 static int DSB_LineStep(const DarkScrollBar *dsb)
 {
-    if (dsb->kind == 1 && dsb->horizontal) return 16;
+    if (dsb->horizontal && dsb->kind != 2) return 16;
     return 1;
 }
 
@@ -1621,7 +1637,11 @@ static void DSB_ScrollTarget(DarkScrollBar *dsb, int delta)
     HWND t = dsb->target;
     if (!t || !delta) return;
     if (dsb->kind == 0) {
-        SendMessageW(t, LB_SETTOPINDEX, dsb->pos + delta, 0);
+        if (dsb->horizontal)
+            SendMessageW(t, WM_HSCROLL,
+                         MAKEWPARAM(SB_THUMBPOSITION, dsb->pos + delta), 0);
+        else
+            SendMessageW(t, LB_SETTOPINDEX, dsb->pos + delta, 0);
     } else if (dsb->kind == 2) {
         SendMessageW(t, EM_LINESCROLL, 0, (LPARAM)delta);
     } else if (dsb->horizontal) {
@@ -4737,6 +4757,21 @@ static void FreeSubCues(void)
     g_subCurIdx = -1;
 }
 
+/* 去掉 VTT 内联标记：<v SPEAKER_4>、<c.xxx>、<i>/<b>、<00:00:00.000> 之类 */
+static void StripVttTags(char *s)
+{
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '<') {
+            while (*r && *r != '>') r++;
+            if (*r == '>') r++;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+}
+
 static void AddSubCue(double start, double endT, const char *u8text)
 {
     SubCue *nc;
@@ -4809,7 +4844,10 @@ static void ParseTranscript(const char *data, int len)
         } else if (llen == 0) {
             if (start >= 0) { AddSubCue(start, endT, textBuf); start = -1; }
         } else if (start >= 0) {
-            int room = (int)sizeof(textBuf) - textLen - 2;
+            int room;
+            StripVttTags(line);
+            llen = (int)strlen(line);
+            room = (int)sizeof(textBuf) - textLen - 2;
             if (room > 0) {
                 if (textLen > 0) textBuf[textLen++] = '\n';
                 if (llen > room) llen = room;
@@ -8857,6 +8895,43 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageW(g_ibTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
         }
     }
+    /* 字幕列表：悬停显示该条字幕全文 */
+    if (hwnd == g_listSub && g_hwndSubTip) {
+        if (msg == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_HOVER | TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            tme.dwHoverTime = HOVER_DEFAULT;
+            TrackMouseEvent(&tme);
+        } else if (msg == WM_MOUSEHOVER) {
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            DWORD r = (DWORD)SendMessageW(hwnd, LB_ITEMFROMPOINT, 0,
+                                          MAKELPARAM(pt.x, pt.y));
+            int idx = (int)LOWORD(r);
+            if (HIWORD(r) == 0 && idx >= 0 && idx < g_subCueCount &&
+                g_subCues[idx].text) {
+                wchar_t tip[1024];
+                TOOLINFOW ti;
+                POINT scr = pt;
+                wcsncpy(tip, g_subCues[idx].text, 1023);
+                tip[1023] = 0;
+                ClientToScreen(hwnd, &scr);
+                ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                ti.hwnd = hwnd;
+                ti.uId = (UINT_PTR)hwnd;
+                ti.lpszText = tip;
+                SendMessageW(g_hwndSubTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+                SendMessageW(g_hwndSubTip, TTM_TRACKPOSITION, 0,
+                    MAKELPARAM(scr.x + 12, scr.y + 18));
+                SendMessageW(g_hwndSubTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+            }
+            return 0;
+        } else if (msg == WM_MOUSELEAVE) {
+            HideSubTip();
+        }
+    }
     if (msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)) {
         ChangeFontLevel(g_fontLevel + (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1));
         return 0;
@@ -8874,6 +8949,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SyncScrollBar(g_vsPod);
         return 0;
     }
+    if (msg == WM_MOUSEWHEEL && hwnd == g_listSub) {
+        int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
+        int top = (int)SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0);
+        if (top + d < 0) d = -top;
+        SendMessageW(hwnd, LB_SETTOPINDEX, top + d, 0);
+        SyncScrollBar(g_vsSub);
+        return 0;
+    }
     if (msg == WM_MOUSEWHEEL && hwnd == g_editDesc) {
         int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
         SendMessageW(hwnd, EM_LINESCROLL, 0, (LPARAM)d);
@@ -8883,7 +8966,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     /* ListView 会自动显示自带滚动条：在 WM_NCCALCSIZE 里把条带并回
      * 客户区（永不显示白条，内容宽度也不抖动）。剧集列表与搜索结果列表通用 */
     if (msg == WM_NCCALCSIZE && wp &&
-        (hwnd == g_listEp || hwnd == g_ibList)) {
+        (hwnd == g_listEp || hwnd == g_ibList || hwnd == g_editDesc)) {
         WNDPROC oldp = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         LRESULT lr = CallWindowProcW(oldp, hwnd, msg, wp, lp);
         SCROLLBARINFO sb;
@@ -8910,6 +8993,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (hwnd == g_ibList) { if (g_ibSb) SyncScrollBar(g_ibSb);
                                      if (g_ibSbH) SyncScrollBar(g_ibSbH); }
         else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
+        else if (hwnd == g_listSub) { SyncScrollBar(g_vsSub); SyncScrollBar(g_hsSub); }
         return lr;
     }
     old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -9091,30 +9175,44 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_btnSubView, SW_HIDE);
             ShowWindow(g_btnSubOn, SW_HIDE);
             if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
+            if (g_vsSub) ShowWindow(g_vsSub, SW_HIDE);
+            if (g_hsSub) ShowWindow(g_hsSub, SW_HIDE);
         } else {
-            int contY = by + SUB_BTN_H;
-            int contH = bh - SUB_BTN_H - 4;
+            int contY = by + 30;
+            int contH = bh - 32;
             int btnW = (w3 - 6) / 2;
-            g_rcPanel[2].left = x;           g_rcPanel[2].top = by;
+            /* 内容框顶边与另两列对齐（同为 by+28），两按钮放在工具栏基线 */
+            g_rcPanel[2].left = x;           g_rcPanel[2].top = by + 28;
             g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
-            /* 顶部两按钮：简介/字幕 切换、字幕开关 */
-            MoveWindow(g_btnSubView, x + 2, by + 2, btnW, SUB_BTN_H - 4, TRUE);
-            MoveWindow(g_btnSubOn, x + 4 + btnW, by + 2, w3 - btnW - 6, SUB_BTN_H - 4, TRUE);
+            MoveWindow(g_btnSubView, x + 2, by, btnW, 24, TRUE);
+            MoveWindow(g_btnSubOn, x + 4 + btnW, by, w3 - btnW - 6, 24, TRUE);
             ShowWindow(g_btnSubView, SW_SHOWNA);
             ShowWindow(g_btnSubOn, SW_SHOWNA);
             if (g_subInDesc) {
-                /* 字幕列表模式 */
+                /* 字幕列表模式：纵/横自绘条，原生横条已隐藏 */
                 ShowWindow(g_editDesc, SW_HIDE);
-                MoveWindow(g_listSub, x + 2, contY, w3 - sbw - 4, contH, TRUE);
-                ShowWindow(g_listSub, SW_SHOWNA);
                 if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
+                MoveWindow(g_listSub, x + 2, contY, w3 - sbw - 4, contH - sbh, TRUE);
+                ShowWindow(g_listSub, SW_SHOWNA);
+                if (g_vsSub) {
+                    MoveWindow(g_vsSub, x + w3 - 2 - sbw, contY, sbw, contH - sbh, TRUE);
+                    ShowWindow(g_vsSub, SW_SHOWNA); SyncScrollBar(g_vsSub);
+                }
+                if (g_hsSub) {
+                    MoveWindow(g_hsSub, x + 2, by + bh - 2 - sbh, w3 - sbw - 4, sbh, TRUE);
+                    ShowWindow(g_hsSub, SW_SHOWNA); SyncScrollBar(g_hsSub);
+                }
             } else {
                 /* 简介模式 */
                 ShowWindow(g_listSub, SW_HIDE);
+                if (g_vsSub) ShowWindow(g_vsSub, SW_HIDE);
+                if (g_hsSub) ShowWindow(g_hsSub, SW_HIDE);
                 MoveWindow(g_editDesc, x + 2, contY, w3 - sbw - 4, contH, TRUE);
-                if (g_vsDesc) MoveWindow(g_vsDesc, x + w3 - 2 - sbw, contY, sbw, contH, TRUE);
+                if (g_vsDesc) {
+                    MoveWindow(g_vsDesc, x + w3 - 2 - sbw, contY, sbw, contH, TRUE);
+                    ShowWindow(g_vsDesc, SW_SHOWNA);
+                }
                 ShowWindow(g_editDesc, SW_SHOWNA);
-                if (g_vsDesc) ShowWindow(g_vsDesc, SW_SHOWNA);
             }
         }
     }
@@ -9154,19 +9252,39 @@ static wchar_t* SubFlatten(const wchar_t *s)
 /* 刷新简介区字幕列表 + 按钮文案 + 外挂窗；当前字幕高亮并滚到可视区 */
 static void SubRefreshUI(void)
 {
-    int i;
+    int i, maxW = 0;
+    HDC dc = NULL;
+    HGDIOBJ oldf = NULL;
     if (g_listSub) {
+        dc = GetDC(g_listSub);
+        if (dc) oldf = SelectObject(dc, g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT));
         SendMessageW(g_listSub, LB_RESETCONTENT, 0, 0);
         for (i = 0; i < g_subCueCount; i++) {
             wchar_t *flat = SubFlatten(g_subCues[i].text);
+            SIZE sz;
             SendMessageW(g_listSub, LB_ADDSTRING, 0, (LPARAM)(flat ? flat : L""));
+            if (flat && dc && GetTextExtentPoint32W(dc, flat, lstrlenW(flat), &sz) &&
+                sz.cx > maxW)
+                maxW = sz.cx;
             free(flat);
         }
+        if (dc) {
+            if (oldf) SelectObject(dc, oldf);
+            ReleaseDC(g_listSub, dc);
+        }
+        /* 横向滚动范围按最长一条字幕的像素宽设置，原生横条隐藏只用自绘条 */
+        SendMessageW(g_listSub, LB_SETHORIZONTALEXTENT, maxW + 12, 0);
+        ShowScrollBar(g_listSub, SB_HORZ, FALSE);
+        SendMessageW(g_listSub, WM_HSCROLL, MAKEWPARAM(SB_LEFT, 0), 0);
         if (g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
             g_subNoSeek = 1;
             SendMessageW(g_listSub, LB_SETCURSEL, (WPARAM)g_subCurIdx, 0);
             SendMessageW(g_listSub, LB_SETTOPINDEX, (WPARAM)g_subCurIdx, 0);
             g_subNoSeek = 0;
+        }
+        if (IsWindowVisible(g_listSub)) {
+            SyncScrollBar(g_vsSub);
+            SyncScrollBar(g_hsSub);
         }
     }
     if (g_btnSubView)
@@ -9183,10 +9301,12 @@ static void SubTick(double sec)
     if (idx != g_subCurIdx) {
         g_subCurIdx = idx;
         if (g_listSub && IsWindowVisible(g_listSub) && idx >= 0) {
+            HideSubTip();   /* 列表要滚动了，收掉停在旧行上的提示 */
             g_subNoSeek = 1;
             SendMessageW(g_listSub, LB_SETCURSEL, (WPARAM)idx, 0);
             SendMessageW(g_listSub, LB_SETTOPINDEX, (WPARAM)idx, 0);
             g_subNoSeek = 0;
+            SyncScrollBar(g_vsSub);
         }
         SubUpdateBar();
     }
@@ -9203,6 +9323,16 @@ static void SubListSeek(int idx)
 static POINT g_barDragStart = {0,0};
 static POINT g_barDragWin   = {0,0};
 static int   g_barMoved = 0;
+static int   g_barHoverX = 0;      /* 鼠标在右上角叉叉上 */
+static int   g_barTracking = 0;    /* 已在等 WM_MOUSELEAVE */
+
+/* 右上角叉叉按钮（悬停才画）*/
+static RECT BarCloseRect(const RECT *rc)
+{
+    RECT r;
+    SetRect(&r, rc->right - 24, rc->top + 4, rc->right - 4, rc->top + 24);
+    return r;
+}
 
 /* 拿到要显示的字幕文本：优先当前条目，否则取下一条，否则空 */
 static const wchar_t* SubBarText(void)
@@ -9218,10 +9348,28 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;   /* 背景在 WM_PAINT 里铺，拖动该窗口不闪 */
+    case WM_NCCALCSIZE:
+        /* 客户区铺满整个窗口：去掉 WS_THICKFRAME 画出的系统边框
+         * （暗色下是顶端那条白条），缩放仍在 WM_NCHITTEST 里自己做 */
+        return 0;
+    case WM_NCHITTEST: {
+        POINT p;
+        RECT rc;
+        int m = 5, x, y;
+        GetCursorPos(&p);
+        GetWindowRect(hwnd, &rc);
+        x = p.x - rc.left; y = p.y - rc.top;
+        if (y < m) return (x < m) ? HTTOPLEFT : (x >= rc.right - rc.left - m ? HTTOPRIGHT : HTTOP);
+        if (y >= rc.bottom - rc.top - m)
+            return (x < m) ? HTBOTTOMLEFT : (x >= rc.right - rc.left - m ? HTBOTTOMRIGHT : HTBOTTOM);
+        if (x < m) return HTLEFT;
+        if (x >= rc.right - rc.left - m) return HTRIGHT;
+        return HTCLIENT;
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
+        RECT rc, inner;
         HFONT hf, old;
         int h;
         const wchar_t *txt = SubBarText();
@@ -9233,23 +9381,61 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             DeleteObject(br);
         }
         if (txt && txt[0]) {
-            /* 字号随窗口高度自适应，最大 28 */
-            h = (rc.bottom - rc.top) / 3;
-            if (h < 12) h = 12;
-            if (h > 28) h = 28;
+            /* 自动选能整段放下的最大字号：先按窗口高度估一个上限，
+             * 再逐步缩小到放得下（长句不再被截断）*/
+            int textH = 0;
+            RECT dr;
+            inner = rc;
+            InflateRect(&inner, -10, -6);
+            for (h = 28; h >= 10; h -= 2) {
+                RECT cr = inner;
+                hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                 DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
+                old = (HFONT)SelectObject(hdc, hf);
+                DrawTextW(hdc, txt, -1, &cr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+                SelectObject(hdc, old);
+                DeleteObject(hf);
+                textH = cr.bottom - cr.top;
+                if (textH <= inner.bottom - inner.top) break;
+            }
+            if (h < 10) h = 10;
             hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                              DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
             old = (HFONT)SelectObject(hdc, hf);
             SetTextColor(hdc, ThText());
-            InflateRect(&rc, -8, -4);
-            DrawTextW(hdc, txt, -1, &rc,
-                      DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+            /* DT_VCENTER 对多行文本无效，手动居中 */
+            dr = inner;
+            if (textH > 0 && textH < inner.bottom - inner.top)
+                dr.top += (inner.bottom - inner.top - textH) / 2;
+            DrawTextW(hdc, txt, -1, &dr,
+                      DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
             SelectObject(hdc, old);
             DeleteObject(hf);
+        }
+        if (g_barHoverX) {
+            /* 悬停时右上角画叉叉：关闭外挂字幕 */
+            RECT b = BarCloseRect(&rc);
+            HBRUSH br = CreateSolidBrush(ThPanel());
+            FillRect(hdc, &b, br);
+            DeleteObject(br);
+            {
+                HPEN pen = CreatePen(PS_SOLID, 2, ThText());
+                HGDIOBJ op = SelectObject(hdc, pen);
+                int s = 5;
+                MoveToEx(hdc, b.left + s, b.top + s, NULL);
+                LineTo(hdc, b.right - s, b.bottom - s);
+                MoveToEx(hdc, b.right - s, b.top + s, NULL);
+                LineTo(hdc, b.left + s, b.bottom - s);
+                SelectObject(hdc, op);
+                DeleteObject(pen);
+            }
         }
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_RBUTTONUP:
+        PauseResume();           /* 右键：暂停/继续 */
+        return 0;
     case WM_LBUTTONDOWN:
         SetCapture(hwnd);
         GetCursorPos(&g_barDragStart);
@@ -9261,6 +9447,29 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         g_barMoved = 0;
         return 0;
     case WM_MOUSEMOVE:
+        if (!(wParam & MK_LBUTTON)) {
+            POINT cur;
+            RECT rc, b;
+            int hov;
+            GetCursorPos(&cur);
+            ScreenToClient(hwnd, &cur);
+            GetClientRect(hwnd, &rc);
+            b = BarCloseRect(&rc);
+            hov = PtInRect(&b, cur) ? 1 : 0;
+            if (hov != g_barHoverX) {
+                g_barHoverX = hov;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            if (!g_barTracking) {
+                TRACKMOUSEEVENT tme;
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                tme.dwHoverTime = 0;
+                TrackMouseEvent(&tme);
+                g_barTracking = 1;
+            }
+        }
         if (wParam & MK_LBUTTON) {
             POINT cur;
             GetCursorPos(&cur);
@@ -9273,11 +9482,29 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         return 0;
-    case WM_LBUTTONUP:
-        ReleaseCapture();
-        if (!g_barMoved && g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount)
-            PlayerSeekToSec(g_subCues[g_subCurIdx].start);
+    case WM_MOUSELEAVE:
+        g_barTracking = 0;
+        if (g_barHoverX) { g_barHoverX = 0; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
+    case WM_LBUTTONUP: {
+        POINT cur;
+        RECT rc, b;
+        ReleaseCapture();
+        GetCursorPos(&cur);
+        ScreenToClient(hwnd, &cur);
+        GetClientRect(hwnd, &rc);
+        b = BarCloseRect(&rc);
+        if (!g_barMoved && PtInRect(&b, cur)) {
+            /* 点叉叉：关闭外挂字幕（等同关闭按钮） */
+            ShowWindow(hwnd, SW_HIDE);
+            g_subEnabled = 0;
+            if (g_btnSubOn) SetWindowTextW(g_btnSubOn, L"字幕关");
+        } else if (!g_barMoved && g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
+            PlayerSeekToSec(g_subCues[g_subCurIdx].start);
+        }
+        g_barHoverX = 0;
+        return 0;
+    }
     case WM_MOUSEWHEEL: {
         /* 滚轮切换上/下一条字幕并跳转 */
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -11720,7 +11947,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         g_editDesc = CreateWindowExW(0, L"EDIT", NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_VSCROLL |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
@@ -11733,9 +11960,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBON, NULL, NULL);
         g_listSub = CreateWindowExW(0, L"LISTBOX", NULL,
             WS_CHILD | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
-            WS_VSCROLL | LBS_HASSTRINGS | LBS_SHOWSELALWAYS,
+            WS_HSCROLL | LBS_HASSTRINGS | LBS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_SUB, NULL, NULL);
         SendMessageW(g_listSub, WM_SETFONT, (WPARAM)g_font, TRUE);
+        /* 横向滚动交给自绘条：原生横条只提供滚动范围/位置，隐藏不画 */
+        ShowScrollBar(g_listSub, SB_HORZ, FALSE);
 
         /* 剧集标题过滤框：即时过滤，空串=不过滤 */
         g_editFilter = CreateWindowExW(0, L"EDIT", NULL,
@@ -11747,6 +11976,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_vsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 0, IDC_SB_EP);
         g_hsEp   = CreateDarkScrollBar(hwnd, g_listEp,   1, 1, IDC_SB_EP_H);
         g_vsDesc = CreateDarkScrollBar(hwnd, g_editDesc, 2, 0, IDC_SB_DESC);
+        g_vsSub  = CreateDarkScrollBar(hwnd, g_listSub,  0, 0, IDC_SB_SUB);
+        g_hsSub  = CreateDarkScrollBar(hwnd, g_listSub,  0, 1, IDC_SB_SUB_H);
 
         /* 简介折叠按钮：悬停才显示，位置由 LayoutControls 每次布局写入 */
         g_btnDescTab = CreateWindowExW(0, DESC_TAB_CLASS, L"",
@@ -11876,6 +12107,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ti.lpszText = L"";
                 SendMessageW(g_hwndEpTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
                 ThemeTipSubclass(g_hwndEpTip);
+            }
+        }
+
+        /* 字幕列表 tracking tooltip：悬停显示该条字幕全文 */
+        {
+            TOOLINFOW ti;
+            g_hwndSubTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL,
+                WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                0, 0, 0, 0, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (g_hwndSubTip) {
+                SendMessageW(g_hwndSubTip, TTM_SETMAXTIPWIDTH, 0, 520);
+                ZeroMemory(&ti, sizeof(ti));
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_TRACK;
+                ti.hwnd = g_listSub;
+                ti.uId = (UINT_PTR)g_listSub;
+                ti.lpszText = L"";
+                SendMessageW(g_hwndSubTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+                ThemeTipSubclass(g_hwndSubTip);
             }
         }
 
