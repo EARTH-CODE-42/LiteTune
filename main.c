@@ -326,6 +326,7 @@ static int  g_posSec = 0, g_durSec = 0;  /* 500ms 定时器缓存的进度（秒
 static SubCue *g_subCues = NULL;     /* 当前剧集的字幕条目 */
 static int     g_subCueCount = 0;
 static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标，-1=无 */
+static int     g_subShownIdx = -1;   /* 外挂窗最后显示过的字幕下标（间隙时沿用） */
 static char   *g_subTransUrl = NULL; /* 当前加载字幕的 transcript URL（去重用） */
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
 static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕列表（按钮1） */
@@ -1510,7 +1511,6 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill,
 #define DSB_CLASS L"LiteTuneScrollBar"
 #define DESC_TAB_CLASS L"LiteTuneDescTab"
 #define SUBBAR_CLASS   L"LiteTuneSubBar"
-#define SUBBAR_FONT    20   /* 外挂字幕基准字号（放不下才缩小，不再随文本长短放大） */
 #define LOC_BTN_CLASS L"LiteTuneLocBtn"   /* 剧集列表右下角“定位正在播放”按钮 */
 /* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
 #define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
@@ -4772,6 +4772,7 @@ static void FreeSubCues(void)
     g_subCues = NULL;
     g_subCueCount = 0;
     g_subCurIdx = -1;
+    g_subShownIdx = -1;
 }
 
 /* 去掉 VTT 内联标记：<v SPEAKER_4>、<c.xxx>、<i>/<b>、<00:00:00.000> 之类 */
@@ -4952,17 +4953,15 @@ static void OnSubReady(SubRaw *sr)
     }
 }
 
-/* 根据播放秒数定位当前字幕下标；未命中返回 -1 */
+/* 根据播放秒数定位当前字幕下标；重叠时取最靠后的一条（新开始的字幕） */
 static int SubCueIndexAt(double sec)
 {
-    int i;
+    int i, best = -1;
     for (i = 0; i < g_subCueCount; i++) {
-        if (sec >= g_subCues[i].start && sec < g_subCues[i].end) return i;
+        if (sec >= g_subCues[i].start && sec < g_subCues[i].end)
+            best = i;
     }
-    /* 落在所有条目之后：返回最后一条（若已过其结束时间则由调用方决定） */
-    if (g_subCueCount > 0 && sec >= g_subCues[g_subCueCount - 1].end)
-        return -1;
-    return -1;
+    return best;
 }
 
 /* ================= 后台线程：加载 feeds ================= */
@@ -9337,6 +9336,7 @@ static void SubTick(double sec)
     int idx = SubCueIndexAt(sec);
     if (idx != g_subCurIdx) {
         g_subCurIdx = idx;
+        if (idx >= 0) g_subShownIdx = idx;
         if (g_listSub && IsWindowVisible(g_listSub) && idx >= 0) {
             HideSubTip();   /* 列表要滚动了，收掉停在旧行上的提示 */
             g_subNoSeek = 1;
@@ -9371,12 +9371,13 @@ static RECT BarCloseRect(const RECT *rc)
     return r;
 }
 
-/* 拿到要显示的字幕文本：优先当前条目，否则取下一条，否则空 */
+/* 拿到要显示的字幕文本：当前条目；字幕间隙时沿用上一条，不要跳回第一条 */
 static const wchar_t* SubBarText(void)
 {
     if (g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount)
         return g_subCues[g_subCurIdx].text;
-    if (g_subCueCount > 0) return g_subCues[0].text;
+    if (g_subShownIdx >= 0 && g_subShownIdx < g_subCueCount)
+        return g_subCues[g_subShownIdx].text;
     return NULL;
 }
 
@@ -9441,13 +9442,16 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             DeleteObject(br);
         }
         if (txt && txt[0]) {
-            /* 自动选能整段放下的最大字号：先按窗口高度估一个上限，
-             * 再逐步缩小到放得下（长句不再被截断）*/
-            int textH = 0;
+            /* 基准字号由窗口高度决定：默认正好装下 2 行，字号在不同句子间保持一致 */
+            int textH = 0, base, ly;
             RECT dr;
             inner = rc;
             InflateRect(&inner, -10, -6);
-            for (h = SUBBAR_FONT; h >= 11; h--) {
+            ly = inner.bottom - inner.top;
+            base = ly * 5 / 12;          /* ≈ 2.4 倍行高放两行 */
+            if (base < 11) base = 11;
+            if (base > 72) base = 72;
+            for (h = base; h >= 11; h--) {
                 RECT cr = inner;
                 hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                  DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
@@ -9573,7 +9577,7 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         idx += (delta > 0) ? -1 : 1;
         if (idx < 0) idx = 0;
         if (idx >= g_subCueCount) idx = g_subCueCount - 1;
-        if (idx >= 0) { g_subCurIdx = idx; PlayerSeekToSec(g_subCues[idx].start); InvalidateRect(hwnd, NULL, TRUE); }
+        if (idx >= 0) { g_subCurIdx = idx; g_subShownIdx = idx; PlayerSeekToSec(g_subCues[idx].start); InvalidateRect(hwnd, NULL, TRUE); }
         return 0;
     }
     case WM_CLOSE:
@@ -9601,7 +9605,7 @@ static void SubUpdateBar(void)
                 SUBBAR_CLASS, L"",
                 WS_POPUP | WS_THICKFRAME | WS_CLIPSIBLINGS,
                 sw - 360, sh - 180, 340, 90,
-                g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+                NULL, NULL, GetModuleHandleW(NULL), NULL);   /* 无属主：主窗口最小化不牵连字幕窗 */
             if (g_hwndSubBar) BarNoDwmBorder(g_hwndSubBar);
         }
         ShowWindow(g_hwndSubBar, SW_SHOWNA);
@@ -13818,9 +13822,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
      * 悬停：图标上方弹迷你控制浮窗；单击：主窗口显示/收进托盘；右键：播放/暂停 */
     case WM_TRAYICON:
         if (LOWORD(lParam) == WM_MOUSEMOVE) {
-            /* 只在主窗口收进托盘/最小化时弹浮窗，不打扰正在看的主界面 */
-            if ((!IsWindowVisible(hwnd) || IsIconic(hwnd)) &&
-                (!g_fly || !IsWindowVisible(g_fly))) {
+            /* 不管主窗口是否可见，鼠标移到托盘图标都弹浮窗 */
+            if (!g_fly || !IsWindowVisible(g_fly)) {
                 ShowFlyout();
                 SetTimer(hwnd, 7, 150, NULL);   /* 轮询光标是否已离开 */
             }
