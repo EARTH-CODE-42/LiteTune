@@ -334,6 +334,8 @@ static HWND    g_btnSubView = NULL;  /* 按钮1：简介/字幕切换 */
 static HWND    g_btnSubOn = NULL;    /* 按钮2：字幕开关 */
 static HWND    g_hwndSubBar = NULL;  /* 外挂置顶字幕窗口 */
 static int     g_subNoSeek = 0;      /* 程序式 LB_SETCURSEL 时置 1，跳过点击跳转 */
+static int     g_subTextW = 0;       /* 最长一条字幕的像素宽（横向滚动上限） */
+static int     g_subXOff = 0;        /* 字幕列表自绘横向偏移（像素，0=最左） */
 
 /* 续播记忆：退出时把 g_playUrl+位置写进 ini，下次启动 feeds 加载完自动续播 */
 static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径 */
@@ -1508,6 +1510,7 @@ static void DrawGlyph(HDC hdc, const RECT *rc, int kind, COLORREF col, int fill,
 #define DSB_CLASS L"LiteTuneScrollBar"
 #define DESC_TAB_CLASS L"LiteTuneDescTab"
 #define SUBBAR_CLASS   L"LiteTuneSubBar"
+#define SUBBAR_FONT    20   /* 外挂字幕基准字号（放不下才缩小，不再随文本长短放大） */
 #define LOC_BTN_CLASS L"LiteTuneLocBtn"   /* 剧集列表右下角“定位正在播放”按钮 */
 /* 滚动条宽度取系统值，确保完全遮盖系统滚动条 */
 #define DSB_W 10   /* 自绘滚动条窄宽度（系统条带由 NCCALCSIZE 并回客户区，互不干扰） */
@@ -1598,6 +1601,15 @@ static int DSB_QueryState(DarkScrollBar *dsb)
         dsb->pos = (int)SendMessageW(t, LVM_GETTOPINDEX, 0, 0);
         return count > per;
     }
+    if (dsb->kind == 0 && dsb->horizontal) {   /* 字幕列表：自绘横向偏移（像素） */
+        int cw = rc.right - rc.left;
+        if (cw <= 0) cw = 1;
+        dsb->min = 0;
+        dsb->max = g_subTextW > cw ? g_subTextW - cw : 0;
+        dsb->page = cw;
+        dsb->pos = g_subXOff;
+        return dsb->max > dsb->min;
+    }
     /* ListView 横向：控件维护的像素滚动信息。
      * GetScrollInfo 的 nMax 是内容总宽（不是最后滚动位置），
      * 要换算成与纵向一致的口径：max=最后有效滚动位置，
@@ -1637,10 +1649,14 @@ static void DSB_ScrollTarget(DarkScrollBar *dsb, int delta)
     HWND t = dsb->target;
     if (!t || !delta) return;
     if (dsb->kind == 0) {
-        if (dsb->horizontal)
-            SendMessageW(t, WM_HSCROLL,
-                         MAKEWPARAM(SB_THUMBPOSITION, dsb->pos + delta), 0);
-        else
+        if (dsb->horizontal) {
+            /* 字幕列表：不依赖控件原生横条，自己维护像素偏移重绘 */
+            int x = dsb->pos + delta;
+            if (x < 0) x = 0;
+            if (x > dsb->max) x = dsb->max;
+            g_subXOff = x;
+            InvalidateRect(t, NULL, FALSE);
+        } else
             SendMessageW(t, LB_SETTOPINDEX, dsb->pos + delta, 0);
     } else if (dsb->kind == 2) {
         SendMessageW(t, EM_LINESCROLL, 0, (LPARAM)delta);
@@ -1889,7 +1905,8 @@ static void SyncScrollBar(HWND hbar)
  * 简介关闭后若还调它，会把条弹回旧位置，屏幕上就像留了一条残影 */
 static void SyncDescScrollBar(void)
 {
-    if (!g_descHidden) SyncScrollBar(g_vsDesc);
+    /* 字幕列表模式下简介控件是隐藏的，绝不能把它的滚条弹出来盖在字幕条上 */
+    if (!g_descHidden && !g_subInDesc) SyncScrollBar(g_vsDesc);
 }
 
 /* 暗色表头自绘（WM_DRAWITEM/ODT_HEADER 由表头的父窗口 ListView 接收） */
@@ -9197,10 +9214,14 @@ static void LayoutControls(HWND hwnd)
                 if (g_vsSub) {
                     MoveWindow(g_vsSub, x + w3 - 2 - sbw, contY, sbw, contH - sbh, TRUE);
                     ShowWindow(g_vsSub, SW_SHOWNA); SyncScrollBar(g_vsSub);
+                    SetWindowPos(g_vsSub, HWND_TOP, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
                 if (g_hsSub) {
                     MoveWindow(g_hsSub, x + 2, by + bh - 2 - sbh, w3 - sbw - 4, sbh, TRUE);
                     ShowWindow(g_hsSub, SW_SHOWNA); SyncScrollBar(g_hsSub);
+                    SetWindowPos(g_hsSub, HWND_TOP, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             } else {
                 /* 简介模式 */
@@ -9211,6 +9232,9 @@ static void LayoutControls(HWND hwnd)
                 if (g_vsDesc) {
                     MoveWindow(g_vsDesc, x + w3 - 2 - sbw, contY, sbw, contH, TRUE);
                     ShowWindow(g_vsDesc, SW_SHOWNA);
+                    SyncScrollBar(g_vsDesc);
+                    SetWindowPos(g_vsDesc, HWND_TOP, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
                 ShowWindow(g_editDesc, SW_SHOWNA);
             }
@@ -9272,10 +9296,22 @@ static void SubRefreshUI(void)
             if (oldf) SelectObject(dc, oldf);
             ReleaseDC(g_listSub, dc);
         }
-        /* 横向滚动范围按最长一条字幕的像素宽设置，原生横条隐藏只用自绘条 */
-        SendMessageW(g_listSub, LB_SETHORIZONTALEXTENT, maxW + 12, 0);
-        ShowScrollBar(g_listSub, SB_HORZ, FALSE);
-        SendMessageW(g_listSub, WM_HSCROLL, MAKEWPARAM(SB_LEFT, 0), 0);
+        /* 横向滚动：只改自绘偏移重绘，不用控件原生横条（那会重影/乱码） */
+        g_subTextW = maxW;
+        g_subXOff = 0;
+        {
+            HDC mdc = GetDC(g_listSub);
+            if (mdc) {
+                HFONT f = (HFONT)SendMessageW(g_listSub, WM_GETFONT, 0, 0);
+                HGDIOBJ of = SelectObject(mdc, f ? f : GetStockObject(DEFAULT_GUI_FONT));
+                TEXTMETRICW tm;
+                if (GetTextMetricsW(mdc, &tm))
+                    SendMessageW(g_listSub, LB_SETITEMHEIGHT, 0,
+                                 (WPARAM)(tm.tmHeight + 6));
+                SelectObject(mdc, of);
+                ReleaseDC(g_listSub, mdc);
+            }
+        }
         if (g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
             g_subNoSeek = 1;
             SendMessageW(g_listSub, LB_SETCURSEL, (WPARAM)g_subCurIdx, 0);
@@ -9286,6 +9322,7 @@ static void SubRefreshUI(void)
             SyncScrollBar(g_vsSub);
             SyncScrollBar(g_hsSub);
         }
+        InvalidateRect(g_listSub, NULL, TRUE);
     }
     if (g_btnSubView)
         SetWindowTextW(g_btnSubView, g_subInDesc ? L"简介" : L"字幕");
@@ -9343,11 +9380,34 @@ static const wchar_t* SubBarText(void)
     return NULL;
 }
 
+/* 去掉 Win11 给顶层窗口自动描的 1px 边框（点击/失焦时会出现白边） */
+static void BarNoDwmBorder(HWND h)
+{
+    typedef HRESULT (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+    HMODULE m = LoadLibraryW(L"dwmapi.dll");
+    if (!m) return;
+    {
+        PFN_DwmSetWindowAttribute f =
+            (PFN_DwmSetWindowAttribute)GetProcAddress(m, "DwmSetWindowAttribute");
+        if (f) {
+            DWORD round = 1;            /* DWMWCP_DONOTROUND */
+            DWORD none  = 0xFFFFFFFE;   /* DWMWA_COLOR_NONE */
+            f(h, 33, &round, sizeof(round));   /* DWMWA_WINDOW_CORNER_PREFERENCE */
+            f(h, 34, &none,  sizeof(none));    /* DWMWA_BORDER_COLOR */
+        }
+    }
+    FreeLibrary(m);
+}
+
 static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;   /* 背景在 WM_PAINT 里铺，拖动该窗口不闪 */
+    case WM_NCACTIVATE:
+        return TRUE;   /* 不画激活/失焦边框（右侧截图的白边） */
+    case WM_NCPAINT:
+        return 0;      /* 无边框可画，避免系统补画 1px 描边 */
     case WM_NCCALCSIZE:
         /* 客户区铺满整个窗口：去掉 WS_THICKFRAME 画出的系统边框
          * （暗色下是顶端那条白条），缩放仍在 WM_NCHITTEST 里自己做 */
@@ -9387,7 +9447,7 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             RECT dr;
             inner = rc;
             InflateRect(&inner, -10, -6);
-            for (h = 28; h >= 10; h -= 2) {
+            for (h = SUBBAR_FONT; h >= 11; h--) {
                 RECT cr = inner;
                 hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                  DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
@@ -9398,7 +9458,7 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 textH = cr.bottom - cr.top;
                 if (textH <= inner.bottom - inner.top) break;
             }
-            if (h < 10) h = 10;
+            if (h < 11) h = 11;
             hf = CreateFontW(-h, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                              DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Microsoft YaHei UI");
             old = (HFONT)SelectObject(hdc, hf);
@@ -9542,6 +9602,7 @@ static void SubUpdateBar(void)
                 WS_POPUP | WS_THICKFRAME | WS_CLIPSIBLINGS,
                 sw - 360, sh - 180, 340, 90,
                 g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (g_hwndSubBar) BarNoDwmBorder(g_hwndSubBar);
         }
         ShowWindow(g_hwndSubBar, SW_SHOWNA);
         InvalidateRect(g_hwndSubBar, NULL, TRUE);
@@ -11960,11 +12021,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBON, NULL, NULL);
         g_listSub = CreateWindowExW(0, L"LISTBOX", NULL,
             WS_CHILD | WS_CLIPSIBLINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
-            WS_HSCROLL | LBS_HASSTRINGS | LBS_SHOWSELALWAYS,
+            LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_SHOWSELALWAYS,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_SUB, NULL, NULL);
         SendMessageW(g_listSub, WM_SETFONT, (WPARAM)g_font, TRUE);
-        /* 横向滚动交给自绘条：原生横条只提供滚动范围/位置，隐藏不画 */
-        ShowScrollBar(g_listSub, SB_HORZ, FALSE);
 
         /* 剧集标题过滤框：即时过滤，空串=不过滤 */
         g_editFilter = CreateWindowExW(0, L"EDIT", NULL,
@@ -12155,6 +12214,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             mi->itemHeight = 54;
             return TRUE;
         }
+        if (mi->CtlID == IDC_LIST_SUB) {
+            /* 字幕行高跟随界面字号（换字号后 SubRefreshUI 还会再设一次） */
+            HDC dc = GetDC(hwnd);
+            int ih = 18;
+            if (dc) {
+                HGDIOBJ of = SelectObject(dc, g_font);
+                TEXTMETRICW tm;
+                if (GetTextMetricsW(dc, &tm) && tm.tmHeight > 0)
+                    ih = tm.tmHeight + 6;
+                SelectObject(dc, of);
+                ReleaseDC(hwnd, dc);
+            }
+            mi->itemHeight = ih;
+            return TRUE;
+        }
         break;
     }
 
@@ -12244,6 +12318,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int on, kind = IconKindOf(di->CtlID, &on);
             if (kind >= 0) { DrawIconButton(di, kind, on); return TRUE; }
             break;
+        }
+        /* 字幕列表（owner-draw）：整行自绘，横向偏移由自绘条控制 */
+        if (di->CtlID == IDC_LIST_SUB && di->itemID != (UINT)-1) {
+            int idx = (int)di->itemID;
+            wchar_t *txt = (idx >= 0 && idx < g_subCueCount)
+                         ? SubFlatten(g_subCues[idx].text) : NULL;
+            RECT rc = di->rcItem, tr;
+            HGDIOBJ oldf;
+            FillRectColor(di->hDC, &rc,
+                (di->itemState & ODS_SELECTED) ? ThSel() : ThPanel());
+            if (txt) {
+                tr = rc;
+                tr.left += 6 - g_subXOff;
+                tr.right = tr.left + g_subTextW + 10;
+                SetBkMode(di->hDC, TRANSPARENT);
+                SetTextColor(di->hDC, ThText());
+                oldf = SelectObject(di->hDC, g_font);
+                DrawTextW(di->hDC, txt, -1, &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(di->hDC, oldf);
+                free(txt);
+            }
+            return TRUE;
         }
         if (di->CtlID != IDC_LIST_POD || di->itemID == (UINT)-1) break;
         if ((int)di->itemID > g_podCount) break;
