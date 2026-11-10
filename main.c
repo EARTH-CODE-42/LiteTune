@@ -174,7 +174,7 @@ enum {
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
     IDC_SB_SUB, IDC_SB_SUB_H,
     IDC_TAB_DESC,
-    IDC_BTN_SUBVIEW, IDC_BTN_SUBON, IDC_LIST_SUB
+    IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_LIST_SUB
 };
 
 /* ================= 全局状态 ================= */
@@ -331,12 +331,14 @@ static char   *g_subTransUrl = NULL; /* 当前加载字幕的 transcript URL（�
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
 static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕列表（按钮1） */
 static HWND    g_listSub = NULL;     /* 简介区字幕列表 */
-static HWND    g_btnSubView = NULL;  /* 按钮1：简介/字幕切换 */
-static HWND    g_btnSubOn = NULL;    /* 按钮2：字幕开关 */
+static HWND    g_btnSubView = NULL;  /* tab1：简介 */
+static HWND    g_btnSubTab = NULL;   /* tab2：字幕列表 */
+static HWND    g_btnSubOn = NULL;    /* 按钮：字幕开关 */
 static HWND    g_hwndSubBar = NULL;  /* 外挂置顶字幕窗口 */
 static int     g_subNoSeek = 0;      /* 程序式 LB_SETCURSEL 时置 1，跳过点击跳转 */
 static int     g_subTextW = 0;       /* 最长一条字幕的像素宽（横向滚动上限） */
 static int     g_subXOff = 0;        /* 字幕列表自绘横向偏移（像素，0=最左） */
+static DWORD   g_subSeekTick = 0;    /* 上次手动跳转字幕的时刻，避开 seek 未生效时的旧位置 */
 
 /* 续播记忆：退出时把 g_playUrl+位置写进 ini，下次启动 feeds 加载完自动续播 */
 static wchar_t  *g_resumeUrl = NULL;      /* 待续播的剧集 URL/本地路径 */
@@ -499,6 +501,7 @@ enum {
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_TB_EXIT, TR_M_REFRESH_NOW,
     TR_CTX_SET_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
+    TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_N
 };
 
@@ -570,7 +573,7 @@ static const wchar_t *tr(int id)
             L"另外，手机要连页面上标注 WiFi/以太网 的地址；复制到别的电脑运行时，"
             L"那台电脑也会重新询问一次防火墙权限。",
         L"倍速已切换",
-        L"只显示已缓存（右键多选可批量下载）",
+        L"只显示已缓存",
         L"批量缓存 %d/%d…", L"批量缓存完成（成功 %d/%d 集）",
         L"请先选择要缓存的剧集（Ctrl+点击）", L"批量缓存进行中",
         L"批量缓存完成（成功 %d/%d 集，超上限部分未缓存）",
@@ -617,7 +620,8 @@ static const wchar_t *tr(int id)
         L"手动填写字幕地址...", L"字幕地址",
         L"输入该集字幕地址（VTT/SRT），留空则清除：",
         L"字幕地址已保存",
-        L"地址无效，需以 http:// 或 https:// 开头"
+        L"地址无效，需以 http:// 或 https:// 开头",
+        L"简介", L"字幕", L"字幕开", L"字幕关"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -695,7 +699,7 @@ static const wchar_t *tr(int id)
             L"Copying the program to another PC means that PC will ask for "
             L"firewall permission again.",
         L"Playback speed changed",
-        L"Show cached only (right-click to batch download)",
+        L"Show cached only",
         L"Batch caching %d/%d...", L"Batch cache done (%d/%d ok)",
         L"Select episodes first (Ctrl+click)", L"Batch cache in progress",
         L"Batch cache done (%d/%d ok, rest over limit skipped)",
@@ -751,7 +755,8 @@ static const wchar_t *tr(int id)
         L"Set Transcript URL...", L"Transcript URL",
         L"Enter a VTT/SRT URL for this episode (leave empty to clear):",
         L"Transcript URL saved",
-        L"Invalid URL. It must start with http:// or https://"
+        L"Invalid URL. It must start with http:// or https://",
+        L"Notes", L"Subs", L"Subs on", L"Subs off"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -5677,17 +5682,41 @@ static int EpisodeBatchQueued(int ep)
 }
 
 /* ================= 音频信息探测 ================= */
+/* 最近一次探测到的格式参数：切语言时据此重拼显示串（声道名是翻译过的） */
+static const wchar_t *g_fmtName = L"";   /* MP3/AAC/...，空=未知（用“音频”） */
+static UINT      g_fmtRate = 0, g_fmtKbps = 0, g_fmtCh = 0;
+static int       g_fmtValid = 0;
+
+static void FormatInfoText(wchar_t *out, int max)
+{
+    const wchar_t *nm;
+    if (!out || max <= 0) return;
+    if (!g_fmtValid) { out[0] = 0; return; }
+    nm = *g_fmtName ? g_fmtName : tr(TR_AUDIO);
+    if (g_fmtRate > 0) {
+        const wchar_t *chName = g_fmtCh == 1 ? tr(TR_MONO)
+                             : (g_fmtCh == 2 ? tr(TR_STEREO) : tr(TR_MULTICH));
+        if (g_fmtKbps > 0)
+            swprintf(out, max, L"%ls|%dkbps|%uHz|%ls", nm, g_fmtKbps, g_fmtRate, chName);
+        else
+            swprintf(out, max, L"%ls|%uHz|%ls", nm, g_fmtRate, chName);
+    } else {
+        wcscpy_s(out, max, nm);
+    }
+}
+
 static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax, long long *outDur100ns)
 {
     IMFSourceReader *reader = NULL;
     IMFMediaType *mt = NULL;
     UINT32 rate = 0, ch = 0, avgBps = 0;
     GUID subtype;
-    const wchar_t *fmtName = tr(TR_AUDIO);
+    const wchar_t *fmtName = L"";
     HRESULT hr;
 
     *outDur100ns = 0;
     wcscpy_s(out, outMax, L"");
+    g_fmtValid = 0;
     hr = MFCreateSourceReaderFromURL(path, NULL, &reader);
     if (FAILED(hr) || !reader) return;
 
@@ -5719,16 +5748,12 @@ static void ProbeAudio(const wchar_t *path, wchar_t *out, int outMax, long long 
     }
     reader->lpVtbl->Release(reader);
 
-    if (rate > 0) {
-        int kbps = avgBps > 0 ? (int)(avgBps * 8 / 1000) : 0;
-        const wchar_t *chName = ch == 1 ? tr(TR_MONO) : (ch == 2 ? tr(TR_STEREO) : tr(TR_MULTICH));
-        if (kbps > 0)
-            swprintf(out, outMax, L"%ls|%dkbps|%uHz|%ls", fmtName, kbps, rate, chName);
-        else
-            swprintf(out, outMax, L"%ls|%uHz|%ls", fmtName, rate, chName);
-    } else {
-        wcscpy_s(out, outMax, fmtName);
-    }
+    g_fmtName = fmtName;
+    g_fmtRate = rate;
+    g_fmtKbps = avgBps > 0 ? (int)(avgBps * 8 / 1000) : 0;
+    g_fmtCh = ch;
+    g_fmtValid = 1;
+    FormatInfoText(out, outMax);
 }
 
 /* 读一个字符串型属性，返回新分配的宽字符串（调用方 free），无则 NULL */
@@ -5847,6 +5872,7 @@ static void PlayerStop(void)
     SetWindowTextW(g_stTime, L"00:00 / 00:00");
     SendMessageW(g_sldSeek, TBM_SETPOS, TRUE, 0);
     if (g_stFormat) SetWindowTextW(g_stFormat, L"");
+    g_fmtValid = 0;
     if (g_listEp) InvalidateRect(g_listEp, NULL, TRUE);      /* 剧集颜色复位 */
     UpdateThumbbarPlayPause();
     UpdateWindowTitle();
@@ -9201,6 +9227,7 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_editDesc, SW_HIDE);
             ShowWindow(g_listSub, SW_HIDE);
             ShowWindow(g_btnSubView, SW_HIDE);
+            ShowWindow(g_btnSubTab, SW_HIDE);
             ShowWindow(g_btnSubOn, SW_HIDE);
             if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
             if (g_vsSub) ShowWindow(g_vsSub, SW_HIDE);
@@ -9208,13 +9235,16 @@ static void LayoutControls(HWND hwnd)
         } else {
             int contY = by + 30;
             int contH = bh - 32;
-            int btnW = (w3 - 6) / 2;
-            /* 内容框顶边与另两列对齐（同为 by+28），两按钮放在工具栏基线 */
+            int inner = w3 - 4;
+            int tabW = (inner - 4) / 3;      /* 「简介」「字幕」两个 tab 等宽，余下给开关 */
+            /* 内容框顶边与另两列对齐（同为 by+28），按钮行放在工具栏基线 */
             g_rcPanel[2].left = x;           g_rcPanel[2].top = by + 28;
             g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
-            MoveWindow(g_btnSubView, x + 2, by, btnW, 24, TRUE);
-            MoveWindow(g_btnSubOn, x + 4 + btnW, by, w3 - btnW - 6, 24, TRUE);
+            MoveWindow(g_btnSubView, x + 2, by, tabW, 24, TRUE);
+            MoveWindow(g_btnSubTab,  x + 4 + tabW, by, tabW, 24, TRUE);
+            MoveWindow(g_btnSubOn,   x + 6 + tabW * 2, by, x + w3 - 2 - (x + 6 + tabW * 2), 24, TRUE);
             ShowWindow(g_btnSubView, SW_SHOWNA);
+            ShowWindow(g_btnSubTab, SW_SHOWNA);
             ShowWindow(g_btnSubOn, SW_SHOWNA);
             if (g_subInDesc) {
                 /* 字幕列表模式：纵/横自绘条，原生横条已隐藏 */
@@ -9335,16 +9365,27 @@ static void SubRefreshUI(void)
         }
         InvalidateRect(g_listSub, NULL, TRUE);
     }
-    if (g_btnSubView)
-        SetWindowTextW(g_btnSubView, g_subInDesc ? L"简介" : L"字幕");
-    if (g_btnSubOn)
-        SetWindowTextW(g_btnSubOn, g_subEnabled ? L"字幕开" : L"字幕关");
+    if (g_btnSubView) {
+        SetWindowTextW(g_btnSubView, tr(TR_SUB_VIEW_DESC));
+        InvalidateRect(g_btnSubView, NULL, TRUE);   /* tab 高亮只在自绘里，需重画 */
+    }
+    if (g_btnSubTab) {
+        SetWindowTextW(g_btnSubTab, tr(TR_SUB_VIEW_LIST));
+        InvalidateRect(g_btnSubTab, NULL, TRUE);
+    }
+    if (g_btnSubOn) {
+        SetWindowTextW(g_btnSubOn, tr(g_subEnabled ? TR_SUB_ON : TR_SUB_OFF));
+        InvalidateRect(g_btnSubOn, NULL, TRUE);
+    }
     SubUpdateBar();
 }
 
 /* 播放进度联动：根据当前秒数更新高亮字幕（由 500ms 定时器调用） */
 static void SubTick(double sec)
 {
+    /* 刚手动跳到某条字幕时，播放器位置可能还是旧值（seek 异步生效），
+     * 此时若按位置重算，会把 g_subCurIdx 拉回旧条目，导致下一次滚轮从错位置起算 */
+    if (GetTickCount() - g_subSeekTick < 700) return;
     int idx = SubCueIndexAt(sec);
     if (idx != g_subCurIdx) {
         g_subCurIdx = idx;
@@ -9365,6 +9406,8 @@ static void SubTick(double sec)
 static void SubListSeek(int idx)
 {
     if (idx < 0 || idx >= g_subCueCount) return;
+    g_subShownIdx = idx;
+    g_subSeekTick = GetTickCount();
     PlayerSeekToSec(g_subCues[idx].start);
 }
 
@@ -9574,7 +9617,7 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             /* 点叉叉：关闭外挂字幕（等同关闭按钮） */
             ShowWindow(hwnd, SW_HIDE);
             g_subEnabled = 0;
-            if (g_btnSubOn) SetWindowTextW(g_btnSubOn, L"字幕关");
+            if (g_btnSubOn) SetWindowTextW(g_btnSubOn, tr(TR_SUB_OFF));
         } else if (!g_barMoved && g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
             PlayerSeekToSec(g_subCues[g_subCurIdx].start);
         }
@@ -9582,21 +9625,27 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
     case WM_MOUSEWHEEL: {
-        /* 滚轮切换上/下一条字幕并跳转 */
+        /* 滚轮切换上/下一条字幕并跳转。
+         * 锚点用“上次显示的那条”：两条字幕之间的空隙里 g_subCurIdx 是 -1，
+         * 若按 0 起算，上滚会把 idx 夹到 0 而 seek 到第 1 条（通常是 00:00），
+         * 表现为莫名跳回音频开头。 */
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        int idx = g_subCurIdx;
-        if (idx < 0) idx = 0;
+        int idx = g_subCurIdx >= 0 ? g_subCurIdx : g_subShownIdx;
+        if (idx < 0 || idx >= g_subCueCount) return 0;
         idx += (delta > 0) ? -1 : 1;
         if (idx < 0) idx = 0;
         if (idx >= g_subCueCount) idx = g_subCueCount - 1;
-        if (idx >= 0) { g_subCurIdx = idx; g_subShownIdx = idx; PlayerSeekToSec(g_subCues[idx].start); InvalidateRect(hwnd, NULL, TRUE); }
+        g_subCurIdx = idx; g_subShownIdx = idx;
+        g_subSeekTick = GetTickCount();
+        PlayerSeekToSec(g_subCues[idx].start);
+        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
     case WM_CLOSE:
         /* 关闭即隐藏（保留位置/尺寸），并同步字幕开关状态 */
         ShowWindow(hwnd, SW_HIDE);
         g_subEnabled = 0;
-        if (g_btnSubOn) SetWindowTextW(g_btnSubOn, L"字幕关");
+        if (g_btnSubOn) SetWindowTextW(g_btnSubOn, tr(TR_SUB_OFF));
         return 0;
     case WM_DESTROY:
         if (g_hwndSubBar == hwnd) g_hwndSubBar = NULL;
@@ -10468,6 +10517,18 @@ static void ApplyLanguage(void)
     UpdateTipText(g_btnPhone,    tr(TR_TIP_PHONE));
     UpdateThumbbarLanguage();
     UpdateWindowTitle();
+
+    /* 格式串（含“立体”等声道名）是探测时拼好的，切语言要重拼 */
+    if (g_stFormat) {
+        wchar_t fi[128];
+        FormatInfoText(fi, 128);
+        SetWindowTextW(g_stFormat, fi);
+    }
+    /* 简介/字幕 tab 与开关文案 */
+    if (g_btnSubView) SetWindowTextW(g_btnSubView, tr(TR_SUB_VIEW_DESC));
+    if (g_btnSubTab)  SetWindowTextW(g_btnSubTab,  tr(TR_SUB_VIEW_LIST));
+    if (g_btnSubOn)
+        SetWindowTextW(g_btnSubOn, tr(g_subEnabled ? TR_SUB_ON : TR_SUB_OFF));
 
     /* 状态行：下载中不打断；播放中重拼“正在播放”，其余回到就绪 */
     if (!g_downloading) {
@@ -12028,11 +12089,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
-        /* 字幕：简介区顶部两按钮（简介/字幕切换、字幕开关）+ 字幕列表 */
-        g_btnSubView = CreateWindowExW(0, L"BUTTON", L"字幕",
+        /* 字幕：简介区顶部三按钮（简介 tab / 字幕 tab / 字幕开关）+ 字幕列表 */
+        g_btnSubView = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_VIEW_DESC),
             WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBVIEW, NULL, NULL);
-        g_btnSubOn = CreateWindowExW(0, L"BUTTON", L"字幕开",
+        g_btnSubTab = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_VIEW_LIST),
+            WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBTAB, NULL, NULL);
+        g_btnSubOn = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_ON),
             WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBON, NULL, NULL);
         g_listSub = CreateWindowExW(0, L"LISTBOX", NULL,
@@ -12092,6 +12156,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_editFilter);
         SubclassForFontWheel(g_btnFavOnly);
         SubclassForFontWheel(g_btnSubView);
+        SubclassForFontWheel(g_btnSubTab);
         SubclassForFontWheel(g_btnSubOn);
         SubclassForFontWheel(g_listSub);
 
@@ -12255,20 +12320,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (di->CtlType == ODT_BUTTON) {
-            /* 字幕按钮：简介/字幕 切换、字幕开关（自绘以适配暗色） */
-            if (di->CtlID == IDC_BTN_SUBVIEW || di->CtlID == IDC_BTN_SUBON) {
+            /* 字幕三个按钮：「简介」「字幕」两个 tab + 字幕开关（自绘以适配暗色） */
+            if (di->CtlID == IDC_BTN_SUBVIEW || di->CtlID == IDC_BTN_SUBTAB ||
+                di->CtlID == IDC_BTN_SUBON) {
                 RECT rc = di->rcItem;
                 wchar_t txt[32];
                 HFONT oldf;
-                int on = (di->CtlID == IDC_BTN_SUBON) ? g_subEnabled : g_subInDesc;
-                FillRectColor(di->hDC, &rc, ThPanel());
-                if (di->itemState & ODS_SELECTED)
-                    DrawEdge(di->hDC, &rc, EDGE_SUNKEN, BF_RECT);
-                else
-                    DrawEdge(di->hDC, &rc, EDGE_RAISED, BF_RECT);
+                int pressed = (di->itemState & ODS_SELECTED) != 0;
+                int on = (di->CtlID == IDC_BTN_SUBON) ? g_subEnabled
+                       : (di->CtlID == IDC_BTN_SUBTAB ? g_subInDesc : !g_subInDesc);
+                int active = pressed || on;   /* 鼠标按下 OR 逻辑激活 → sunken */
+                FillRectColor(di->hDC, &rc, active ? ThBtnPressed() : ThPanel());
+                DrawEdge(di->hDC, &rc, active ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
                 GetWindowTextW(di->hwndItem, txt, 32);
                 SetBkMode(di->hDC, TRANSPARENT);
-                SetTextColor(di->hDC, on ? ThAccent() : ThText());
+                SetTextColor(di->hDC, ThText());
                 oldf = (HFONT)SelectObject(di->hDC, g_font);
                 DrawTextW(di->hDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(di->hDC, oldf);
@@ -13185,11 +13251,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 FillEpisodeList();
                 SyncScrollBar(g_vsEp);
             }
-            else if (id == IDC_BTN_SUBVIEW) {
-                /* 简介/字幕 切换 */
-                g_subInDesc = !g_subInDesc;
-                LayoutControls(g_hwnd);
-                SubRefreshUI();
+            else if (id == IDC_BTN_SUBVIEW || id == IDC_BTN_SUBTAB) {
+                /* 「简介」「字幕」两个 tab */
+                int want = (id == IDC_BTN_SUBTAB);
+                if (g_subInDesc != want) {
+                    g_subInDesc = want;
+                    LayoutControls(g_hwnd);
+                    SubRefreshUI();
+                }
             }
             else if (id == IDC_BTN_SUBON) {
                 /* 字幕开关：控制外挂窗显隐 */
