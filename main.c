@@ -7640,6 +7640,24 @@ static void RefreshSinglePodcast(int i)
     EnqueueRefreshUrl(g_pods[i].feedUrl);
 }
 
+/* 删除某集的字幕缓存 trans_<hash>.vtt。哈希按生效的字幕地址算（手动覆盖优先）；
+ * 离线视图的本地文件没有字幕缓存，直接跳过 */
+static void DropEpTranscript(const Episode *e)
+{
+    char *u8;
+    const char *t;
+    wchar_t path[MAX_PATH];
+    if (!e || e->localFile || !e->url) return;
+    u8 = WToU8(e->url);
+    if (!u8) return;
+    t = SubOvFind(LastEpHash(u8));
+    free(u8);
+    if (!t) t = e->transcriptUrl;
+    if (!t) return;
+    UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
+    DeleteFileW(path);
+}
+
 /* 删除某播客全部已缓存的音频文件 */
 static void DeletePodcastCache(int i)
 {
@@ -7651,6 +7669,7 @@ static void DeletePodcastCache(int i)
             wchar_t path[MAX_PATH];
             CachePathFor(e->url, path, MAX_PATH);
             DeleteFileW(path);
+            DropEpTranscript(e);
         }
     }
     RefreshCachedEntry();
@@ -7677,6 +7696,7 @@ static void DeleteEpisodeCache(int pod, int ep)
             wchar_t path[MAX_PATH];
             CachePathFor(e->url, path, MAX_PATH);
             DeleteFileW(path);
+            DropEpTranscript(e);
         }
     }
     RefreshCachedEntry();
@@ -7693,7 +7713,7 @@ static void OpenCacheFolder(void)
     ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
-/* 右键"已缓存"行 → 清空全部缓存 mp3 */
+/* 右键"已缓存"行 → 清空全部缓存（mp3 + 字幕 vtt） */
 static void DeleteAllCacheFiles(void)
 {
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
@@ -7706,6 +7726,19 @@ static void DeleteAllCacheFiles(void)
         do {
             wchar_t full[MAX_PATH];
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+            DeleteFileW(full);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    /* 字幕缓存一并清掉：只删符合命名规则的 trans_<8hex>.vtt，不碰目录里其它 vtt */
+    swprintf(pat, MAX_PATH, L"%lstrans_*.vtt", cdir);
+    h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t full[MAX_PATH];
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!IsCacheFileName(fd.cFileName, L"trans_", L"vtt")) continue;
             swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
             DeleteFileW(full);
         } while (FindNextFileW(h, &fd));
@@ -10334,17 +10367,17 @@ static int CountCacheFiles(const wchar_t *dir)
     return n;
 }
 
-/* 新旧缓存目录是否存在同名缓存文件（.mp3/.img/.xml/.hdr 都查）：
+/* 新旧缓存目录是否存在同名缓存文件（.mp3/.img/.xml/.hdr/.vtt 都查）：
  * 有同名就拒绝切换，防止移动或后续下载覆盖目标文件夹里的文件。
  * 目标里只有不同名文件（比如以前的封面/feed 缓存）则放行。 */
 static int CacheDirHasConflict(const wchar_t *oldDir, const wchar_t *newDir)
 {
-    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr" };
+    static const wchar_t *exts[] = { L"mp3", L"img", L"xml", L"hdr", L"vtt" };
     wchar_t pat[MAX_PATH], dst[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int i;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -13115,6 +13148,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     } else {
                         CachePathFor(de->url, path, MAX_PATH);
                         if (DeleteFileW(path)) done++;
+                        DropEpTranscript(de);
                     }
                 }
                 RefreshCachedEntry();
