@@ -2,10 +2,10 @@
 
 [English](README.md) | 简体中文
 
-**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 296 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
+**极简、绿色便携的 RSS 播客播放器** —— 纯 C 语言 + 原生 Win32 API，单个 32 位可执行文件（约 300 KB），Win7–Win11 32/64 位通用。无需安装、不依赖任何第三方 DLL，不写注册表，删除 exe 即完全卸载。
 
-![version](https://img.shields.io/badge/Version-1.6.0-blue)
-![size](https://img.shields.io/badge/Size-296%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.7.0-blue)
+![size](https://img.shields.io/badge/Size-300%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -23,7 +23,7 @@
 ![clean](https://img.shields.io/badge/Cache-auto%20clean-4B0082)
 ![resume](https://img.shields.io/badge/Playback-resume-blueviolet)
 ![remote](https://img.shields.io/badge/Control-phone%20web-red)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/LiteTune)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 
 [![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)

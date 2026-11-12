@@ -2,10 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
-**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (about 296 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
+**Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (~300 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![version](https://img.shields.io/badge/Version-1.6.0-blue)
-![size](https://img.shields.io/badge/Size-296%20KB-brightgreen)
+![version](https://img.shields.io/badge/Version-1.7.0-blue)
+![size](https://img.shields.io/badge/Size-300%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
 ![platform](https://img.shields.io/badge/Platform-Win%207--11%2032%2F64-0078D6)
@@ -23,7 +23,7 @@ English | [简体中文](README.zh-CN.md)
 ![clean](https://img.shields.io/badge/Cache-auto%20clean-4B0082)
 ![resume](https://img.shields.io/badge/Playback-resume-blueviolet)
 ![remote](https://img.shields.io/badge/Control-phone%20web-red)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/LiteTune)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EARTH-CODE-42/win32-podcast)
 [![LiteTune on AlternativeTo](https://alternativeto.net/static/badges/badge-compact-dark.svg)](https://alternativeto.net/software/litetune/about/?utm_source=badge&utm_medium=referral)
 [![SourceForge Downloads](https://img.shields.io/sourceforge/dt/litetune.svg?style=for-the-badge&label=SourceForge%20Downloads&color=FF6600)](https://sourceforge.net/projects/litetune/)
 
