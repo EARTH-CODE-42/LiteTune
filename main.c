@@ -290,6 +290,8 @@ static int      g_w2perm = 383;          /* 剧集列宽，千分比 */
 static int      g_volume = 80;           /* 音量 0-100 */
 static int      g_winW = 480, g_winH = 360;  /* 窗口外框尺寸（含标题栏边框），用于保存/恢复 */
 static int      g_winX = CW_USEDEFAULT, g_winY = CW_USEDEFAULT;  /* 窗口左上角，CW_USEDEFAULT=首次运行 */
+/* 外挂字幕窗位置/大小；w/h<=0 表示没保存过，用默认右下角 */
+static int      g_subX = 0, g_subY = 0, g_subW = 0, g_subH = 0;
 static int      g_colW[3] = { 110, 88, 44 };  /* 剧集列表三列像素宽 */
 static int      g_fontLevel = 0;  /* 字号级别 0=小(默认) 1=中 2=大，全局字体随级别+1pt */
 static int      g_cfgExternal = 0;       /* 配置存储模式：1=外挂同目录 feeds.ini 0=内嵌 exe 尾部。
@@ -3084,14 +3086,249 @@ static void CacheDir(wchar_t *out, int outMax)
     }
 }
 
-static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
+/* URL → 缓存名哈希（与旧版一致，保证已下载的文件仍能命中） */
+static unsigned long CacheUrlHash(const wchar_t *url)
 {
     unsigned long h = 5381;
     const wchar_t *p = url;
-    wchar_t dir[MAX_PATH];
     while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
+    return h;
+}
+
+/* 从缓存文件名解析哈希：<8hex>.<ext> 或 可读名_<8hex>.<ext>。
+ * 返回 1=符合规则；*legacy 置 1 表示旧格式（无前缀） */
+static int CacheNameHash(const wchar_t *name, const wchar_t *ext,
+                         unsigned long *ph, int *legacy)
+{
+    size_t n = wcslen(name), el = wcslen(ext), i;
+    wchar_t hex[9];
+    if (el < 1 || n < el + 9) return 0;
+    if (name[n - el - 1] != L'.') return 0;
+    if (_wcsicmp(name + n - el, ext) != 0) return 0;
+    if (n > el + 9 && name[n - el - 10] != L'_') return 0;
+    for (i = 0; i < 8; i++) {
+        wchar_t c = name[n - el - 9 + i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return 0;
+    }
+    wcsncpy(hex, name + n - el - 9, 8);
+    hex[8] = 0;
+    *ph = wcstoul(hex, NULL, 16);
+    if (legacy) *legacy = (n == el + 9);
+    return 1;
+}
+
+static int AudioNameHash(const wchar_t *name, unsigned long *ph, int *legacy)
+{
+    return CacheNameHash(name, L"mp3", ph, legacy);
+}
+
+/* 把标题里的 Windows 非法字符换成空格，并裁掉末尾的点和空格 */
+static void SanitizeSeg(const wchar_t *src, wchar_t *dst, int maxChars)
+{
+    int n = 0;
+    if (src) {
+        while (*src && n < maxChars) {
+            wchar_t c = *src++;
+            if (c < 32 || c == L'<' || c == L'>' || c == L':' || c == L'"' ||
+                c == L'/' || c == L'\\' || c == L'|' || c == L'?' || c == L'*')
+                c = L' ';
+            dst[n++] = c;
+        }
+    }
+    while (n > 0 && (dst[n - 1] == L' ' || dst[n - 1] == L'.')) n--;
+    dst[n] = 0;
+}
+
+/* 生成缓存文件名主干：<dir>播客名_剧集名_<8hex>（不含扩展名）。
+ * 两段各限 60 字，再按目录长度压缩，保证加扩展名后不超 MAX_PATH */
+static void CacheNameBase(const wchar_t *dir, const wchar_t *podTitle,
+                          const wchar_t *epTitle, unsigned long h,
+                          wchar_t *out, int outMax)
+{
+    wchar_t pod[72], ep[72];
+    int budget = MAX_PATH - (int)wcslen(dir) - 16;   /* 给 _<8hex>.ext 和结尾留够 */
+    int np, ne;
+    SanitizeSeg(podTitle, pod, 60);
+    SanitizeSeg(epTitle, ep, 60);
+    if (!pod[0]) wcscpy(pod, L"Podcast");
+    if (!ep[0])  wcscpy(ep, L"Episode");
+    if (budget < 24) budget = 24;
+    np = (int)wcslen(pod);
+    ne = (int)wcslen(ep);
+    while (np + ne + 14 > budget) {
+        if (np >= ne && np > 8) pod[--np] = 0;
+        else if (ne > 8) ep[--ne] = 0;
+        else break;
+    }
+    swprintf(out, outMax, L"%ls%ls_%ls_%08lx", dir, pod, ep, h);
+}
+
+/* 音频缓存全路径：主名 + .mp3（与字幕同名，仅扩展名不同） */
+static void CacheNameFor(const wchar_t *dir, const wchar_t *podTitle,
+                         const wchar_t *epTitle, unsigned long h,
+                         wchar_t *out, int outMax)
+{
+    wchar_t base[MAX_PATH];
+    CacheNameBase(dir, podTitle, epTitle, h, base, MAX_PATH);
+    swprintf(out, outMax, L"%ls.mp3", base);
+}
+
+/* 查找某哈希已有的缓存文件：先找可读名 *_<hash>.mp3，再找旧格式 <hash>.mp3 */
+static int CacheFindFor(unsigned long h, wchar_t *out, int outMax)
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[16];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(suffix, 16, L"_%08lx.mp3", h);
+    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        int hit = 0;
+        size_t sl = wcslen(suffix);
+        do {
+            size_t nl = wcslen(fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+        if (hit) {
+            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            return 1;
+        }
+    }
+    swprintf(pat, MAX_PATH, L"%ls%08lx.mp3", dir, h);
+    if (GetFileAttributesW(pat) != INVALID_FILE_ATTRIBUTES) {
+        wcsncpy(out, pat, outMax - 1);
+        out[outMax - 1] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* 缓存路径：已存在的文件（新/旧命名）优先，都没有则给旧格式路径供下载线程写入 */
+static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
+{
+    unsigned long h = CacheUrlHash(url);
+    wchar_t dir[MAX_PATH];
+    if (CacheFindFor(h, out, outMax)) return;
     CacheDir(dir, MAX_PATH);
     swprintf(out, outMax, L"%ls%08lx.mp3", dir, h);
+}
+
+/* 查找某剧集已有的字幕：可读名 *_<hash>.vtt/.srt 优先，兼容旧 sub_<hash>.* */
+static int CacheSubFind(unsigned long h, wchar_t *out, int outMax)
+{
+    static const wchar_t *exts[2] = { L"vtt", L"srt" };
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[24];
+    int i;
+
+    CacheDir(dir, MAX_PATH);
+    for (i = 0; i < 2; i++) {
+        WIN32_FIND_DATAW fd;
+        HANDLE f;
+        size_t sl;
+        int hit = 0;
+
+        swprintf(suffix, 24, L"_%08lx.%ls", h, exts[i]);
+        swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+        sl = wcslen(suffix);
+        f = FindFirstFileW(pat, &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                size_t nl = wcslen(fd.cFileName);
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+        if (hit) {
+            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            return 1;
+        }
+        swprintf(out, outMax, L"%lssub_%08lx.%ls", dir, h, exts[i]);
+        if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
+    }
+    return 0;
+}
+
+/* 删除某剧集全部字幕缓存（新旧两种命名都覆盖） */
+static void CacheSubDelete(unsigned long h)
+{
+    wchar_t p[MAX_PATH];
+    while (CacheSubFind(h, p, MAX_PATH)) DeleteFileW(p);
+}
+
+/* 下载完成后把 <hash>.mp3 改名为可读名，并把最终路径写进 out。
+ * 只在 UI 线程调用：只有这里有播客/剧集标题。改名失败沿用原路径 */
+static void CacheRenameOne(const wchar_t *url, const wchar_t *podTitle,
+                           const wchar_t *epTitle, wchar_t *out, int outMax)
+{
+    wchar_t dir[MAX_PATH], dst[MAX_PATH];
+    unsigned long h;
+    int legacy = 0;
+    const wchar_t *fn;
+
+    CachePathFor(url, out, outMax);
+    if (GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES) return;
+    if (g_nowPath[0] && _wcsicmp(out, g_nowPath) == 0) return;   /* 正在播：别动 */
+    fn = wcsrchr(out, L'\\');
+    if (!fn || !AudioNameHash(fn + 1, &h, &legacy) || !legacy) return;   /* 已是可读名 */
+    CacheDir(dir, MAX_PATH);
+    CacheNameFor(dir, podTitle, epTitle, h, dst, MAX_PATH);
+    if (_wcsicmp(dst, out) == 0) return;
+    if (MoveFileExW(out, dst, MOVEFILE_REPLACE_EXISTING)) {
+        wcsncpy(out, dst, outMax - 1);
+        out[outMax - 1] = 0;
+    }
+}
+
+/* 扫描缓存目录，把旧格式 <8hex>.mp3 统一改名为可读名（按哈希匹配现有剧集）。
+ * 批量下载线程只认 URL，改名统一收在 UI 线程，避免线程参数传所有权复杂的标题 */
+static void CacheRenameKnownAll(void)
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], dst[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    if (g_podCount <= 0) return;
+    CacheDir(dir, MAX_PATH);
+    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        wchar_t src[MAX_PATH];
+        unsigned long fh;
+        int legacy, pi, ei, found = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!AudioNameHash(fd.cFileName, &fh, &legacy) || !legacy) continue;
+        for (pi = 0; pi < g_podCount && !found; pi++) {
+            Podcast *p = &g_pods[pi];
+            for (ei = 0; ei < p->epCount; ei++) {
+                Episode *e = &p->eps[ei];
+                if (!e->url || e->localFile || CacheUrlHash(e->url) != fh) continue;
+                CacheNameFor(dir, p->title, e->title, fh, dst, MAX_PATH);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) continue;
+        swprintf(src, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
+        if (g_nowPath[0] && _wcsicmp(src, g_nowPath) == 0) continue;   /* 正在播：别动 */
+        if (_wcsicmp(src, dst) != 0 &&
+            MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING)) {
+            int ci;
+            /* 离线视图里的 url 是旧路径，改名后同步，否则播放/删除会扑空 */
+            for (ci = 0; ci < g_cachePod.epCount; ci++)
+                if (g_cachePod.eps[ci].url &&
+                    _wcsicmp(g_cachePod.eps[ci].url, src) == 0) {
+                    free(g_cachePod.eps[ci].url);
+                    g_cachePod.eps[ci].url = _wcsdup(dst);
+                }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
 }
 
 /* 确保当前缓存目录可用：默认目录（%TEMP%\LiteTune）不存在时递归建出来；
@@ -3134,7 +3371,8 @@ static int EnsureCacheDirWritable(void)
 }
 
 /* 校验文件名是否为「前缀 + 8 位十六进制 + '.' + 扩展名」形式的缓存文件。
- * 与 UrlCachePath/CachePathFor 的命名规则严格对齐，避免误删自定义目录里的同名扩展名文件 */
+ * 用于 feed_/cover_/trans_/sub_ 这类固定前缀缓存；音频缓存名可读化后由
+ * AudioNameHash 单独校验，避免误删自定义目录里的同名扩展名文件 */
 static int IsCacheFileName(const wchar_t *name, const wchar_t *prefix, const wchar_t *ext)
 {
     size_t pLen = wcslen(prefix), eLen = wcslen(ext), nLen = wcslen(name);
@@ -3154,14 +3392,17 @@ static int IsCacheFileName(const wchar_t *name, const wchar_t *prefix, const wch
  * 只删符合程序命名规则的文件，因此自定义目录里有别的同名扩展名文件也不会被误删 */
 static void CacheAutoClean(void)
 {
-    static const struct { const wchar_t *prefix; const wchar_t *ext; } kinds[] = {
-        { L"",       L"mp3" },   /* 音频：<8hex>.mp3 */
-        { L"feed_",  L"xml" },   /* 订阅 XML：feed_<8hex>.xml */
-        { L"feed_",  L"hdr" },   /* 订阅验证器：feed_<8hex>.hdr */
-        { L"cover_", L"img" },   /* 封面：cover_<8hex>.img */
-        { L"trans_", L"vtt" },   /* 字幕：trans_<8hex>.vtt */
-        { L"sub_",   L"vtt" },   /* 本地导入字幕：sub_<8hex>.vtt */
-        { L"sub_",   L"srt" },   /* 本地导入字幕：sub_<8hex>.srt */
+    static const struct {
+        const wchar_t *prefix;
+        const wchar_t *ext;
+        int matchHash;   /* 1=允许 可读名_<8hex>.<ext>，0=只认 前缀+<8hex>.<ext> */
+    } kinds[] = {
+        { L"",       L"mp3", 1 }, /* 音频 */
+        { L"",       L"vtt", 1 }, /* 字幕（可读名/trans_/sub_ 都覆盖） */
+        { L"",       L"srt", 1 }, /* 字幕 */
+        { L"feed_",  L"xml", 0 }, /* 订阅 XML：feed_<8hex>.xml */
+        { L"feed_",  L"hdr", 0 }, /* 订阅验证器：feed_<8hex>.hdr */
+        { L"cover_", L"img", 0 }, /* 封面：cover_<8hex>.img */
     };
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
@@ -3175,14 +3416,20 @@ static void CacheAutoClean(void)
     ullNow.LowPart = ftNow.dwLowDateTime;
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
-    for (k = 0; k < 7; k++) {
+    for (k = 0; k < (int)(sizeof(kinds) / sizeof(kinds[0])); k++) {
         swprintf(pat, MAX_PATH, L"%ls%ls*.%ls", cdir, kinds[k].prefix, kinds[k].ext);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             wchar_t fp[MAX_PATH];
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (!IsCacheFileName(fd.cFileName, kinds[k].prefix, kinds[k].ext)) continue;
+            {
+                unsigned long fh;
+                int ok = kinds[k].matchHash
+                    ? CacheNameHash(fd.cFileName, kinds[k].ext, &fh, NULL)
+                    : IsCacheFileName(fd.cFileName, kinds[k].prefix, kinds[k].ext);
+                if (!ok) continue;
+            }
             ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
             ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
             if (ullFile.QuadPart < ullNow.QuadPart) {
@@ -3252,11 +3499,19 @@ static void LoadCachePodcast(void)
         swprintf(mp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
         e->url = _wcsdup(mp);
 
-        /* 默认标题：去掉扩展名的文件名（哈希名），再从 mp3 元数据覆盖 */
+        /* 默认标题：去掉扩展名；可读名再去掉 _<哈希> 尾巴，最后用
+         * mp3 的 ID3 标签覆盖 */
         wcsncpy(base, fd.cFileName, MAX_PATH - 1);
         base[MAX_PATH - 1] = 0;
         dot = (int)wcslen(base);
         if (dot >= 4) base[dot - 4] = 0;
+        {
+            unsigned long fh;
+            int legacy = 0;
+            if (AudioNameHash(fd.cFileName, &fh, &legacy) && !legacy &&
+                dot > 9 && base[dot - 9] == L'_')
+                base[dot - 9] = 0;
+        }
         e->title  = _wcsdup(base);
         e->author = _wcsdup(tr(TR_UNKNOWN_POD));
 
@@ -4198,6 +4453,10 @@ static void ParseConfigLine(char *line)
         else if (strcmp(s, "winh") == 0) g_winH = atoi(val);
         else if (strcmp(s, "winx") == 0) g_winX = atoi(val);
         else if (strcmp(s, "winy") == 0) g_winY = atoi(val);
+        else if (strcmp(s, "subwin") == 0) {
+            if (sscanf(val, "%d,%d,%d,%d", &g_subX, &g_subY, &g_subW, &g_subH) != 4)
+                g_subX = g_subY = g_subW = g_subH = 0;
+        }
         else if (strcmp(s, "cw0") == 0) g_colW[0] = atoi(val);
         else if (strcmp(s, "cw1") == 0) g_colW[1] = atoi(val);
         else if (strcmp(s, "cw2") == 0) g_colW[2] = atoi(val);
@@ -4546,6 +4805,15 @@ static void LoadConfig(void)
             }
         }
     }
+    /* 字幕窗：尺寸过小或完全落在所有显示器外就回默认右下角 */
+    if (g_subW < 200 || g_subH < 40) {
+        g_subX = g_subY = g_subW = g_subH = 0;
+    } else {
+        RECT r;
+        SetRect(&r, g_subX, g_subY, g_subX + g_subW, g_subY + g_subH);
+        if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL))
+            g_subX = g_subY = g_subW = g_subH = 0;
+    }
     {
         static const int defCw[3] = { 110, 88, 44 };
         int ci;
@@ -4587,6 +4855,8 @@ static char *BuildConfigText(DWORD *lenOut)
     SbAddf(&sb, "winh=%d\n", g_winH);
     SbAddf(&sb, "winx=%d\n", g_winX);
     SbAddf(&sb, "winy=%d\n", g_winY);
+    if (g_subW > 0 && g_subH > 0)
+        SbAddf(&sb, "subwin=%d,%d,%d,%d\n", g_subX, g_subY, g_subW, g_subH);
     if (g_cacheDir[0]) {
         char *u8 = WToU8(g_cacheDir);
         if (u8) { SbAddf(&sb, "cachedir=%s\n", u8); free(u8); }
@@ -4698,6 +4968,14 @@ static void SaveConfig(void)
         if (st == SW_RESTORE && GetWindowRect(g_hwnd, &wr)) {
             g_winX = wr.left;  g_winY = wr.top;
             g_winW = wr.right - wr.left;  g_winH = wr.bottom - wr.top;
+        }
+    }
+    /* 字幕窗位置/大小（隐藏时也抓，下次开启停在原处） */
+    if (g_hwndSubBar && IsWindow(g_hwndSubBar)) {
+        RECT sr;
+        if (GetWindowRect(g_hwndSubBar, &sr)) {
+            g_subX = sr.left;  g_subY = sr.top;
+            g_subW = sr.right - sr.left;  g_subH = sr.bottom - sr.top;
         }
     }
 
@@ -4931,39 +5209,24 @@ typedef struct {
     int   len;
 } SubRaw;
 
-/* 线程参数：剧集 URL（查本地 sub_ 缓存）+ transcript URL（查 trans_ 缓存/联网） */
+/* 线程参数：剧集 URL（查本地字幕）+ transcript URL（联网下载）+ 落盘路径。
+ * subPath 由 UI 线程按标题生成（播客_剧集_<hash>.vtt），线程只负责写 */
 typedef struct {
     char *epUrl;
     char *transUrl;
+    wchar_t *subPath;
+    unsigned long hash;   /* 剧集 URL 哈希，与音频同主名 */
 } SubLoadParam;
 
-/* 查本地 sub_<剧集URL哈希>.vtt 或 .srt：找到返回 malloc 文本，否则 NULL */
-static char *ReadLocalSub(const char *epUrl, DWORD *outLen)
+/* 读整份字幕文件（给 CacheSubFind 找到的路径用） */
+static char *ReadSubFile(const wchar_t *path, DWORD *outLen)
 {
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
-    unsigned long h;
     FILE *f;
     long sz;
     char *buf;
-    const char *p;
 
-    if (!epUrl || !epUrl[0]) return NULL;
-
-    h = 5381;
-    p = epUrl;
-    while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
-
-    CacheDir(dir, MAX_PATH);
-
-    /* 先试 .vtt，再试 .srt */
-    swprintf(path, MAX_PATH, L"%lssub_%08lx.vtt", dir, h);
     f = _wfopen(path, L"rb");
-    if (!f) {
-        swprintf(path, MAX_PATH, L"%lssub_%08lx.srt", dir, h);
-        f = _wfopen(path, L"rb");
-    }
     if (!f) return NULL;
-
     fseek(f, 0, SEEK_END);
     sz = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -4984,7 +5247,7 @@ static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
     SubLoadParam *sp = (SubLoadParam*)param;
     SubRaw *sr = (SubRaw*)calloc(1, sizeof(SubRaw));
     if (!sr) {
-        free(sp->epUrl); free(sp->transUrl); free(sp);
+        free(sp->epUrl); free(sp->transUrl); free(sp->subPath); free(sp);
         return 0;
     }
 
@@ -4992,29 +5255,31 @@ static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
     {
         DWORD len = 0;
         char *data = NULL;
+        wchar_t found[MAX_PATH];
 
-        /* 优先级 1：本地 sub_<剧集URL哈希>.vtt/.srt */
-        if (sp->epUrl && sp->epUrl[0])
-            data = ReadLocalSub(sp->epUrl, &len);
+        /* 优先级 1：本地已有字幕（可读名，兼容旧 sub_ 名） */
+        if (sp->hash && CacheSubFind(sp->hash, found, MAX_PATH))
+            data = ReadSubFile(found, &len);
 
-        /* 优先级 2：网络缓存 trans_<transURL哈希>.vtt */
-        if (!data && sp->transUrl && sp->transUrl[0])
-            data = ReadUrlCache(sp->transUrl, L"trans_", L"vtt", &len);
-
-        /* 优先级 3：联网下载 */
+        /* 优先级 2：联网下载，落盘成 播客_剧集_<hash>.vtt，下次零网络 */
         if (!data && sp->transUrl && sp->transUrl[0]) {
             wchar_t *wurl = U8ToW(sp->transUrl);
             if (wurl) {
                 data = HttpFetch(wurl, &len, 0, NULL, NULL);
                 free(wurl);
-                if (data && len > 0)
-                    WriteUrlCache(sp->transUrl, L"trans_", L"vtt", data, len);
+                if (data && len > 0 && sp->subPath) {
+                    FILE *f;
+                    EnsureCacheDir();
+                    f = _wfopen(sp->subPath, L"wb");
+                    if (f) { fwrite(data, 1, len, f); fclose(f); }
+                }
             }
         }
 
         sr->data = data;
         sr->len = (int)len;
     }
+    free(sp->subPath);
     /* sr->url 借用 transUrl（优先）或 epUrl，所有权转交 UI 线程释放；
      * 只释放另一个，避免 UI 端 strcmp 用到已释放内存 */
     if (sp->transUrl) free(sp->epUrl);
@@ -5023,32 +5288,46 @@ static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
     return 0;
 }
 
-/* 异步加载字幕：先查本地 sub_ 缓存 → trans_ 网络缓存 → 联网
- * epUrl 用于查本地缓存，transcriptUrl 用于查网络/下载。
- * 两者任一为空则跳过对应步骤。 */
-static void LoadTranscript(const char *epUrl, const char *transcriptUrl)
+/* 异步加载字幕：本地 播客_剧集_<hash>.vtt/.srt 优先；没有再用 transcriptUrl
+ * 联网下载并落盘成同名文件。epUrlW 为剧集 URL，用来算哈希和做去重标识 */
+static void LoadTranscript(const wchar_t *epUrlW, const wchar_t *podTitle,
+                           const wchar_t *epTitle, const char *transcriptUrl)
 {
+    char *epU8;
     const char *key;
 
-    if ((!epUrl || !epUrl[0]) && (!transcriptUrl || !transcriptUrl[0])) {
+    if ((!epUrlW || !epUrlW[0]) && (!transcriptUrl || !transcriptUrl[0])) {
         FreeSubCues();
         free(g_subTransUrl); g_subTransUrl = NULL;
         return;
     }
+    epU8 = epUrlW ? WToU8(epUrlW) : NULL;
     /* 用 transcriptUrl 作为去重标识（有则优先），否则用剧集 URL */
-    key = (transcriptUrl && transcriptUrl[0]) ? transcriptUrl : epUrl;
-    if (g_subTransUrl && key && strcmp(g_subTransUrl, key) == 0) return;
+    key = (transcriptUrl && transcriptUrl[0]) ? transcriptUrl : epU8;
+    if (g_subTransUrl && key && strcmp(g_subTransUrl, key) == 0) { free(epU8); return; }
 
     free(g_subTransUrl);
-    g_subTransUrl = _strdup(key);
+    g_subTransUrl = key ? _strdup(key) : NULL;
     {
         SubLoadParam *sp = (SubLoadParam*)calloc(1, sizeof(SubLoadParam));
-        if (!sp) return;
-        sp->epUrl = epUrl ? _strdup(epUrl) : NULL;
+        if (!sp) { free(epU8); return; }
+        sp->epUrl = epU8;
         sp->transUrl = transcriptUrl ? _strdup(transcriptUrl) : NULL;
-        HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, sp, 0, NULL);
-        if (th) CloseHandle(th);
-        else { free(sp->epUrl); free(sp->transUrl); free(sp); }
+        sp->hash = (epUrlW && epUrlW[0]) ? CacheUrlHash(epUrlW) : 0;
+        if (sp->hash) {
+            wchar_t dir[MAX_PATH], base[MAX_PATH];
+            size_t bl;
+            CacheDir(dir, MAX_PATH);
+            CacheNameBase(dir, podTitle, epTitle, sp->hash, base, MAX_PATH);
+            bl = wcslen(base);
+            sp->subPath = (wchar_t*)malloc((bl + 5) * sizeof(wchar_t));
+            if (sp->subPath) swprintf(sp->subPath, (int)bl + 5, L"%ls.vtt", base);
+        }
+        {
+            HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, sp, 0, NULL);
+            if (th) CloseHandle(th);
+            else { free(sp->epUrl); free(sp->transUrl); free(sp->subPath); free(sp); }
+        }
     }
 }
 
@@ -5710,16 +5989,12 @@ static void StartBatchCache(void)
     }
     for (i = 0; i < total; i++) {
         Episode *e = &p->eps[indices[i]];
-        wchar_t cache[MAX_PATH];
         int j, dup = 0;
         if (!e->url) continue;
         for (j = 0; j < bc->count; j++)
             if (bc->urls[j] && wcscmp(bc->urls[j], e->url) == 0) { dup = 1; break; }
         if (dup) continue;
-        CachePathFor(e->url, cache, MAX_PATH);
-        if (e->localFile || EpisodeIsCached(e) ||
-            GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES)
-            continue;
+        if (e->localFile || EpisodeIsCached(e)) continue;
         if (bc->count >= bc->cap) {
             int ncap = bc->cap * 2;
             wchar_t **nb = (wchar_t**)realloc(bc->urls,
@@ -7186,7 +7461,8 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
     if (SubFollowsEpisode(e->url)) {
         char *u8 = e->localFile ? NULL : WToU8(e->url);
         const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
-        LoadTranscript(u8, ov ? ov : e->transcriptUrl);
+        LoadTranscript(e->localFile ? NULL : e->url, p->title, e->title,
+                       ov ? ov : e->transcriptUrl);
         free(u8);
         SubRefreshUI();
     }
@@ -7779,7 +8055,7 @@ static void RefreshSinglePodcast(int i)
     EnqueueRefreshUrl(g_pods[i].feedUrl);
 }
 
-/* 删除某集的字幕缓存 trans_<hash>.vtt。哈希按生效的字幕地址算（手动覆盖优先）；
+/* 删除某集的字幕缓存（可读名/旧 sub_ 名，外加旧版本按字幕地址存的 trans_）；
  * 离线视图的本地文件没有字幕缓存，直接跳过 */
 static void DropEpTranscript(const Episode *e)
 {
@@ -7791,10 +8067,13 @@ static void DropEpTranscript(const Episode *e)
     if (!u8) return;
     t = SubOvFind(LastEpHash(u8));
     free(u8);
+
+    CacheSubDelete(CacheUrlHash(e->url));
     if (!t) t = e->transcriptUrl;
-    if (!t) return;
-    UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
-    DeleteFileW(path);
+    if (t) {
+        UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
+        DeleteFileW(path);
+    }
 }
 
 /* 删除某播客全部已缓存的音频文件 */
@@ -7870,31 +8149,20 @@ static void DeleteAllCacheFiles(void)
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    /* 字幕缓存一并清掉：只删符合命名规则的 trans_<8hex>.vtt，不碰目录里其它 vtt */
-    swprintf(pat, MAX_PATH, L"%lstrans_*.vtt", cdir);
-    h = FindFirstFileW(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            wchar_t full[MAX_PATH];
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (!IsCacheFileName(fd.cFileName, L"trans_", L"vtt")) continue;
-            swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
-            DeleteFileW(full);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    /* 本地导入字幕 sub_<8hex>.vtt / .srt 也一并清掉 */
+    /* 字幕缓存一并清掉：只删符合命名规则的 *_<8hex>.vtt/.srt（新旧命名都覆盖），
+     * 不碰目录里其它 vtt/srt */
     {
-        static const struct { const wchar_t *ext; } sExts[] = { { L"vtt" }, { L"srt" } };
+        static const wchar_t *sExts[2] = { L"vtt", L"srt" };
         int si;
         for (si = 0; si < 2; si++) {
-            swprintf(pat, MAX_PATH, L"%lssub_*.%ls", cdir, sExts[si].ext);
+            unsigned long fh;
+            swprintf(pat, MAX_PATH, L"%ls*.%ls", cdir, sExts[si]);
             h = FindFirstFileW(pat, &fd);
             if (h == INVALID_HANDLE_VALUE) continue;
             do {
                 wchar_t full[MAX_PATH];
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                if (!IsCacheFileName(fd.cFileName, L"sub_", sExts[si].ext)) continue;
+                if (!CacheNameHash(fd.cFileName, sExts[si], &fh, NULL)) continue;
                 swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
                 DeleteFileW(full);
             } while (FindNextFileW(h, &fd));
@@ -8787,16 +9055,14 @@ static void AskCustomShutdown(void)
         SetShutdownTimer(_wtoi(g_ibBuf));
 }
 
-/* 把本地字幕复制到 sub_<剧集URL哈希>.<ext>，失败返回 0 */
-static int SaveLocalSub(const Episode *e, const wchar_t *srcPath)
+/* 把本地字幕存成 播客_剧集_<hash>.<ext>（与音频同名，仅扩展名不同），失败返回 0 */
+static int SaveLocalSub(const Podcast *p, const Episode *e, const wchar_t *srcPath)
 {
     char *data;
     DWORD len = 0;
-    unsigned long h = 5381;
-    char *u8;
+    unsigned long h;
     const wchar_t *slash, *dot;
-    const char *pc;
-    wchar_t ext[8], dir[MAX_PATH], dstPath[MAX_PATH];
+    wchar_t ext[8], dir[MAX_PATH], base[MAX_PATH], dstPath[MAX_PATH];
     FILE *f;
 
     data = ReadFileAll(srcPath, &len);
@@ -8805,10 +9071,8 @@ static int SaveLocalSub(const Episode *e, const wchar_t *srcPath)
         free(data);
         return 0;
     }
-    u8 = WToU8(e->url);
-    if (!u8) { free(data); return 0; }
-    for (pc = u8; *pc; pc++) h = ((h << 5) + h) ^ (unsigned long)*pc;
-    free(u8);
+    if (!e->url) { free(data); return 0; }
+    h = CacheUrlHash(e->url);
 
     /* 取源文件扩展名（只认 .vtt/.srt，其余默认 .vtt） */
     slash = wcsrchr(srcPath, L'\\');
@@ -8822,8 +9086,10 @@ static int SaveLocalSub(const Episode *e, const wchar_t *srcPath)
     }
 
     CacheDir(dir, MAX_PATH);
-    swprintf(dstPath, MAX_PATH, L"%lssub_%08lx%ls", dir, h, ext);
+    CacheNameBase(dir, p->title, e->title, h, base, MAX_PATH);
+    swprintf(dstPath, MAX_PATH, L"%ls%ls", base, ext);
     EnsureCacheDir();
+    CacheSubDelete(h);   /* 换扩展名时先清旧文件，避免查找先命中旧 .vtt */
     f = _wfopen(dstPath, L"wb");
     if (!f) {
         MessageBoxTh(g_hwnd, L"缓存目录不可写", L"LiteTune", MB_OK | MB_ICONERROR);
@@ -8875,21 +9141,24 @@ static void ImportSubtitle(int podIdx, int epIdx)
              wcsncmp(g_ibBuf, L"https://", 8) == 0);
     if (g_ibBuf[0] && !isUrl) {
         /* 本地文件：复制进 sub_ 缓存，并清掉旧的网络地址覆盖 */
-        if (!SaveLocalSub(e, g_ibBuf)) return;
+        if (!SaveLocalSub(p, e, g_ibBuf)) return;
         SubOvSet(h, "");
     } else {
         u8 = WToU8(g_ibBuf);
         SubOvSet(h, u8);          /* 空串 = 删除覆盖 */
         free(u8);
+        /* 旧本地字幕一并清掉：否则同名文件会继续优先于新地址/清除操作 */
+        CacheSubDelete(CacheUrlHash(e->url));
     }
     SetStatusTemp(tr(TR_SUB_SAVED));
 
     /* 正在播别的集时只保存，等真正播这一集再生效 */
     if (SubFollowsEpisode(e->url)) {
-        char *u8ep = WToU8(e->url);
+        /* 刚导入/改了地址：清掉去重标识强制重载 */
+        free(g_subTransUrl);
+        g_subTransUrl = NULL;
         ov = SubOvFind(h);
-        LoadTranscript(u8ep, ov ? ov : e->transcriptUrl);
-        free(u8ep);
+        LoadTranscript(e->url, p->title, e->title, ov ? ov : e->transcriptUrl);
         SubRefreshUI();
     }
 }
@@ -9683,15 +9952,53 @@ static void SubListSeek(int idx)
 static POINT g_barDragStart = {0,0};
 static POINT g_barDragWin   = {0,0};
 static int   g_barMoved = 0;
-static int   g_barHoverX = 0;      /* 鼠标在右上角叉叉上 */
+static int   g_barHoverBtn = -1;   /* 悬停的控制条按钮，-1=无 */
 static int   g_barTracking = 0;    /* 已在等 WM_MOUSELEAVE */
 
-/* 右上角叉叉按钮（悬停才画）*/
-static RECT BarCloseRect(const RECT *rc)
+/* 悬停控制条：⏯ / -15s / +15s / ✕，右上角一排（方形按钮） */
+#define BAR_BTN_N 4
+#define BAR_BTN_W 24
+#define BAR_BTN_H 24
+
+/* 圆角填充小按钮，避免方块底色看起来"被拉长" */
+static void FillRoundRect(HDC dc, const RECT *b, COLORREF fill, int rad)
+{
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pn = CreatePen(PS_SOLID, 1, fill);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pn);
+    RoundRect(dc, b->left, b->top, b->right, b->bottom, rad, rad);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pn);
+}
+
+/* 字幕窗整窗圆角（region 由系统接管，重设时旧的会自动释放） */
+static void SubBarRound(HWND h)
+{
+    RECT rc;
+    if (!GetClientRect(h, &rc) || rc.right <= 0 || rc.bottom <= 0) return;
+    SetWindowRgn(h, CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, 14, 14), TRUE);
+}
+
+static RECT BarBtnRect(const RECT *rc, int i)
 {
     RECT r;
-    SetRect(&r, rc->right - 24, rc->top + 4, rc->right - 4, rc->top + 24);
+    int x = rc->right - 6 - (BAR_BTN_N - i) * (BAR_BTN_W + 2) + 2;
+    SetRect(&r, x, rc->top + 4, x + BAR_BTN_W, rc->top + 4 + BAR_BTN_H);
     return r;
+}
+
+/* 命中的按钮下标，-1=不在任何按钮上 */
+static int BarBtnAt(const RECT *rc, POINT pt)
+{
+    int i;
+    for (i = 0; i < BAR_BTN_N; i++) {
+        RECT b = BarBtnRect(rc, i);
+        if (PtInRect(&b, pt)) return i;
+    }
+    return -1;
 }
 
 /* 拿到要显示的字幕文本：当前条目；字幕间隙时沿用上一条，不要跳回第一条 */
@@ -9750,6 +10057,9 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (x >= rc.right - rc.left - m) return HTRIGHT;
         return HTCLIENT;
     }
+    case WM_SIZE:
+        SubBarRound(hwnd);   /* 缩放后重设圆角 region */
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -9763,6 +10073,16 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             HBRUSH br = CreateSolidBrush(ThPanel());
             FillRect(hdc, &rc, br);
             DeleteObject(br);
+        }
+        {
+            /* 1px 边框，圆角与窗口 region 的 14px 对齐 */
+            HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            HPEN pn = CreatePen(PS_SOLID, 1, ThBtnBorder());
+            HGDIOBJ op = SelectObject(hdc, pn);
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            DeleteObject(pn);
         }
         if (txt && txt[0]) {
             /* 基准字号由窗口高度决定：默认正好装下 2 行，字号在不同句子间保持一致 */
@@ -9799,22 +10119,53 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             SelectObject(hdc, old);
             DeleteObject(hf);
         }
-        if (g_barHoverX) {
-            /* 悬停时右上角画叉叉：关闭外挂字幕 */
-            RECT b = BarCloseRect(&rc);
-            HBRUSH br = CreateSolidBrush(ThPanel());
-            FillRect(hdc, &b, br);
-            DeleteObject(br);
-            {
-                HPEN pen = CreatePen(PS_SOLID, 2, ThText());
-                HGDIOBJ op = SelectObject(hdc, pen);
-                int s = 5;
-                MoveToEx(hdc, b.left + s, b.top + s, NULL);
-                LineTo(hdc, b.right - s, b.bottom - s);
-                MoveToEx(hdc, b.right - s, b.top + s, NULL);
-                LineTo(hdc, b.left + s, b.bottom - s);
-                SelectObject(hdc, op);
-                DeleteObject(pen);
+        if (g_barHoverBtn >= 0) {
+            /* 悬停时右上角出现控制条：⏯ / -15s / +15s / ✕ */
+            int i;
+            for (i = 0; i < BAR_BTN_N; i++) {
+                RECT b = BarBtnRect(&rc, i);
+                int cx, cy;
+                if (i == g_barHoverBtn) FillRoundRect(hdc, &b, ThFlyHover(), 10);
+                cx = (b.left + b.right) / 2;
+                cy = (b.top + b.bottom) / 2;
+                if (i == 0) {
+                    HBRUSH pb = CreateSolidBrush(ThText());
+                    if (g_playState == 1) {   /* 播放中 → 暂停图标 */
+                        RECT r1, r2;
+                        SetRect(&r1, cx - 5, cy - 5, cx - 1, cy + 5);
+                        SetRect(&r2, cx + 1, cy - 5, cx + 5, cy + 5);
+                        FillRect(hdc, &r1, pb);
+                        FillRect(hdc, &r2, pb);
+                    } else {                  /* 暂停/停止 → 播放三角 */
+                        POINT p[3];
+                        HGDIOBJ obr = SelectObject(hdc, pb);
+                        p[0].x = cx - 4; p[0].y = cy - 6;
+                        p[1].x = cx - 4; p[1].y = cy + 6;
+                        p[2].x = cx + 6; p[2].y = cy;
+                        Polygon(hdc, p, 3);
+                        SelectObject(hdc, obr);
+                    }
+                    DeleteObject(pb);
+                } else if (i == 1 || i == 2) {
+                    HFONT f = CreateFontW(-10, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                          DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, 0, L"Segoe UI");
+                    HFONT of = (HFONT)SelectObject(hdc, f);
+                    SetTextColor(hdc, ThText());
+                    DrawTextW(hdc, i == 1 ? L"-15" : L"+15", -1, &b,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(hdc, of);
+                    DeleteObject(f);
+                } else {
+                    HPEN pen = CreatePen(PS_SOLID, 2, ThText());
+                    HGDIOBJ op = SelectObject(hdc, pen);
+                    int s = 7;
+                    MoveToEx(hdc, b.left + s, b.top + s, NULL);
+                    LineTo(hdc, b.right - s, b.bottom - s);
+                    MoveToEx(hdc, b.right - s, b.top + s, NULL);
+                    LineTo(hdc, b.left + s, b.bottom - s);
+                    SelectObject(hdc, op);
+                    DeleteObject(pen);
+                }
             }
         }
         EndPaint(hwnd, &ps);
@@ -9836,15 +10187,14 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_MOUSEMOVE:
         if (!(wParam & MK_LBUTTON)) {
             POINT cur;
-            RECT rc, b;
+            RECT rc;
             int hov;
             GetCursorPos(&cur);
             ScreenToClient(hwnd, &cur);
             GetClientRect(hwnd, &rc);
-            b = BarCloseRect(&rc);
-            hov = PtInRect(&b, cur) ? 1 : 0;
-            if (hov != g_barHoverX) {
-                g_barHoverX = hov;
+            hov = BarBtnAt(&rc, cur);
+            if (hov != g_barHoverBtn) {
+                g_barHoverBtn = hov;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             if (!g_barTracking) {
@@ -9871,25 +10221,35 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     case WM_MOUSELEAVE:
         g_barTracking = 0;
-        if (g_barHoverX) { g_barHoverX = 0; InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_barHoverBtn >= 0) { g_barHoverBtn = -1; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_LBUTTONUP: {
         POINT cur;
-        RECT rc, b;
+        RECT rc;
+        int btn;
         ReleaseCapture();
         GetCursorPos(&cur);
         ScreenToClient(hwnd, &cur);
         GetClientRect(hwnd, &rc);
-        b = BarCloseRect(&rc);
-        if (!g_barMoved && PtInRect(&b, cur)) {
-            /* 点叉叉：关闭外挂字幕（等同关闭按钮） */
-            ShowWindow(hwnd, SW_HIDE);
-            g_subEnabled = 0;
-            if (g_btnSubOn) SetWindowTextW(g_btnSubOn, tr(TR_SUB_OFF));
+        btn = BarBtnAt(&rc, cur);
+        if (!g_barMoved && btn >= 0) {
+            if (btn == 0) {
+                PauseResume();
+            } else if (btn == 1) {
+                PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 0, 0);   /* 后退 15s */
+            } else if (btn == 2) {
+                PostMessageW(g_hwnd, WM_APP_REMOTE_SEEK, 1, 0);   /* 前进 15s */
+            } else {
+                /* 点叉叉：关闭外挂字幕（等同关闭按钮） */
+                ShowWindow(hwnd, SW_HIDE);
+                g_subEnabled = 0;
+                if (g_btnSubOn) SetWindowTextW(g_btnSubOn, tr(TR_SUB_OFF));
+            }
+            InvalidateRect(hwnd, NULL, TRUE);   /* 播放/暂停图标随状态刷新 */
         } else if (!g_barMoved && g_subCurIdx >= 0 && g_subCurIdx < g_subCueCount) {
             PlayerSeekToSec(g_subCues[g_subCurIdx].start);
         }
-        g_barHoverX = 0;
+        g_barHoverBtn = -1;
         return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -9907,6 +10267,15 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         g_subSeekTick = GetTickCount();
         PlayerSeekToSec(g_subCues[idx].start);
         InvalidateRect(hwnd, NULL, TRUE);
+        return 0;
+    }
+    case WM_EXITSIZEMOVE: {
+        /* 拖完/缩放完记住位置和大小（退出时 SaveConfig 落盘） */
+        RECT r;
+        if (GetWindowRect(hwnd, &r)) {
+            g_subX = r.left;  g_subY = r.top;
+            g_subW = r.right - r.left;  g_subH = r.bottom - r.top;
+        }
         return 0;
     }
     case WM_CLOSE:
@@ -9929,13 +10298,18 @@ static void SubUpdateBar(void)
         if (!g_hwndSubBar) {
             int sw = GetSystemMetrics(SM_CXSCREEN);
             int sh = GetSystemMetrics(SM_CYSCREEN);
+            int x = (g_subW > 0) ? g_subX : sw - 360;
+            int y = (g_subH > 0) ? g_subY : sh - 180;
+            int w = (g_subW > 0) ? g_subW : 340;
+            int h = (g_subH > 0) ? g_subH : 90;
             g_hwndSubBar = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 SUBBAR_CLASS, L"",
                 WS_POPUP | WS_THICKFRAME | WS_CLIPSIBLINGS,
-                sw - 360, sh - 180, 340, 90,
+                x, y, w, h,
                 NULL, NULL, GetModuleHandleW(NULL), NULL);   /* 无属主：主窗口最小化不牵连字幕窗 */
             if (g_hwndSubBar) BarNoDwmBorder(g_hwndSubBar);
+            if (g_hwndSubBar) SubBarRound(g_hwndSubBar);
         }
         ShowWindow(g_hwndSubBar, SW_SHOWNA);
         InvalidateRect(g_hwndSubBar, NULL, TRUE);
@@ -13883,6 +14257,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
              * head 已等于 count，会让进度提前显示“全部完成” */
             if (g_batchActive && doneN >= cnt) {
                 g_batchActive = 0;
+                CacheRenameKnownAll();   /* 整批下完：旧哈希名统一换成可读名 */
                 SetStatus(g_batchSavedBase);
                 if (cap) swprintf(st, 128, tr(TR_BATCH_DONE_CAP), okc, cnt);
                 else     swprintf(st, 128, tr(TR_BATCH_DONE_FMT), okc, cnt);
@@ -13900,6 +14275,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_BATCH_FINISH: {
         (void)wParam; (void)lParam;
         BatchReleaseAfterFinish();
+        CacheRenameKnownAll();   /* 已下完的部分也换成可读名 */
         g_batchActive = 0;
         SetStatus(g_batchSavedBase);
         SetStatusTemp(tr(TR_BATCH_CANCELLED));
@@ -14061,7 +14437,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 wchar_t cache[MAX_PATH], info[128], st[512];
                 long long pd = 0;
                 Episode *e = &g_pods[r->pod].eps[epIdx];
-                CachePathFor(e->url, cache, MAX_PATH);
+                /* 下载线程只认 URL，落盘是 <hash>.mp3；这里补上可读名 */
+                CacheRenameOne(e->url, g_pods[r->pod].title, e->title,
+                               cache, MAX_PATH);
                 ProbeAudio(cache, info, 128, &pd);
                 g_dur100ns = pd;
                 SetWindowTextW(g_stFormat, info);
