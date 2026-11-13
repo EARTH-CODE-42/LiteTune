@@ -156,6 +156,7 @@ typedef struct {
     int pod;
     wchar_t *url;   /* 按 URL 标识，排序导致索引变化也不受影响 */
     int ok;
+    int diskError;  /* HTTP 成功但写盘失败（缓存目录不可写） */
     long gen;       /* 下载代号，过期任务的完成消息会被丢弃 */
 } EpReady;
 
@@ -426,6 +427,7 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_BATCH_FINISH  (WM_APP + 14) /* wParam=成功数, lParam=总数 */
 #define WM_APP_BATCH_PROGRESS (WM_APP + 16) /* wParam=当前集百分比 0-100 */
 #define WM_APP_SEARCH_DONE    (WM_APP + 17) /* lParam=SearchResult* */
+#define WM_APP_CACHE_NOT_WRITABLE (WM_APP + 18)  /* 缓存目录不可写（UI 线程提示） */
 #define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
@@ -500,7 +502,7 @@ enum {
     TR_CTX_DELCACHE_N_FMT, TR_DELCACHE_DONE_FMT,
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_TB_EXIT, TR_M_REFRESH_NOW,
-    TR_CTX_SET_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
+    TR_CTX_IMPORT_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_N
 };
@@ -556,9 +558,8 @@ static const wchar_t *tr(int id)
         L"移动缓存", L"选择缓存目录",
         L"当前缓存目录有 %d 个缓存文件、%d 个正在下载。\r\n"
             L"下载中的完成后会自动存到新目录；是否移动已有缓存？",
-        L"目标文件夹里有与当前缓存同名的文件。\r\n\r\n"
-            L"为避免覆盖，请换一个文件夹，"
-            L"或先移走目标文件夹里的同名文件。",
+        L"目标文件夹里有与当前缓存同名的文件，为避免覆盖，缓存文件没有移动。\r\n\r\n"
+            L"目录已切换，新下载会直接存到新文件夹；旧缓存仍在原位置，可手动移走。",
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
         L"添加播客", L"删除播客", L"调整顺序", L"设置", L"倍速",
@@ -617,10 +618,10 @@ static const wchar_t *tr(int id)
         L"删除选中的 %d 集缓存", L"已删除 %d 集缓存",
         L"已收藏 %d 集", L"已取消收藏 %d 集",
         L"退出", L"立即刷新全部订阅",
-        L"手动填写字幕地址...", L"字幕地址",
-        L"输入该集字幕地址（VTT/SRT），留空则清除：",
-        L"字幕地址已保存",
-        L"地址无效，需以 http:// 或 https:// 开头",
+        L"导入字幕...", L"导入字幕",
+        L"输入字幕网络地址，或本地 VTT/SRT 文件(留空则清除)：",
+        L"字幕已保存",
+        L"需填写 http:// 或 https:// 开头的地址，或选择一个存在的字幕文件",
         L"简介", L"字幕", L"字幕开", L"字幕关"
     };
     static const wchar_t *const en[TR_N] = {
@@ -678,9 +679,10 @@ static const wchar_t *tr(int id)
         L"Move Cache", L"Select Cache Folder",
         L"The current cache folder contains %d cache file(s), and %d download(s) are in progress.\r\n"
             L"Finished downloads will land in the new folder automatically. Move existing cache files?",
-        L"The target folder contains files with the same names as the current cache.\r\n\r\n"
-            L"To avoid overwriting, please choose another folder "
-            L"or remove the conflicting files first.",
+        L"The target folder contains files with the same names as the current cache, "
+            L"so the cache files were not moved to avoid overwriting.\r\n\r\n"
+            L"The folder has been switched; new downloads will go to the new folder. "
+            L"The old cache remains in the old folder and can be moved manually.",
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
         L"Add podcast", L"Delete podcast", L"Reorder", L"Settings", L"Speed",
@@ -752,10 +754,10 @@ static const wchar_t *tr(int id)
         L"Delete cache of %d selected", L"Deleted cache of %d episode(s)",
         L"Favorited %d episode(s)", L"Unfavorited %d episode(s)",
         L"Exit", L"Refresh all feeds now",
-        L"Set Transcript URL...", L"Transcript URL",
-        L"Enter a VTT/SRT URL for this episode (leave empty to clear):",
-        L"Transcript URL saved",
-        L"Invalid URL. It must start with http:// or https://",
+        L"Import Subtitle...", L"Import Subtitle",
+        L"Enter a subtitle URL or a local VTT/SRT file (leave empty to clear):",
+        L"Subtitle saved",
+        L"Enter a URL starting with http:// or https://, or pick an existing subtitle file",
         L"Notes", L"Subs", L"Subs on", L"Subs off"
     };
     return (g_lang ? en : zh)[id];
@@ -3054,23 +3056,27 @@ static int ParseFeed(const char *xml, Podcast *pod)
 }
 
 /* ================= 缓存 ================= */
+/* 默认缓存目录：%TEMP%\LiteTune（末尾不带反斜杠） */
+static void DefaultCacheDir(wchar_t *out, int outMax)
+{
+    wchar_t tmp[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tmp) > 0) {
+        swprintf(out, outMax, L"%lsLiteTune", tmp);
+    } else {
+        ExeDir(out, outMax);
+        wcscat_s(out, outMax, L"cache");
+    }
+}
+
 /* 返回当前缓存目录（末尾带反斜杠）。
- * 默认 %TEMP%\LiteTune\（系统可自动清理，删除程序不留垃圾）；
- * 用户手动选择过则存在 ini 里的 g_cacheDir；GetTempPath 失败才退回 exe\cache */
+ * 用户手动选择过则用 g_cacheDir，否则默认 %TEMP%\LiteTune\ */
 static void CacheDir(wchar_t *out, int outMax)
 {
     if (g_cacheDir[0]) {
         wcsncpy(out, g_cacheDir, outMax - 1);
         out[outMax - 1] = 0;
     } else {
-        /* 默认放系统临时文件夹，删除程序后缓存由 Windows 自动清理 */
-        wchar_t tmp[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, tmp) > 0) {
-            swprintf(out, outMax, L"%lsLiteTune", tmp);
-        } else {
-            ExeDir(out, outMax);
-            wcscat_s(out, outMax, L"cache");
-        }
+        DefaultCacheDir(out, outMax);
     }
     int len = (int)wcslen(out);
     if (len > 0 && out[len - 1] != L'\\' && len < outMax - 1) {
@@ -3088,12 +3094,43 @@ static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
     swprintf(out, outMax, L"%ls%08lx.mp3", dir, h);
 }
 
-static void EnsureCacheDir(void)
+/* 确保当前缓存目录可用：默认目录（%TEMP%\LiteTune）不存在时递归建出来；
+ * 用户自定义目录只检查是否存在，不替用户创建（目录没了就走回退，避免凭空造目录）。
+ * 返回 1=可用，0=不存在/建不出 */
+static int EnsureCacheDir(void)
 {
     wchar_t dir[MAX_PATH];
     CacheDir(dir, MAX_PATH);
     dir[wcslen(dir) - 1] = 0;   /* 去掉末尾反斜杠 */
-    CreateDirectoryW(dir, NULL);
+    if (!g_cacheDir[0]) {
+        int err = SHCreateDirectoryExW(NULL, dir, NULL);
+        return (err == ERROR_SUCCESS || err == ERROR_ALREADY_EXISTS) ? 1 : 0;
+    }
+    return (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+}
+
+/* 启动自检：确认缓存目录存在且可写。
+ * 不存在或不可写时直接把 g_cacheDir 归零（改为默认目录），与设置界面保持一致，
+ * 并建出默认目录；返回 0 让调用方提示一次 */
+static int EnsureCacheDirWritable(void)
+{
+    wchar_t dir[MAX_PATH], tmpPath[MAX_PATH];
+    FILE *f;
+
+    if (EnsureCacheDir()) {
+        CacheDir(dir, MAX_PATH);
+        swprintf(tmpPath, MAX_PATH, L"%ls_litetune_write_test.tmp", dir);
+        f = _wfopen(tmpPath, L"wb");
+        if (f) {
+            fclose(f);
+            DeleteFileW(tmpPath);
+            return 1;
+        }
+    }
+
+    g_cacheDir[0] = 0;   /* 改用默认目录，配置同步（避免界面显示与配置不一致） */
+    EnsureCacheDir();
+    return 0;
 }
 
 /* 校验文件名是否为「前缀 + 8 位十六进制 + '.' + 扩展名」形式的缓存文件。
@@ -3123,6 +3160,8 @@ static void CacheAutoClean(void)
         { L"feed_",  L"hdr" },   /* 订阅验证器：feed_<8hex>.hdr */
         { L"cover_", L"img" },   /* 封面：cover_<8hex>.img */
         { L"trans_", L"vtt" },   /* 字幕：trans_<8hex>.vtt */
+        { L"sub_",   L"vtt" },   /* 本地导入字幕：sub_<8hex>.vtt */
+        { L"sub_",   L"srt" },   /* 本地导入字幕：sub_<8hex>.srt */
     };
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
@@ -3136,7 +3175,7 @@ static void CacheAutoClean(void)
     ullNow.LowPart = ftNow.dwLowDateTime;
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
-    for (k = 0; k < 5; k++) {
+    for (k = 0; k < 7; k++) {
         swprintf(pat, MAX_PATH, L"%ls%ls*.%ls", cdir, kinds[k].prefix, kinds[k].ext);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -4884,59 +4923,132 @@ static void ParseTranscript(const char *data, int len)
     if (start >= 0) AddSubCue(start, endT, textBuf);
 }
 
-/* 异步加载字幕：工作线程下载（读缓存或联网），完成后 PostMessage 回 UI 线程解析，
- * 避免 HttpFetch 30s/60s 超时阻塞界面。同一 URL 不重复加载 */
+/* 异步加载字幕：工作线程下载（先查本地 sub_ 缓存 → 网络 trans_ 缓存 → 联网），
+ * 完成后 PostMessage 回 UI 线程解析。同一 URL 不重复加载 */
 typedef struct {
-    char *url;     /* 该字幕对应的 transcript URL（UI 端校验是否仍为当前集） */
-    char *data;    /* 下载到的原始文本（已 \0 结尾），NULL 表示失败 */
+    char *url;     /* 字幕标识：有 transcriptUrl 则用它，否则用剧集 URL；UI 端校验去重用 */
+    char *data;    /* 原始文本（已 \0 结尾），NULL 表示失败 */
     int   len;
 } SubRaw;
 
+/* 线程参数：剧集 URL（查本地 sub_ 缓存）+ transcript URL（查 trans_ 缓存/联网） */
+typedef struct {
+    char *epUrl;
+    char *transUrl;
+} SubLoadParam;
+
+/* 查本地 sub_<剧集URL哈希>.vtt 或 .srt：找到返回 malloc 文本，否则 NULL */
+static char *ReadLocalSub(const char *epUrl, DWORD *outLen)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    unsigned long h;
+    FILE *f;
+    long sz;
+    char *buf;
+    const char *p;
+
+    if (!epUrl || !epUrl[0]) return NULL;
+
+    h = 5381;
+    p = epUrl;
+    while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
+
+    CacheDir(dir, MAX_PATH);
+
+    /* 先试 .vtt，再试 .srt */
+    swprintf(path, MAX_PATH, L"%lssub_%08lx.vtt", dir, h);
+    f = _wfopen(path, L"rb");
+    if (!f) {
+        swprintf(path, MAX_PATH, L"%lssub_%08lx.srt", dir, h);
+        f = _wfopen(path, L"rb");
+    }
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 16 * 1024 * 1024) { fclose(f); return NULL; }
+    buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    buf[sz] = 0;
+    *outLen = (DWORD)sz;
+    return buf;
+}
+
 static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
 {
-    char *url = (char*)param;
+    SubLoadParam *sp = (SubLoadParam*)param;
     SubRaw *sr = (SubRaw*)calloc(1, sizeof(SubRaw));
-    if (sr) {
-        sr->url = url;   /* 所有权转交 UI 端释放 */
-        if (url && url[0]) {
-            DWORD len = 0;
-            char *data = ReadUrlCache(url, L"trans_", L"vtt", &len);
-            if (!data) {
-                wchar_t *wurl = U8ToW(url);
-                if (wurl) {
-                    data = HttpFetch(wurl, &len, 0, NULL, NULL);
-                    free(wurl);
-                    if (data && len > 0) WriteUrlCache(url, L"trans_", L"vtt", data, len);
-                }
-            }
-            sr->data = data;
-            sr->len = (int)len;
-        }
-        PostMessageW(g_hwnd, WM_APP_SUB_READY, 0, (LPARAM)sr);
-    } else {
-        free(url);
+    if (!sr) {
+        free(sp->epUrl); free(sp->transUrl); free(sp);
+        return 0;
     }
+
+    sr->url = sp->transUrl ? sp->transUrl : sp->epUrl;   /* 标识，UI 端用于去重校验 */
+    {
+        DWORD len = 0;
+        char *data = NULL;
+
+        /* 优先级 1：本地 sub_<剧集URL哈希>.vtt/.srt */
+        if (sp->epUrl && sp->epUrl[0])
+            data = ReadLocalSub(sp->epUrl, &len);
+
+        /* 优先级 2：网络缓存 trans_<transURL哈希>.vtt */
+        if (!data && sp->transUrl && sp->transUrl[0])
+            data = ReadUrlCache(sp->transUrl, L"trans_", L"vtt", &len);
+
+        /* 优先级 3：联网下载 */
+        if (!data && sp->transUrl && sp->transUrl[0]) {
+            wchar_t *wurl = U8ToW(sp->transUrl);
+            if (wurl) {
+                data = HttpFetch(wurl, &len, 0, NULL, NULL);
+                free(wurl);
+                if (data && len > 0)
+                    WriteUrlCache(sp->transUrl, L"trans_", L"vtt", data, len);
+            }
+        }
+
+        sr->data = data;
+        sr->len = (int)len;
+    }
+    /* sr->url 借用 transUrl（优先）或 epUrl，所有权转交 UI 线程释放；
+     * 只释放另一个，避免 UI 端 strcmp 用到已释放内存 */
+    if (sp->transUrl) free(sp->epUrl);
+    free(sp);
+    PostMessageW(g_hwnd, WM_APP_SUB_READY, 0, (LPARAM)sr);
     return 0;
 }
 
-static void LoadTranscript(const char *url)
+/* 异步加载字幕：先查本地 sub_ 缓存 → trans_ 网络缓存 → 联网
+ * epUrl 用于查本地缓存，transcriptUrl 用于查网络/下载。
+ * 两者任一为空则跳过对应步骤。 */
+static void LoadTranscript(const char *epUrl, const char *transcriptUrl)
 {
-    char *urlCopy;
-    if (!url || !url[0]) {
+    const char *key;
+
+    if ((!epUrl || !epUrl[0]) && (!transcriptUrl || !transcriptUrl[0])) {
         FreeSubCues();
         free(g_subTransUrl); g_subTransUrl = NULL;
         return;
     }
-    if (g_subTransUrl && strcmp(g_subTransUrl, url) == 0) return;   /* 同一集不重载 */
-    /* 标记正在加载（防止重复发线程），url 待 WM_APP_SUB_READY 校验后再落定 */
+    /* 用 transcriptUrl 作为去重标识（有则优先），否则用剧集 URL */
+    key = (transcriptUrl && transcriptUrl[0]) ? transcriptUrl : epUrl;
+    if (g_subTransUrl && key && strcmp(g_subTransUrl, key) == 0) return;
+
     free(g_subTransUrl);
-    g_subTransUrl = _strdup(url);
-    urlCopy = _strdup(url);
-    if (!urlCopy) return;
+    g_subTransUrl = _strdup(key);
     {
-        HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, urlCopy, 0, NULL);
+        SubLoadParam *sp = (SubLoadParam*)calloc(1, sizeof(SubLoadParam));
+        if (!sp) return;
+        sp->epUrl = epUrl ? _strdup(epUrl) : NULL;
+        sp->transUrl = transcriptUrl ? _strdup(transcriptUrl) : NULL;
+        HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, sp, 0, NULL);
         if (th) CloseHandle(th);
-        else { free(urlCopy); }
+        else { free(sp->epUrl); free(sp->transUrl); free(sp); }
     }
 }
 
@@ -5371,7 +5483,19 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
                                      &job->reqSlot, &job->gen);
                     if (data && len > 0) {
                         f = _wfopen(cache, L"wb");
-                        if (f) {
+                        if (!f) {
+                            /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
+                            g_cacheDir[0] = 0;
+                            EnsureCacheDir();
+                            CachePathFor(r->url, cache, MAX_PATH);
+                            f = _wfopen(cache, L"wb");
+                            if (f) {
+                                r->ok = (fwrite(data, 1, len, f) == len);
+                                fclose(f);
+                            } else {
+                                r->diskError = 1;   /* 标记：缓存目录不可写 */
+                            }
+                        } else {
                             r->ok = (fwrite(data, 1, len, f) == len);
                             fclose(f);
                         }
@@ -5452,7 +5576,22 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
                                              &bc->reqSlot, NULL);
                             if (data && len > 0) {
                                 f = _wfopen(cache, L"wb");
-                                if (f) {
+                                if (!f) {
+                                    /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
+                                    g_cacheDir[0] = 0;
+                                    EnsureCacheDir();
+                                    CachePathFor(url, cache, MAX_PATH);
+                                    f = _wfopen(cache, L"wb");
+                                    if (f) {
+                                        ok = (fwrite(data, 1, len, f) == len);
+                                        fclose(f);
+                                    } else {
+                                        /* 回退后仍失败：发一次警告（用自定义消息） */
+                                        static int warned = 0;
+                                        if (!warned) { warned = 1;
+                                            PostMessageW(g_hwnd, WM_APP_CACHE_NOT_WRITABLE, 0, 0); }
+                                    }
+                                } else {
                                     ok = (fwrite(data, 1, len, f) == len);
                                     fclose(f);
                                 }
@@ -7047,8 +7186,8 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
     if (SubFollowsEpisode(e->url)) {
         char *u8 = e->localFile ? NULL : WToU8(e->url);
         const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
+        LoadTranscript(u8, ov ? ov : e->transcriptUrl);
         free(u8);
-        LoadTranscript(ov ? ov : e->transcriptUrl);
         SubRefreshUI();
     }
 }
@@ -7744,6 +7883,24 @@ static void DeleteAllCacheFiles(void)
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+    /* 本地导入字幕 sub_<8hex>.vtt / .srt 也一并清掉 */
+    {
+        static const struct { const wchar_t *ext; } sExts[] = { { L"vtt" }, { L"srt" } };
+        int si;
+        for (si = 0; si < 2; si++) {
+            swprintf(pat, MAX_PATH, L"%lssub_*.%ls", cdir, sExts[si].ext);
+            h = FindFirstFileW(pat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                wchar_t full[MAX_PATH];
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (!IsCacheFileName(fd.cFileName, L"sub_", sExts[si].ext)) continue;
+                swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+                DeleteFileW(full);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
     if (g_playPod == g_podCount) PlayerStop();   /* 正在离线播放：停掉 */
     RefreshCachedEntry();                        /* 缓存清空会自动撤掉虚拟行 */
     if (g_viewCached) {
@@ -7849,6 +8006,7 @@ static void MovePodcastTo(int i, int j)
 #define ID_IB_LIST   9006
 #define ID_IB_SB     9007   /* ListView 纵向自绘滚动条 */
 #define ID_IB_SBH    9008   /* ListView 水平自绘滚动条 */
+#define ID_IB_BROWSE 9009   /* mode 2：选择本地字幕文件 */
 
 static HWND g_ibSb;
 static HWND g_ibSbH;
@@ -8146,7 +8304,8 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         e = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
             (g_ibMode == 1 ? ES_NUMBER : ES_AUTOHSCROLL),
-            12, 36, 408, 24, h, (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
+            12, 36, g_ibMode == 2 ? 364 : 408, 24, h,
+            (HMENU)(INT_PTR)ID_IB_EDIT, NULL, NULL);
         if (g_ibMode == 2 && g_ibBuf[0])
             SetWindowTextW(e, g_ibBuf);   /* 预填当前字幕地址 */
         lab = CreateWindowExW(0, L"STATIC",
@@ -8155,6 +8314,10 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 12, 408, 18, h, NULL, NULL, NULL);
         if (g_darkMode) btnStyle |= BS_OWNERDRAW;
         if (g_ibMode == 2) {
+            /* 字幕：右侧浏览按钮，文本 "..." 提示可点选本地文件 */
+            CreateWindowExW(0, L"BUTTON", L"...",
+                btnStyle | BS_PUSHBUTTON,
+                384, 36, 36, 24, h, (HMENU)(INT_PTR)ID_IB_BROWSE, NULL, NULL);
             /* 手动填字幕地址：只有确定/取消 */
             CreateWindowExW(0, L"BUTTON", tr(TR_OK),
                 btnStyle | BS_DEFPUSHBUTTON,
@@ -8306,6 +8469,13 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             DestroyWindow(h);
         } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_OPML) {
             DoOpmlPickImport(h);
+        } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_BROWSE) {
+            /* 选本地字幕文件，把路径填进输入框；确定时再按文件导入 */
+            static const wchar_t *FILTER =
+                L"Subtitles (*.vtt;*.srt)\0*.vtt;*.srt\0All Files (*.*)\0*.*\0";
+            wchar_t path[MAX_PATH];
+            if (FileDlg(h, 0, tr(TR_CTX_IMPORT_SUB), FILTER, NULL, path, MAX_PATH))
+                SetDlgItemTextW(h, ID_IB_EDIT, path);
         } else if (HIWORD(wp) == BN_CLICKED && LOWORD(wp) == ID_IB_OK) {
             wchar_t raw[2048];
             wchar_t *s, *e;
@@ -8317,11 +8487,14 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                              e[-1] == L'\r' || e[-1] == L'\n')) *--e = 0;
 
             if (g_ibMode == 2) {
-                /* 字幕地址：留空=清除覆盖；非空必须是 http(s) */
+                /* 字幕：留空=清除覆盖；非空须是 http(s) 地址或存在的本地文件 */
                 if (s[0] && wcsncmp(s, L"http://", 7) != 0 &&
                     wcsncmp(s, L"https://", 8) != 0) {
-                    MessageBoxTh(h, tr(TR_SUB_BAD), L"LiteTune", MB_ICONWARNING);
-                    return 0;
+                    DWORD fa = GetFileAttributesW(s);
+                    if (fa == INVALID_FILE_ATTRIBUTES || (fa & FILE_ATTRIBUTE_DIRECTORY)) {
+                        MessageBoxTh(h, tr(TR_SUB_BAD), L"LiteTune", MB_ICONWARNING);
+                        return 0;
+                    }
                 }
                 wcsncpy(g_ibBuf, s, 2047);
                 g_ibBuf[2047] = 0;
@@ -8614,8 +8787,58 @@ static void AskCustomShutdown(void)
         SetShutdownTimer(_wtoi(g_ibBuf));
 }
 
-/* 手动指定某集字幕地址（留空=清除）：写入覆盖表并立即重载 */
-static void SetEpisodeSubUrl(int podIdx, int epIdx)
+/* 把本地字幕复制到 sub_<剧集URL哈希>.<ext>，失败返回 0 */
+static int SaveLocalSub(const Episode *e, const wchar_t *srcPath)
+{
+    char *data;
+    DWORD len = 0;
+    unsigned long h = 5381;
+    char *u8;
+    const wchar_t *slash, *dot;
+    const char *pc;
+    wchar_t ext[8], dir[MAX_PATH], dstPath[MAX_PATH];
+    FILE *f;
+
+    data = ReadFileAll(srcPath, &len);
+    if (!data || len == 0) {
+        MessageBoxTh(g_hwnd, L"无法读取字幕文件", L"LiteTune", MB_OK | MB_ICONERROR);
+        free(data);
+        return 0;
+    }
+    u8 = WToU8(e->url);
+    if (!u8) { free(data); return 0; }
+    for (pc = u8; *pc; pc++) h = ((h << 5) + h) ^ (unsigned long)*pc;
+    free(u8);
+
+    /* 取源文件扩展名（只认 .vtt/.srt，其余默认 .vtt） */
+    slash = wcsrchr(srcPath, L'\\');
+    if (!slash) slash = srcPath;
+    dot = wcsrchr(slash, L'.');
+    if (dot && (wcscmp(dot, L".vtt") == 0 || wcscmp(dot, L".srt") == 0)) {
+        wcsncpy(ext, dot, 7);
+        ext[7] = 0;
+    } else {
+        wcscpy(ext, L".vtt");
+    }
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(dstPath, MAX_PATH, L"%lssub_%08lx%ls", dir, h, ext);
+    EnsureCacheDir();
+    f = _wfopen(dstPath, L"wb");
+    if (!f) {
+        MessageBoxTh(g_hwnd, L"缓存目录不可写", L"LiteTune", MB_OK | MB_ICONERROR);
+        free(data);
+        return 0;
+    }
+    fwrite(data, 1, len, f);
+    fclose(f);
+    free(data);
+    return 1;
+}
+
+/* 导入字幕：可填网络地址，也可填本地文件路径（留空=清除覆盖）。
+ * 本地文件复制进 sub_ 缓存；网络地址写入覆盖表；随后立即重载 */
+static void ImportSubtitle(int podIdx, int epIdx)
 {
     Podcast *p;
     Episode *e;
@@ -8623,6 +8846,7 @@ static void SetEpisodeSubUrl(int podIdx, int epIdx)
     char *u8;
     const char *ov;
     wchar_t *pre;
+    int isUrl;
 
     if (podIdx == g_podCount) p = &g_cachePod;
     else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
@@ -8646,15 +8870,26 @@ static void SetEpisodeSubUrl(int podIdx, int epIdx)
         free(pre);
     }
     if (!AskInputBox(tr(TR_SUB_TITLE), 2)) return;
-    u8 = WToU8(g_ibBuf);
-    SubOvSet(h, u8);          /* 空串 = 删除覆盖 */
-    free(u8);
+
+    isUrl = (wcsncmp(g_ibBuf, L"http://", 7) == 0 ||
+             wcsncmp(g_ibBuf, L"https://", 8) == 0);
+    if (g_ibBuf[0] && !isUrl) {
+        /* 本地文件：复制进 sub_ 缓存，并清掉旧的网络地址覆盖 */
+        if (!SaveLocalSub(e, g_ibBuf)) return;
+        SubOvSet(h, "");
+    } else {
+        u8 = WToU8(g_ibBuf);
+        SubOvSet(h, u8);          /* 空串 = 删除覆盖 */
+        free(u8);
+    }
     SetStatusTemp(tr(TR_SUB_SAVED));
 
-    /* 正在播别的集时只保存地址，等真正播这一集再生效 */
+    /* 正在播别的集时只保存，等真正播这一集再生效 */
     if (SubFollowsEpisode(e->url)) {
+        char *u8ep = WToU8(e->url);
         ov = SubOvFind(h);
-        LoadTranscript(ov ? ov : e->transcriptUrl);
+        LoadTranscript(u8ep, ov ? ov : e->transcriptUrl);
+        free(u8ep);
         SubRefreshUI();
     }
 }
@@ -10780,6 +11015,40 @@ static void DoExportIni(void)
     free(cfg);
 }
 
+/* 导入配置时剔除 cachedir 行：配置搬到新机器后，旧机器的缓存目录通常不可写 */
+static char *StripCachedir(const char *src, DWORD srcLen, DWORD *outLen)
+{
+    char *dst = (char*)malloc(srcLen + 1);
+    const char *p = src;
+    char *d = dst;
+    DWORD remaining = srcLen;
+
+    if (!dst) { *outLen = 0; return NULL; }
+
+    while (remaining > 0) {
+        const char *lineEnd = memchr(p, '\n', remaining);
+        DWORD lineLen = lineEnd ? (DWORD)(lineEnd - p + 1) : remaining;
+
+        /* 跳过行首空白后检查是否以 cachedir= 开头 */
+        const char *ls = p;
+        DWORD lsRemain = lineLen;
+        while (lsRemain > 0 && (*ls == ' ' || *ls == '\t' || *ls == '\r')) { ls++; lsRemain--; }
+
+        if (lsRemain >= 9 && memcmp(ls, "cachedir=", 9) == 0) {
+            /* 跳过这一行 */
+        } else {
+            memcpy(d, p, lineLen);
+            d += lineLen;
+        }
+
+        p += lineLen;
+        remaining -= lineLen;
+    }
+    *d = 0;
+    *outLen = (DWORD)(d - dst);
+    return dst;
+}
+
 /* 导入：带标记头的配置 ini（全量恢复，写回尾部后退出生效）或 OPML（合并订阅） */
 static void DoImport(void)
 {
@@ -10800,19 +11069,29 @@ static void DoImport(void)
 
     if (MemHasCfgMarker(buf)) {
         /* 配置 ini：确认后按当前模式落地（外挂写 feeds.ini / 内嵌写 exe 尾部）；
-         * g_skipSave 保证退出时不被旧内存状态覆盖 */
+         * g_skipSave 保证退出时不被旧内存状态覆盖；
+         * 剔除 cachedir 行——新机器上旧机器的缓存目录通常不可写 */
         if (MessageBoxTh(g_hwnd, tr(TR_IMP_INI_Q), tr(TR_IMP_TITLE),
                         MB_YESNO | MB_ICONQUESTION) == IDYES) {
             int ok = 0;
+            DWORD filteredLen = 0;
+            char *filtered = StripCachedir(buf, len, &filteredLen);
+            if (!filtered) {
+                MessageBoxTh(g_hwnd, tr(TR_IMP_WRITE_FAIL), L"LiteTune",
+                            MB_OK | MB_ICONERROR);
+                free(buf);
+                return;
+            }
             if (g_cfgExternal) {
                 wchar_t iniPath[MAX_PATH];
                 CfgExternalPath(iniPath, MAX_PATH);
-                ok = WriteTextFile(iniPath, buf, len);
-            } else if (CfgTailWriteVerified(buf, len)) {
+                ok = WriteTextFile(iniPath, filtered, filteredLen);
+            } else if (CfgTailWriteVerified(filtered, filteredLen)) {
                 ok = 1;
             }
+            free(filtered);
+            free(buf);
             if (ok) {
-                free(buf);
                 g_skipSave = 1;
                 MessageBoxTh(g_hwnd, tr(TR_IMP_INI_DONE), tr(TR_IMP_TITLE),
                             MB_OK | MB_ICONINFORMATION);
@@ -11264,32 +11543,28 @@ static void OnSettingsButton(void)
             int oldHasFiles = CountCacheFiles(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
             swprintf(newDir, MAX_PATH, L"%ls\\", newPath);
-            /* 目标里有与当前缓存同名的文件就拒绝切换，防止覆盖用户文件 */
-            if (_wcsicmp(curDir, newDir) != 0 &&
-                CacheDirHasConflict(curDir, newDir)) {
-                MessageBoxTh(g_hwnd, tr(TR_DIR_CONFLICT), tr(TR_M_CHANGE_CACHE),
-                             MB_OK | MB_ICONWARNING);
-            } else {
-                /* 新旧相同就不必移动 */
-                if (oldHasFiles > 0 &&
-                    _wcsicmp(curDir, newDir) != 0) {
-                    int activeDl = ActiveDownloadCount();
-                    wchar_t msg[256];
-                    if (activeDl > 0)
-                        swprintf(msg, 256, tr(TR_MOVE_Q_NEW_DL_FMT),
-                                 oldHasFiles, activeDl);
-                    else
-                        swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
-                    if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                        CreateDirectoryW(newPath, NULL);
+            /* 先问要不要移动；用户确认移动后才检查同名冲突（有冲突则只切换不移动） */
+            if (_wcsicmp(curDir, newDir) != 0 && oldHasFiles > 0) {
+                int activeDl = ActiveDownloadCount();
+                wchar_t msg[256];
+                if (activeDl > 0)
+                    swprintf(msg, 256, tr(TR_MOVE_Q_NEW_DL_FMT),
+                             oldHasFiles, activeDl);
+                else
+                    swprintf(msg, 256, tr(TR_MOVE_Q_NEW_FMT), oldHasFiles);
+                if (MessageBoxTh(g_hwnd, msg, tr(TR_MOVE_CACHE), MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    if (CacheDirHasConflict(curDir, newDir)) {
+                        MessageBoxTh(g_hwnd, tr(TR_DIR_CONFLICT), tr(TR_M_CHANGE_CACHE),
+                                     MB_OK | MB_ICONWARNING);
+                    } else {
                         MoveCacheFiles(curDir, newDir);
                     }
                 }
-                wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
-                g_cacheDir[MAX_PATH - 1] = 0;
-                EnsureCacheDir();
-                SetStatusTemp(tr(TR_CACHE_CHANGED));
             }
+            wcsncpy(g_cacheDir, newPath, MAX_PATH - 1);
+            g_cacheDir[MAX_PATH - 1] = 0;
+            EnsureCacheDir();
+            SetStatusTemp(tr(TR_CACHE_CHANGED));
         }
         if (pidl) CoTaskMemFree(pidl);
     } else if (cmd == 3) {
@@ -13095,7 +13370,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (vp && vp->feedUrl && !g_viewCached)
                     MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
                 MenuAdd(m, 0, 3, tr(TR_CTX_COPY_EP_URL));
-                if (!e->localFile) MenuAdd(m, 0, 11, tr(TR_CTX_SET_SUB));
+                if (!e->localFile) MenuAdd(m, 0, 12, tr(TR_CTX_IMPORT_SUB));
                 MenuAddSep(m);
                 if (cached) MenuAdd(m, 0, 2, tr(TR_CTX_DEL_EP_CACHE));
                 else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
@@ -13125,7 +13400,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (CopyToClipboardW(e->url)) SetStatusTemp(tr(TR_CLIP_OK));
                 else SetStatusTemp(tr(TR_CLIP_FAIL));
             }
-            else if (cmd == 11) SetEpisodeSubUrl(g_curPod, ep);
+            else if (cmd == 12) ImportSubtitle(g_curPod, ep);
             else if (cmd == 6) StartBatchCache();
             else if (cmd == 10 && vp) {
                 /* 批量删除缓存：先快照选中行再逐集删，最后统一刷新一次 */
@@ -13812,7 +14087,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 /* 下载失败或条目已消失：撤销绿色播放标记 */
                 g_playPod = -1;
                 g_playEp = -1;
-                SetStatus(r->ok ? tr(TR_AUDIO_GONE) : tr(TR_DL_FAILED));
+                if (r->diskError) {
+                    wchar_t dir[MAX_PATH], msg[MAX_PATH + 128];
+                    CacheDir(dir, MAX_PATH);
+                    swprintf(msg, MAX_PATH + 128,
+                        L"缓存目录不可写，已自动回退到默认目录：\r\n%ls\r\n\r\n可在设置里重新选择缓存目录。", dir);
+                    SetStatus(L"缓存目录不可写，已回退默认");
+                    MessageBoxTh(g_hwnd, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
+                } else {
+                    SetStatus(r->ok ? tr(TR_AUDIO_GONE) : tr(TR_DL_FAILED));
+                }
             }
             free(r->url);
             free(r);
@@ -13831,6 +14115,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if ((long)lParam != g_dlGen) return 0;   /* 旧任务进度，丢弃 */
         swprintf(buf, 64, tr(TR_DL_PROGRESS_FMT), (int)wParam);
         SetStatus(buf);
+        return 0;
+    }
+
+    case WM_APP_CACHE_NOT_WRITABLE: {
+        /* 批量下载线程发现缓存目录不可写（已回退但仍不行），
+         * 发一次警告让用户知道 */
+        wchar_t dir[MAX_PATH], msg[MAX_PATH + 128];
+        CacheDir(dir, MAX_PATH);
+        swprintf(msg, MAX_PATH + 128,
+            L"缓存目录不可写：\r\n%ls\r\n\r\n已自动回退到默认目录。\r\n可在设置里重新选择缓存目录。", dir);
+        SetStatus(L"缓存目录不可写，已回退默认");
+        MessageBoxTh(g_hwnd, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
         return 0;
     }
 
@@ -14115,7 +14411,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     /* 建窗前读取配置：排序/列宽/音量/窗口尺寸 */
     LoadConfig();
     if (g_skipStartup) return 0;   /* 首启弹窗被关闭：不建窗直接退出 */
-    EnsureCacheDir();   /* 配置里可能有自定义缓存目录，先确保存在 */
+    /* 自检：配置的缓存目录不存在或不可写 → 直接改为默认目录并提示一次
+     * （此时主窗未建，用系统 MessageBoxW） */
+    if (!EnsureCacheDirWritable()) {
+        wchar_t dir[MAX_PATH], msg[MAX_PATH + 160];
+        CacheDir(dir, MAX_PATH);
+        if (g_lang)
+            swprintf(msg, MAX_PATH + 160,
+                L"The cache folder is missing or not writable. It has been reset to "
+                L"the default folder:\r\n%ls\r\n\r\nYou can pick another folder in Settings.", dir);
+        else
+            swprintf(msg, MAX_PATH + 160,
+                L"缓存目录不存在或不可写，已恢复为默认目录：\r\n%ls\r\n\r\n"
+                L"可在设置里重新选择缓存目录。", dir);
+        MessageBoxW(NULL, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
+    }
     CacheAutoClean();   /* 按 cachedays 设置清理旧缓存 */
 
     ZeroMemory(&wc, sizeof(wc));
