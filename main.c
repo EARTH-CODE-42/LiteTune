@@ -4083,27 +4083,22 @@ static void UpdateTrayBadge(void)
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-/* ================= 订阅 XML / 封面缓存（cache\feed_*.xml、cover_*.img） ================= */
+/* ================= 订阅 XML / 封面缓存 =================
+ * 可读名：<播客名>_<8hex>.xml / .hdr / .jpg（封面保留原图片格式）；
+ * 旧命名 feed_<8hex>.xml、cover_<8hex>.img 仍然兼容，读到后顺手改成新名 */
 
-/* 文件名 = 前缀 + URL 哈希 + 扩展名，跨启动稳定 */
-static void UrlCachePath(const char *url, const wchar_t *prefix,
-                         const wchar_t *ext, wchar_t *out, int outMax)
-{
-    wchar_t dir[MAX_PATH];
-    CacheDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, LastEpHash(url), ext);
-}
+/* 图片缓存可能出现的扩展名（新格式按真实类型，旧版统一 .img） */
+static const wchar_t *const kImgExts[] =
+    { L"jpg", L"jpeg", L"png", L"gif", L"webp", L"bmp", L"img" };
+#define IMG_EXT_N ((int)(sizeof(kImgExts) / sizeof(kImgExts[0])))
 
-/* 读取缓存文件到 malloc 缓冲（附带结尾 0），失败返回 NULL */
-static char* ReadUrlCache(const char *url, const wchar_t *prefix,
-                          const wchar_t *ext, DWORD *outLen)
+/* 读整份文件到 malloc 缓冲（结尾补 0），失败返回 NULL */
+static char *ReadWholeFile(const wchar_t *path, DWORD *outLen)
 {
-    wchar_t path[MAX_PATH];
     FILE *f;
     long sz;
     char *buf;
 
-    UrlCachePath(url, prefix, ext, path, MAX_PATH);
     f = _wfopen(path, L"rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -4121,17 +4116,117 @@ static char* ReadUrlCache(const char *url, const wchar_t *prefix,
     return buf;
 }
 
-static void WriteUrlCache(const char *url, const wchar_t *prefix,
-                          const wchar_t *ext, const char *data, DWORD len)
+/* 找已有缓存：可读名 *_<8hex>.<ext> 优先，再旧前缀名 <prefix><8hex>.<ext> */
+static int UrlCacheFind(unsigned int h, const wchar_t *prefix,
+                        const wchar_t *ext, wchar_t *out, int outMax)
 {
-    wchar_t path[MAX_PATH];
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[24];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    size_t sl;
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(suffix, 24, L"_%08x.%ls", h, ext);
+    sl = wcslen(suffix);
+    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        int hit = 0;
+        do {
+            size_t nl = wcslen(fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+        if (hit) {
+            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            return 1;
+        }
+    }
+    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, h, ext);
+    return GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* 写路径：已有缓存（新名或旧名）就原地更新，否则用旧前缀名 */
+static void UrlCachePath(const char *url, const wchar_t *prefix,
+                         const wchar_t *ext, wchar_t *out, int outMax)
+{
+    unsigned int h = LastEpHash(url);
+    wchar_t dir[MAX_PATH];
+    if (UrlCacheFind(h, prefix, ext, out, outMax)) return;
+    CacheDir(dir, MAX_PATH);
+    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, h, ext);
+}
+
+/* 可读元数据缓存名：<dir><标题>_<8hex>.<ext>，标题非法字符已过滤 */
+static void MetaCachePath(const wchar_t *dir, const char *url, const wchar_t *title,
+                          const wchar_t *ext, wchar_t *out, int outMax)
+{
+    wchar_t seg[72];
+    int budget = MAX_PATH - (int)wcslen(dir) - 16;
+    SanitizeSeg(title, seg, 60);
+    if (!seg[0]) wcscpy(seg, L"Podcast");
+    if (budget < 12) budget = 12;
+    if ((int)wcslen(seg) > budget) seg[budget] = 0;
+    swprintf(out, outMax, L"%ls%ls_%08x.%ls", dir, seg, LastEpHash(url), ext);
+}
+
+/* 写元数据缓存：落盘成可读名，成功后删掉同哈希的旧文件（旧命名或旧标题） */
+static void WriteMetaCache(const char *url, const wchar_t *prefix,
+                           const wchar_t *title, const wchar_t *ext,
+                           const char *data, DWORD len)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH], old[MAX_PATH];
+    unsigned int h;
     FILE *f;
+    int hadOld;
+
     if (!data || len == 0) return;
-    UrlCachePath(url, prefix, ext, path, MAX_PATH);
+    h = LastEpHash(url);
+    CacheDir(dir, MAX_PATH);
+    hadOld = UrlCacheFind(h, prefix, ext, old, MAX_PATH);
+    MetaCachePath(dir, url, title, ext, path, MAX_PATH);
     f = _wfopen(path, L"wb");
     if (!f) return;
     fwrite(data, 1, len, f);
     fclose(f);
+    if (hadOld && _wcsicmp(old, path) != 0) DeleteFileW(old);
+}
+
+/* 删除某 URL 的元数据缓存（新旧命名都删） */
+static void DeleteMetaCache(const char *url, const wchar_t *prefix,
+                            const wchar_t *const *exts, int nExt)
+{
+    unsigned int h;
+    int i;
+    if (!url) return;
+    h = LastEpHash(url);
+    for (i = 0; i < nExt; i++) {
+        wchar_t p[MAX_PATH];
+        while (UrlCacheFind(h, prefix, exts[i], p, MAX_PATH)) {
+            if (!DeleteFileW(p)) break;
+        }
+    }
+}
+
+/* 读取缓存文件到 malloc 缓冲（附带结尾 0），失败返回 NULL */
+static char* ReadUrlCache(const char *url, const wchar_t *prefix,
+                          const wchar_t *ext, DWORD *outLen)
+{
+    wchar_t path[MAX_PATH];
+    if (!UrlCacheFind(LastEpHash(url), prefix, ext, path, MAX_PATH)) return NULL;
+    return ReadWholeFile(path, outLen);
+}
+
+/* 按真实文件头判断图片格式，保留原扩展名方便用户直接另存 */
+static const wchar_t* ImageExtFor(const char *d, DWORD n)
+{
+    if (n >= 3 && (unsigned char)d[0] == 0xFF && (unsigned char)d[1] == 0xD8) return L"jpg";
+    if (n >= 8 && memcmp(d, "\x89PNG\r\n\x1a\n", 8) == 0) return L"png";
+    if (n >= 6 && (memcmp(d, "GIF87a", 6) == 0 || memcmp(d, "GIF89a", 6) == 0)) return L"gif";
+    if (n >= 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0) return L"webp";
+    if (n >= 2 && d[0] == 'B' && d[1] == 'M') return L"bmp";
+    return L"img";
 }
 
 /* ---------- 订阅源验证器（feed_*.hdr：ETag\nLast-Modified\n） ----------
@@ -4139,17 +4234,17 @@ static void WriteUrlCache(const char *url, const wchar_t *prefix,
  * 定时/全量刷新只花一个空响应的代价；解析成功才写，保证 hdr 与可用缓存同代 */
 
 /* 200 响应后让验证器与缓存同代：响应带验证器则更新，不带则清除旧记录 */
-static void FeedSyncValidators(const char *url, const HttpInfo *info)
+static void FeedSyncValidators(const char *url, const wchar_t *title,
+                               const HttpInfo *info)
 {
     char hb[256];
     int n;
     if (info->etag[0] || info->lastMod[0]) {
         n = snprintf(hb, sizeof(hb), "%s\n%s\n", info->etag, info->lastMod);
-        if (n > 0) WriteUrlCache(url, L"feed_", L"hdr", hb, (DWORD)n);
+        if (n > 0) WriteMetaCache(url, L"feed_", title, L"hdr", hb, (DWORD)n);
     } else {
-        wchar_t cp[MAX_PATH];
-        UrlCachePath(url, L"feed_", L"hdr", cp, MAX_PATH);
-        DeleteFileW(cp);
+        static const wchar_t *hdrExt[] = { L"hdr" };
+        DeleteMetaCache(url, L"feed_", hdrExt, 1);
     }
 }
 
@@ -5062,22 +5157,35 @@ static HBITMAP DecodeImageMem(const char *data, DWORD len)
 
 static void FreePodcast(Podcast *p);   /* 定义在 UI 段，加载线程失败时也要用 */
 
-/* 加载封面图并解码为 HBITMAP；按封面 URL 缓存到 cache\cover_*.img，
- * 二次启动零网络直接从文件解码 */
-static HBITMAP LoadCoverImage(const char *url)
+/* 加载封面图并解码为 HBITMAP；缓存成 cache\<播客名>_<hash>.<原始格式>，
+ * 二次启动零网络直接从文件解码；旧版 cover_*.img 读到后顺手改成正确扩展名 */
+static HBITMAP LoadCoverImage(const char *url, const wchar_t *title)
 {
     DWORD len = 0;
-    char *data;
+    char *data = NULL;
     HBITMAP hbmp = NULL;
+    wchar_t path[MAX_PATH];
+    int i;
 
     if (!url) return NULL;
-    data = ReadUrlCache(url, L"cover_", L"img", &len);
+    path[0] = 0;
+    for (i = 0; i < IMG_EXT_N; i++)
+        if (UrlCacheFind(LastEpHash(url), L"cover_", kImgExts[i], path, MAX_PATH)) {
+            data = ReadWholeFile(path, &len);
+            if (data) break;
+        }
     if (!data) {
         wchar_t *wurl = U8ToW(url);
         if (!wurl) return NULL;
         data = HttpFetch(wurl, &len, 0, NULL, NULL);
         free(wurl);
-        if (data && len > 0) WriteUrlCache(url, L"cover_", L"img", data, len);
+        if (data && len > 0)
+            WriteMetaCache(url, L"cover_", title, ImageExtFor(data, len), data, len);
+    } else if (data && len > 0) {
+        /* 旧 .img 缓存：顺手换成真实扩展名 */
+        const wchar_t *dot = wcsrchr(path, L'.');
+        if (dot && _wcsicmp(dot, L".img") == 0)
+            WriteMetaCache(url, L"cover_", title, ImageExtFor(data, len), data, len);
     }
     if (data && len > 0) hbmp = DecodeImageMem(data, len);
     free(data);
@@ -5218,30 +5326,6 @@ typedef struct {
     unsigned long hash;   /* 剧集 URL 哈希，与音频同主名 */
 } SubLoadParam;
 
-/* 读整份字幕文件（给 CacheSubFind 找到的路径用） */
-static char *ReadSubFile(const wchar_t *path, DWORD *outLen)
-{
-    FILE *f;
-    long sz;
-    char *buf;
-
-    f = _wfopen(path, L"rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 16 * 1024 * 1024) { fclose(f); return NULL; }
-    buf = (char*)malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf); fclose(f); return NULL;
-    }
-    fclose(f);
-    buf[sz] = 0;
-    *outLen = (DWORD)sz;
-    return buf;
-}
-
 static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
 {
     SubLoadParam *sp = (SubLoadParam*)param;
@@ -5259,7 +5343,7 @@ static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
 
         /* 优先级 1：本地已有字幕（可读名，兼容旧 sub_ 名） */
         if (sp->hash && CacheSubFind(sp->hash, found, MAX_PATH))
-            data = ReadSubFile(found, &len);
+            data = ReadWholeFile(found, &len);
 
         /* 优先级 2：联网下载，落盘成 播客_剧集_<hash>.vtt，下次零网络 */
         if (!data && sp->transUrl && sp->transUrl[0]) {
@@ -5507,12 +5591,12 @@ static Podcast* LoadOneFeedDepth(const char *url, int netFirst, int depth)
     if (pod && ParseFeed(xml, pod)) {
         pod->refreshFailed = stale;
         if (fromNet) {
-            WriteUrlCache(url, L"feed_", L"xml", xml, xmlLen);
-            FeedSyncValidators(url, &info);
+            WriteMetaCache(url, L"feed_", pod->title, L"xml", xml, xmlLen);
+            FeedSyncValidators(url, pod->title, &info);
         }
         SortPodcast(pod);
         pod->feedUrl = _strdup(url);
-        if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl);
+        if (pod->imageUrl) pod->hImage = LoadCoverImage(pod->imageUrl, pod->title);
         free(xml);
         return pod;
     }
@@ -7967,15 +8051,10 @@ static void RemovePodcast(int i)
 
     if (g_pods[i].feedUrl) {
         /* 顺带清掉该订阅的 RSS/封面缓存与验证器（已缓存音频 mp3 保留） */
-        wchar_t cp[MAX_PATH];
-        UrlCachePath(g_pods[i].feedUrl, L"feed_", L"xml", cp, MAX_PATH);
-        DeleteFileW(cp);
-        UrlCachePath(g_pods[i].feedUrl, L"feed_", L"hdr", cp, MAX_PATH);
-        DeleteFileW(cp);
-        if (g_pods[i].imageUrl) {
-            UrlCachePath(g_pods[i].imageUrl, L"cover_", L"img", cp, MAX_PATH);
-            DeleteFileW(cp);
-        }
+        static const wchar_t *feedExts[] = { L"xml", L"hdr" };
+        DeleteMetaCache(g_pods[i].feedUrl, L"feed_", feedExts, 2);
+        if (g_pods[i].imageUrl)
+            DeleteMetaCache(g_pods[i].imageUrl, L"cover_", kImgExts, IMG_EXT_N);
         LastEpDrop(LastEpHash(g_pods[i].feedUrl));
         SeenDrop(LastEpHash(g_pods[i].feedUrl));
         FavDrop(LastEpHash(g_pods[i].feedUrl));
@@ -8016,16 +8095,13 @@ static int   g_refreshQN = 0;
 static void PumpRefreshQueue(void)
 {
     char *url;
-    wchar_t cp[MAX_PATH];
+    static const wchar_t *feedExts[] = { L"xml", L"hdr" };
     if (g_refreshQN == 0 || g_feedsLoading) return;
     url = g_refreshQ[0];
     memmove(&g_refreshQ[0], &g_refreshQ[1], (g_refreshQN - 1) * sizeof(char*));
     g_refreshQN--;
     /* 清掉 RSS 缓存与验证器，强制联网全量取最新 */
-    UrlCachePath(url, L"feed_", L"xml", cp, MAX_PATH);
-    DeleteFileW(cp);
-    UrlCachePath(url, L"feed_", L"hdr", cp, MAX_PATH);
-    DeleteFileW(cp);
+    DeleteMetaCache(url, L"feed_", feedExts, 2);
     AddSingleFeedEx(url, 1);   /* 原位替换，不改变订阅顺序 */
     free(url);
 }
@@ -8073,6 +8149,27 @@ static void DropEpTranscript(const Episode *e)
     if (t) {
         UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
         DeleteFileW(path);
+    }
+}
+
+/* 旧命名 feed_<hash>.xml/.hdr 统一改成 播客名_<hash>.xml/.hdr。
+ * 只在 UI 线程调用（标题已就绪）；封面由 LoadCoverImage 顺手改名 */
+static void MetaCacheRenameAll(void)
+{
+    static const wchar_t *feedExts[] = { L"xml", L"hdr" };
+    int i, k;
+    for (i = 0; i < g_podCount; i++) {
+        Podcast *p = &g_pods[i];
+        if (p->loadFailed || !p->title || !p->feedUrl) continue;
+        for (k = 0; k < 2; k++) {
+            wchar_t dir[MAX_PATH], old[MAX_PATH], dst[MAX_PATH];
+            unsigned int h = LastEpHash(p->feedUrl);
+            if (!UrlCacheFind(h, L"feed_", feedExts[k], old, MAX_PATH)) continue;
+            CacheDir(dir, MAX_PATH);
+            MetaCachePath(dir, p->feedUrl, p->title, feedExts[k], dst, MAX_PATH);
+            if (_wcsicmp(old, dst) != 0)
+                MoveFileExW(old, dst, MOVEFILE_REPLACE_EXISTING);
+        }
     }
 }
 
@@ -14381,6 +14478,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_FEEDS_DONE:
         g_feedsLoading = 0;
         RefreshCachedEntry();   /* 末尾补“已缓存”行（有本地音频时） */
+        MetaCacheRenameAll();   /* 旧 feed_/hdr 哈希名换成可读名 */
         if (g_podCount > 0) {
             int cursel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
             SetStatus(tr(TR_READY));
