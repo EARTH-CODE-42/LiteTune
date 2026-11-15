@@ -2340,6 +2340,174 @@ static char* HttpFetch(const wchar_t *url, DWORD *outLen, UINT progressMsg,
     return HttpFetchEx(url, outLen, progressMsg, pReqSlot, pProgGen, NULL, NULL);
 }
 
+/* ---- 断点续传辅助：手工做十进制转换，避免 printf 的 %I64 兼容问题 ---- */
+static void U64ToW(unsigned __int64 v, wchar_t *out)
+{
+    wchar_t tmp[24];
+    int n = 0, i;
+    do { tmp[n++] = (wchar_t)(L'0' + (int)(v % 10)); v /= 10; } while (v);
+    for (i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+}
+
+/* 取字符串里第一个连续数字（如 Content-Range: "bytes 1234-5678/9999"） */
+static unsigned __int64 WFirstU64(const wchar_t *s)
+{
+    unsigned __int64 v = 0;
+    while (*s && (*s < L'0' || *s > L'9')) s++;
+    while (*s >= L'0' && *s <= L'9') { v = v * 10 + (unsigned)(*s - L'0'); s++; }
+    return v;
+}
+
+/* ================= 流式下载：边下边写 + 断点续传 ================= */
+/* 先写 <path>.part，下完再改名为 path：整集不进内存，100MB 播客也只占
+ * 64KB 缓冲。中途断线/取消保留 .part，下次从已有字节数续传
+ * （Range: bytes=N-）；服务端忽略 Range 返回 200 时自动从头重来。
+ * pDiskError 置 1 表示写盘失败（换缓存目录重试可能成功）。
+ * 进度消息 wParam=0..100，lParam=gen。返回 1=完成，0=失败/取消。 */
+static int HttpDownloadFile(const wchar_t *url, const wchar_t *path,
+                            UINT progressMsg, void * volatile *pReqSlot,
+                            volatile long *pProgGen, int *pDiskError)
+{
+    wchar_t part[MAX_PATH + 8];
+    wchar_t host[256], upath[2048];
+    URL_COMPONENTS uc;
+    char *buf;
+    int attempt;
+
+    if (pDiskError) *pDiskError = 0;
+    swprintf(part, MAX_PATH + 8, L"%ls.part", path);
+    buf = (char*)malloc(DL_BUF_SIZE);
+    if (!buf) return 0;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        HINTERNET hSes = NULL, hCon = NULL, hReq = NULL;
+        FILE *f = NULL;
+        unsigned __int64 offset = 0, written = 0, total = 0;
+        DWORD contentLen = 0, status = 0;
+        int ok = 0, diskErr = 0, restart = 0, canceled = 0;
+
+        if (attempt == 0) {   /* 上次没下完的部分接着下 */
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            if (GetFileAttributesExW(part, GetFileExInfoStandard, &fa))
+                offset = ((unsigned __int64)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        }
+
+        ZeroMemory(&uc, sizeof(uc));
+        uc.dwStructSize = sizeof(uc);
+        uc.lpszHostName = host; uc.dwHostNameLength = 256;
+        uc.lpszUrlPath  = upath; uc.dwUrlPathLength  = 2048;
+        if (!WinHttpCrackUrl(url, 0, 0, &uc)) goto done;
+
+        hSes = WinHttpOpenUser();
+        if (!hSes) goto done;
+        WinHttpSetTimeouts(hSes, 30000, 30000, 60000, 60000);
+        hCon = WinHttpConnect(hSes, host,
+            uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
+                                                : INTERNET_DEFAULT_HTTP_PORT, 0);
+        if (!hCon) goto done;
+        hReq = WinHttpOpenRequest(hCon, L"GET", upath, NULL,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!hReq) goto done;
+        if (pReqSlot)
+            InterlockedExchangePointer((PVOID volatile*)pReqSlot, (PVOID)hReq);
+
+        /* 不请求 gzip：音频按原始字节落盘，长度才能和 Content-Length 对上 */
+        {
+            wchar_t rng[96];
+            const wchar_t *hdr = WINHTTP_NO_ADDITIONAL_HEADERS;
+            DWORD hdrLen = 0;
+            if (offset > 0) {
+                wchar_t num[24];
+                U64ToW(offset, num);
+                swprintf(rng, 96, L"Range: bytes=%ls-\r\n", num);
+                hdr = rng;
+                hdrLen = (DWORD)-1L;
+            }
+            if (!WinHttpSendRequest(hReq, hdr, hdrLen,
+                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto done;
+        }
+        if (!WinHttpReceiveResponse(hReq, NULL)) goto done;
+
+        {
+            DWORD sz = sizeof(status);
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                NULL, &status, &sz, NULL);
+        }
+        if (status == 416) { restart = 1; goto done; }   /* 部分文件失效：整份重来 */
+        if (status < 200 || status >= 300) goto done;
+
+        if (status == 206 && offset > 0) {
+            /* 校验区间起点，服务端给了别的区间就不能往尾部追加 */
+            wchar_t cr[128];
+            DWORD sz = sizeof(cr);
+            if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_RANGE, NULL,
+                    cr, &sz, NULL) && WFirstU64(cr) != offset) {
+                restart = 1;
+                goto done;
+            }
+        } else if (status != 206 && offset > 0) {
+            offset = 0;   /* 服务端忽略了 Range：从头写 */
+        }
+
+        {
+            DWORD sz = sizeof(contentLen);
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                NULL, &contentLen, &sz, NULL);
+        }
+        total = offset + contentLen;
+
+        f = _wfopen(part, offset > 0 ? L"ab" : L"wb");
+        if (!f) { diskErr = 1; goto done; }
+
+        for (;;) {
+            DWORD avail = 0, got = 0;
+            if (!WinHttpQueryDataAvailable(hReq, &avail)) break;
+            if (avail == 0) { ok = 1; break; }
+            if (avail > DL_BUF_SIZE) avail = DL_BUF_SIZE;
+            if (!WinHttpReadData(hReq, buf, avail, &got)) break;
+            if (got == 0) { ok = 1; break; }
+            if (fwrite(buf, 1, got, f) != got) { diskErr = 1; break; }
+            written += got;
+            if (progressMsg && contentLen > 0 && total > 0)
+                PostMessageW(g_hwnd, progressMsg,
+                    (WPARAM)((offset + written) * 100 / total),
+                    (LPARAM)(pProgGen ? *pProgGen : 0));
+        }
+        if (f) {
+            if (fflush(f) != 0) diskErr = 1;
+            if (fclose(f) != 0) diskErr = 1;
+            f = NULL;
+        }
+        if (contentLen > 0 && written < contentLen) ok = 0;   /* 提前断流 */
+
+done:
+        if (f) fclose(f);
+        if (hReq) {
+            HINTERNET own = pReqSlot
+                ? (HINTERNET)InterlockedExchangePointer((PVOID volatile*)pReqSlot, NULL)
+                : hReq;
+            if (pReqSlot && !own) canceled = 1;   /* UI 关掉了句柄：用户取消 */
+            if (own) WinHttpCloseHandle(own);
+        }
+        if (hCon) WinHttpCloseHandle(hCon);
+        if (hSes) WinHttpCloseHandle(hSes);
+
+        if (restart) { DeleteFileW(part); continue; }
+        if (ok && !diskErr && !canceled &&
+            MoveFileExW(part, path, MOVEFILE_REPLACE_EXISTING)) {
+            free(buf);
+            return 1;
+        }
+        if (diskErr && pDiskError) *pDiskError = 1;
+        free(buf);
+        return 0;
+    }
+    free(buf);
+    return 0;
+}
+
 /* ================= XML 解析 ================= */
 /* 在 xml 中找 <tag ...>，tag 后必须是 > 空格 / 等边界 */
 static const char* FindOpenTag(const char *xml, const char *tag)
@@ -3217,6 +3385,14 @@ static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
     swprintf(out, outMax, L"%ls%08lx.mp3", dir, h);
 }
 
+/* 顺手删掉断点续传中间文件 <path>.part（删缓存/清空时用） */
+static void DeletePartFile(const wchar_t *path)
+{
+    wchar_t part[MAX_PATH + 8];
+    swprintf(part, MAX_PATH + 8, L"%ls.part", path);
+    DeleteFileW(part);
+}
+
 /* 查找某剧集已有的字幕：可读名 *_<hash>.vtt/.srt 优先，兼容旧 sub_<hash>.* */
 static int CacheSubFind(unsigned long h, wchar_t *out, int outMax)
 {
@@ -3370,39 +3546,17 @@ static int EnsureCacheDirWritable(void)
     return 0;
 }
 
-/* 校验文件名是否为「前缀 + 8 位十六进制 + '.' + 扩展名」形式的缓存文件。
- * 用于 feed_/cover_/trans_/sub_ 这类固定前缀缓存；音频缓存名可读化后由
- * AudioNameHash 单独校验，避免误删自定义目录里的同名扩展名文件 */
-static int IsCacheFileName(const wchar_t *name, const wchar_t *prefix, const wchar_t *ext)
-{
-    size_t pLen = wcslen(prefix), eLen = wcslen(ext), nLen = wcslen(name);
-    size_t i;
-    if (nLen != pLen + 8 + 1 + eLen) return 0;
-    if (wcsncmp(name, prefix, pLen) != 0) return 0;
-    for (i = 0; i < 8; i++) {
-        wchar_t c = name[pLen + i];
-        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return 0;
-    }
-    if (name[pLen + 8] != L'.') return 0;
-    return wcscmp(name + pLen + 9, ext) == 0;
-}
-
 /* 启动时清理 g_cacheDays 天前的旧缓存（0=关）。
- * 覆盖全部缓存类型：音频 *.mp3、订阅 feed_*.xml/feed_*.hdr、封面 cover_*.img。
- * 只删符合程序命名规则的文件，因此自定义目录里有别的同名扩展名文件也不会被误删 */
+ * 覆盖全部缓存类型：音频、断点续传中间文件、字幕、订阅、封面。
+ * 只删符合「<8hex>.<ext>」或「可读名_<8hex>.<ext>」命名规则的文件，
+ * 因此自定义目录里有别的同名扩展名文件也不会被误删 */
 static void CacheAutoClean(void)
 {
-    static const struct {
-        const wchar_t *prefix;
-        const wchar_t *ext;
-        int matchHash;   /* 1=允许 可读名_<8hex>.<ext>，0=只认 前缀+<8hex>.<ext> */
-    } kinds[] = {
-        { L"",       L"mp3", 1 }, /* 音频 */
-        { L"",       L"vtt", 1 }, /* 字幕（可读名/trans_/sub_ 都覆盖） */
-        { L"",       L"srt", 1 }, /* 字幕 */
-        { L"feed_",  L"xml", 0 }, /* 订阅 XML：feed_<8hex>.xml */
-        { L"feed_",  L"hdr", 0 }, /* 订阅验证器：feed_<8hex>.hdr */
-        { L"cover_", L"img", 0 }, /* 封面：cover_<8hex>.img */
+    static const wchar_t *const exts[] = {
+        L"mp3", L"mp3.part",           /* 音频 / 未下完的音频 */
+        L"vtt", L"srt",                /* 字幕（可读名/trans_/sub_ 都覆盖） */
+        L"xml", L"hdr",                /* 订阅 XML / 验证器 */
+        L"jpg", L"jpeg", L"png", L"gif", L"webp", L"bmp", L"img",  /* 封面 */
     };
     wchar_t cdir[MAX_PATH], pat[MAX_PATH];
     WIN32_FIND_DATAW fd;
@@ -3416,20 +3570,14 @@ static void CacheAutoClean(void)
     ullNow.LowPart = ftNow.dwLowDateTime;
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
-    for (k = 0; k < (int)(sizeof(kinds) / sizeof(kinds[0])); k++) {
-        swprintf(pat, MAX_PATH, L"%ls%ls*.%ls", cdir, kinds[k].prefix, kinds[k].ext);
+    for (k = 0; k < (int)(sizeof(exts) / sizeof(exts[0])); k++) {
+        swprintf(pat, MAX_PATH, L"%ls*.%ls", cdir, exts[k]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             wchar_t fp[MAX_PATH];
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            {
-                unsigned long fh;
-                int ok = kinds[k].matchHash
-                    ? CacheNameHash(fd.cFileName, kinds[k].ext, &fh, NULL)
-                    : IsCacheFileName(fd.cFileName, kinds[k].prefix, kinds[k].ext);
-                if (!ok) continue;
-            }
+            if (!CacheNameHash(fd.cFileName, exts[k], NULL, NULL)) continue;
             ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
             ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
             if (ullFile.QuadPart < ullNow.QuadPart) {
@@ -5806,9 +5954,6 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     DlJob *job = (DlJob*)param;
     EpReady *r;
     wchar_t cache[MAX_PATH];
-    DWORD len = 0;
-    char *data;
-    FILE *f;
 
     r = (EpReady*)calloc(1, sizeof(EpReady));
     if (!r) {
@@ -5825,12 +5970,11 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
     if (r->url) {
         CachePathFor(r->url, cache, MAX_PATH);
         EnsureCacheDir();
-        /* 一律先拿路径锁再判文件存在：批量线程先把整集下载到内存再
-         * fopen+fwrite 落盘，fwrite 窗口内文件已存在但只是半成品，
-         * 锁前判存在会播到截断文件；锁内双检则必然看到完整文件。
-         * 等待期间被切歌/停止（gen 作废）就直接放弃，不做无意义下载。
-         * gotLock 与 gen 分开判定，保证拿到的锁一定释放，
-         * 即使 gen 在拿到锁的瞬间作废 */
+        /* 一律先拿路径锁再判文件存在：两个通道可能同时下同一集，
+         * 锁保证只有一个线程碰 <hash>.mp3.part；锁内双检则必然看到
+         * 对方刚改名完成的完整文件。等待期间被切歌/停止（gen 作废）
+         * 就直接放弃，不做无意义下载。gotLock 与 gen 分开判定，
+         * 保证拿到的锁一定释放，即使 gen 在拿到锁的瞬间作废 */
         int gotLock = 0;
         while (!gotLock) {
             if (InterlockedCompareExchange(&g_dlGen, 0, 0) != job->gen) break;
@@ -5842,28 +5986,19 @@ static DWORD WINAPI EpisodeDlThread(LPVOID param)
                 if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
                     r->ok = 1;  /* 已缓存（含批量线程刚写完的） */
                 } else {
-                    data = HttpFetch(r->url, &len, WM_APP_DL_PROGRESS,
-                                     &job->reqSlot, &job->gen);
-                    if (data && len > 0) {
-                        f = _wfopen(cache, L"wb");
-                        if (!f) {
-                            /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
-                            g_cacheDir[0] = 0;
-                            EnsureCacheDir();
-                            CachePathFor(r->url, cache, MAX_PATH);
-                            f = _wfopen(cache, L"wb");
-                            if (f) {
-                                r->ok = (fwrite(data, 1, len, f) == len);
-                                fclose(f);
-                            } else {
-                                r->diskError = 1;   /* 标记：缓存目录不可写 */
-                            }
-                        } else {
-                            r->ok = (fwrite(data, 1, len, f) == len);
-                            fclose(f);
-                        }
+                    int diskErr = 0;
+                    r->ok = HttpDownloadFile(r->url, cache, WM_APP_DL_PROGRESS,
+                                             &job->reqSlot, &job->gen, &diskErr);
+                    if (!r->ok && diskErr) {
+                        /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
+                        g_cacheDir[0] = 0;
+                        EnsureCacheDir();
+                        CachePathFor(r->url, cache, MAX_PATH);
+                        diskErr = 0;
+                        r->ok = HttpDownloadFile(r->url, cache, WM_APP_DL_PROGRESS,
+                                                 &job->reqSlot, &job->gen, &diskErr);
+                        r->diskError = diskErr;   /* 换目录仍写不了才报错 */
                     }
-                    free(data);
                 }
             }
             /* 已存在/新写完都要归位：下载期间切过缓存目录时路径会变 */
@@ -5888,6 +6023,8 @@ typedef struct {
     int                 cap, count, head;   /* head=已取出数，只增不减 */
     int                 doneCount;          /* 已下完数（≠head：取出后还在下载） */
     int                 okCount;
+    int                *pct;         /* 与 urls 平行的每集百分比，cur 有效 */
+    int                 cur;         /* 正在下载的队列下标，-1=空闲 */
     int                 truncated;   /* 选中数超过 256 上限时置 1 */
     volatile LONG       cancel;      /* 1=停止：中断当前下载并丢弃剩余队列 */
     void * volatile     reqSlot;     /* 当前 HttpFetch 请求句柄，关闭即中止 */
@@ -5901,9 +6038,6 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
     for (;;) {
         wchar_t *url;
         wchar_t cache[MAX_PATH];
-        DWORD len = 0;
-        char *data = NULL;
-        FILE *f;
         int ok = 0;
 
         EnterCriticalSection(&bc->cs);
@@ -5914,13 +6048,15 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
             break;
         }
         url = bc->urls[bc->head++];
+        bc->cur = bc->head - 1;   /* 列表行据此显示本集百分比 */
+        if (bc->pct && bc->cur < bc->count) bc->pct[bc->cur] = 0;
         LeaveCriticalSection(&bc->cs);
 
         if (url && url[0]) {
             CachePathFor(url, cache, MAX_PATH);
             EnsureCacheDir();
-            /* lock-first 与单集线程对称：对方的 fopen→fwrite→fclose 窗口内
-             * 文件已存在但只是半成品，锁前判存在会误判 ok=1；锁内双检则安全。
+            /* lock-first 与单集线程对称：两个通道可能同时下同一集，
+             * 锁保证同一时刻只有一个线程写 <hash>.mp3.part。
              * gotLock 与 cancel 分开判定：拿到的锁必须释放，
              * 即使取消信号在拿锁成功的瞬间到达 */
             {
@@ -5935,31 +6071,24 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
                         if (GetFileAttributesW(cache) != INVALID_FILE_ATTRIBUTES) {
                             ok = 1;   /* 单集/本批次其它线程已写完 */
                         } else {
-                            data = HttpFetch(url, &len, WM_APP_BATCH_PROGRESS,
-                                             &bc->reqSlot, NULL);
-                            if (data && len > 0) {
-                                f = _wfopen(cache, L"wb");
-                                if (!f) {
-                                    /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
-                                    g_cacheDir[0] = 0;
-                                    EnsureCacheDir();
-                                    CachePathFor(url, cache, MAX_PATH);
-                                    f = _wfopen(cache, L"wb");
-                                    if (f) {
-                                        ok = (fwrite(data, 1, len, f) == len);
-                                        fclose(f);
-                                    } else {
-                                        /* 回退后仍失败：发一次警告（用自定义消息） */
-                                        static int warned = 0;
-                                        if (!warned) { warned = 1;
-                                            PostMessageW(g_hwnd, WM_APP_CACHE_NOT_WRITABLE, 0, 0); }
-                                    }
-                                } else {
-                                    ok = (fwrite(data, 1, len, f) == len);
-                                    fclose(f);
+                            int diskErr = 0;
+                            ok = HttpDownloadFile(url, cache, WM_APP_BATCH_PROGRESS,
+                                                  &bc->reqSlot, NULL, &diskErr);
+                            if (!ok && diskErr && !bc->cancel) {
+                                /* 缓存目录不可写：直接改用默认目录（配置同步）再试一次 */
+                                g_cacheDir[0] = 0;
+                                EnsureCacheDir();
+                                CachePathFor(url, cache, MAX_PATH);
+                                diskErr = 0;
+                                ok = HttpDownloadFile(url, cache, WM_APP_BATCH_PROGRESS,
+                                                      &bc->reqSlot, NULL, &diskErr);
+                                if (!ok && diskErr) {
+                                    /* 回退后仍失败：发一次警告（用自定义消息） */
+                                    static int warned = 0;
+                                    if (!warned) { warned = 1;
+                                        PostMessageW(g_hwnd, WM_APP_CACHE_NOT_WRITABLE, 0, 0); }
                                 }
                             }
-                            free(data);
                         }
                         if (ok) CacheFileRelocate(url, cache);
                     }
@@ -5968,6 +6097,9 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
             }
         }
         EnterCriticalSection(&bc->cs);
+        if (!ok && bc->pct && bc->cur >= 0 && bc->cur < bc->count)
+            bc->pct[bc->cur] = 0;   /* 失败的行不留半截进度 */
+        bc->cur = -1;
         if (ok) bc->okCount++;
         bc->doneCount++;
         LeaveCriticalSection(&bc->cs);
@@ -6003,6 +6135,7 @@ static void BatchReleaseAfterFinish(void)
     }
     for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
     free(bc->urls);
+    free(bc->pct);
     DeleteCriticalSection(&bc->cs);
     free(bc);
     g_batch = NULL;
@@ -6051,9 +6184,13 @@ static void StartBatchCache(void)
         if (!bc) return;
         InitializeCriticalSection(&bc->cs);
         InitializeConditionVariable(&bc->cv);
+        bc->cur = -1;
         bc->cap = total + 8;
         bc->urls = (wchar_t**)calloc((size_t)bc->cap, sizeof(wchar_t*));
-        if (!bc->urls) {
+        bc->pct = (int*)calloc((size_t)bc->cap, sizeof(int));
+        if (!bc->urls || !bc->pct) {
+            free(bc->urls);
+            free(bc->pct);
             DeleteCriticalSection(&bc->cs);
             free(bc);
             return;
@@ -6068,7 +6205,9 @@ static void StartBatchCache(void)
      * 重置后条件 head>=count 仍成立，线程不会因伪唤醒提前行动 */
     if (bc->thread && bc->head >= bc->count) {
         for (int j = 0; j < bc->count; j++) free(bc->urls[j]);
+        if (bc->pct) memset(bc->pct, 0, (size_t)bc->cap * sizeof(int));
         bc->count = bc->head = bc->okCount = bc->doneCount = 0;
+        bc->cur = -1;
         bc->truncated = 0;
     }
     for (i = 0; i < total; i++) {
@@ -6081,8 +6220,12 @@ static void StartBatchCache(void)
         if (e->localFile || EpisodeIsCached(e)) continue;
         if (bc->count >= bc->cap) {
             int ncap = bc->cap * 2;
-            wchar_t **nb = (wchar_t**)realloc(bc->urls,
-                                               (size_t)ncap * sizeof(wchar_t*));
+            int *np = (int*)realloc(bc->pct, (size_t)ncap * sizeof(int));
+            wchar_t **nb;
+            if (!np) break;
+            bc->pct = np;
+            memset(np + bc->cap, 0, (size_t)(ncap - bc->cap) * sizeof(int));
+            nb = (wchar_t**)realloc(bc->urls, (size_t)ncap * sizeof(wchar_t*));
             if (!nb) break;
             bc->urls = nb;
             bc->cap = ncap;
@@ -6100,6 +6243,7 @@ static void StartBatchCache(void)
         if (!bc->thread && bc->count == 0) {
             g_batch = NULL;
             free(bc->urls);
+            free(bc->pct);
             DeleteCriticalSection(&bc->cs);
             free(bc);
         } else {
@@ -6131,6 +6275,7 @@ static void StartBatchCache(void)
             int bi;
             for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
             free(bc->urls);
+            free(bc->pct);
             DeleteCriticalSection(&bc->cs);
             free(bc);
             g_batch = NULL;
@@ -6177,6 +6322,36 @@ static int EpisodeBatchQueued(int ep)
     }
     LeaveCriticalSection(&bc->cs);
     return found;
+}
+
+/* 该集当前下载百分比（0=不在下载中），列表行用它当时长列的临时标签 */
+static int EpisodeBatchPercent(int ep)
+{
+    int j, pct = 0;
+    Podcast *p;
+    BatchCache *bc = g_batch;
+    if (!bc || !bc->pct || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
+        return 0;
+    p = &g_pods[g_curPod];
+    if (ep < 0 || ep >= p->epCount || !p->eps[ep].url) return 0;
+    EnterCriticalSection(&bc->cs);
+    for (j = 0; j < bc->count; j++) {
+        if (bc->urls[j] && bc->urls[j][0] &&
+            wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
+            pct = bc->pct[j];
+            break;
+        }
+    }
+    LeaveCriticalSection(&bc->cs);
+    return pct;
+}
+
+/* 该行是否就是正在播放目标（下载准备中/播放中/暂停中均算） */
+static int EpisodeRowPlaying(int ep)
+{
+    if (g_playPod < 0 || ep < 0 || ep != g_playEp) return 0;
+    if (g_viewCached) return g_playPod == g_podCount;
+    return g_curPod >= 0 && g_curPod < g_podCount && g_playPod == g_curPod;
 }
 
 /* ================= 音频信息探测 ================= */
@@ -8184,6 +8359,7 @@ static void DeletePodcastCache(int i)
             wchar_t path[MAX_PATH];
             CachePathFor(e->url, path, MAX_PATH);
             DeleteFileW(path);
+            DeletePartFile(path);
             DropEpTranscript(e);
         }
     }
@@ -8211,6 +8387,7 @@ static void DeleteEpisodeCache(int pod, int ep)
             wchar_t path[MAX_PATH];
             CachePathFor(e->url, path, MAX_PATH);
             DeleteFileW(path);
+            DeletePartFile(path);
             DropEpTranscript(e);
         }
     }
@@ -14084,16 +14261,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     int row = (int)cd->nmcd.dwItemSpec;   /* 列表行号 */
                     int ep  = EpIdxOfRow(row);            /* 剧集下标 */
                     Podcast *p = ActivePodcast();
-                    int playing = 0;
                     /* 正在播放目标（下载准备中/播放中/暂停中均算）标绿。
                      * 用独立的 g_playEp，用户点选其他行不会让绿色乱跑；
                      * g_playPod 在 PlayerStop 或播放失败时清空。 */
-                    if (g_playPod >= 0 && ep >= 0 && ep == g_playEp) {
-                        if (g_viewCached)
-                            playing = (g_playPod == g_podCount);
-                        else if (g_curPod >= 0 && g_curPod < g_podCount)
-                            playing = (g_playPod == g_curPod);
-                    }
+                    int playing = EpisodeRowPlaying(ep);
                     int cached = 0;
                     int queued = 0;
                     int lastmark = 0;
@@ -14131,7 +14302,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             : cached ? ThYellow()
                             : (sel ? ThSelText() : ThText());
                     }
-                    return CDRF_NEWFONT;
+                    return queued ? (CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT)
+                                  : CDRF_NEWFONT;
+                } else if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                    /* 批量下载中的行：时长列临时让位给百分比标签 */
+                    int row = (int)cd->nmcd.dwItemSpec;
+                    int ep  = EpIdxOfRow(row);
+                    int pct = EpisodeBatchPercent(ep);
+                    RECT r;
+                    wchar_t s[16];
+                    if (pct <= 0 || pct >= 100) return CDRF_DODEFAULT;
+                    r.left = LVIR_BOUNDS;
+                    r.top  = 2;   /* LVM_GETSUBITEMRECT：top=子项下标（时长列） */
+                    if (!SendMessageW(g_listEp, LVM_GETSUBITEMRECT,
+                                      (WPARAM)row, (LPARAM)&r))
+                        return CDRF_DODEFAULT;
+                    FillRectColor(cd->nmcd.hdc, &r,
+                                  EpisodeRowPlaying(ep) ? ThGreenBg()
+                                  : (ListView_GetItemState(g_listEp, row, LVIS_SELECTED)
+                                     & LVIS_SELECTED) ? ThSel()
+                                  : ThPanel());
+                    swprintf(s, 16, L"%d%%", pct);
+                    r.right -= 8;
+                    SetBkMode(cd->nmcd.hdc, TRANSPARENT);
+                    SelectObject(cd->nmcd.hdc, g_font);
+                    SetTextColor(cd->nmcd.hdc, ThBlue());
+                    DrawTextW(cd->nmcd.hdc, s, -1, &r,
+                              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    return CDRF_DODEFAULT;
                 }
             }
         }
@@ -14327,13 +14525,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         BatchCache *bc = g_batch;
         if (bc && g_batchActive) {
             wchar_t st[128];
-            int head, cnt, len;
+            int head, cnt, len, changed = 0, pct = (int)wParam;
             EnterCriticalSection(&bc->cs);
             head = bc->head; cnt = bc->count;
+            if (bc->pct && bc->cur >= 0 && bc->cur < bc->count) {
+                changed = (bc->pct[bc->cur] != pct);
+                bc->pct[bc->cur] = pct;   /* 列表行百分比 */
+            }
             LeaveCriticalSection(&bc->cs);
             len = swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), head, cnt);
-            swprintf(st + len, 128 - len, L" %d%%", (int)wParam);
+            swprintf(st + len, 128 - len, L" %d%%", pct);
             SetBatchProgress(st);
+            if (changed) InvalidateRect(g_listEp, NULL, FALSE);
         }
         return 0;
     }
