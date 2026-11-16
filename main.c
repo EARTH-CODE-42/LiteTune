@@ -430,6 +430,15 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_BATCH_PROGRESS (WM_APP + 16) /* wParam=当前集百分比 0-100 */
 #define WM_APP_SEARCH_DONE    (WM_APP + 17) /* lParam=SearchResult* */
 #define WM_APP_CACHE_NOT_WRITABLE (WM_APP + 18)  /* 缓存目录不可写（UI 线程提示） */
+
+/* 拖放高亮：悬停剧集行（用于字幕拖放时视觉提示） */
+static int g_dragRow = -1;   /* -1 = 不在拖放态或未悬停到剧集行 */
+#ifndef WM_DRAGOVER
+#define WM_DRAGOVER  0x02E3
+#endif
+#ifndef WM_DRAGLEAVE
+#define WM_DRAGLEAVE 0x02E4
+#endif
 #define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
@@ -505,6 +514,7 @@ enum {
     TR_FAV_BATCH_ON_FMT, TR_FAV_BATCH_OFF_FMT,
     TR_TB_EXIT, TR_M_REFRESH_NOW,
     TR_CTX_IMPORT_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
+    TR_DROP_NO_EP,
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_N
 };
@@ -624,6 +634,7 @@ static const wchar_t *tr(int id)
         L"输入字幕网络地址，或本地 VTT/SRT 文件(留空则清除)：",
         L"字幕已保存",
         L"需填写 http:// 或 https:// 开头的地址，或选择一个存在的字幕文件",
+        L"请把字幕拖到某一集上",
         L"简介", L"字幕", L"字幕开", L"字幕关"
     };
     static const wchar_t *const en[TR_N] = {
@@ -760,6 +771,7 @@ static const wchar_t *tr(int id)
         L"Enter a subtitle URL or a local VTT/SRT file (leave empty to clear):",
         L"Subtitle saved",
         L"Enter a URL starting with http:// or https://, or pick an existing subtitle file",
+        L"Drop the subtitle onto an episode row",
         L"Notes", L"Subs", L"Subs on", L"Subs off"
     };
     return (g_lang ? en : zh)[id];
@@ -3255,18 +3267,20 @@ static void CacheDir(wchar_t *out, int outMax)
 }
 
 /* URL → 缓存名哈希（与旧版一致，保证已下载的文件仍能命中） */
-static unsigned long CacheUrlHash(const wchar_t *url)
+/* 固定 32 位 URL 哈希（djb2），用于音频/字幕缓存文件名。
+ * 显式用 unsigned int 确保 64 位 MinGW 下仍是 32 位，避免 %08x 输出格式不固定 */
+static unsigned int CacheUrlHash(const wchar_t *url)
 {
-    unsigned long h = 5381;
+    unsigned int h = 5381u;
     const wchar_t *p = url;
-    while (*p) h = ((h << 5) + h) ^ (unsigned long)*p++;
+    while (*p) h = ((h << 5) + h) ^ (unsigned int)*p++;
     return h;
 }
 
 /* 从缓存文件名解析哈希：<8hex>.<ext> 或 可读名_<8hex>.<ext>。
  * 返回 1=符合规则；*legacy 置 1 表示旧格式（无前缀） */
 static int CacheNameHash(const wchar_t *name, const wchar_t *ext,
-                         unsigned long *ph, int *legacy)
+                         unsigned int *ph, int *legacy)
 {
     size_t n = wcslen(name), el = wcslen(ext), i;
     wchar_t hex[9];
@@ -3280,12 +3294,12 @@ static int CacheNameHash(const wchar_t *name, const wchar_t *ext,
     }
     wcsncpy(hex, name + n - el - 9, 8);
     hex[8] = 0;
-    *ph = wcstoul(hex, NULL, 16);
+    *ph = (unsigned int)wcstoul(hex, NULL, 16);
     if (legacy) *legacy = (n == el + 9);
     return 1;
 }
 
-static int AudioNameHash(const wchar_t *name, unsigned long *ph, int *legacy)
+static int AudioNameHash(const wchar_t *name, unsigned int *ph, int *legacy)
 {
     return CacheNameHash(name, L"mp3", ph, legacy);
 }
@@ -3310,7 +3324,7 @@ static void SanitizeSeg(const wchar_t *src, wchar_t *dst, int maxChars)
 /* 生成缓存文件名主干：<dir>播客名_剧集名_<8hex>（不含扩展名）。
  * 两段各限 60 字，再按目录长度压缩，保证加扩展名后不超 MAX_PATH */
 static void CacheNameBase(const wchar_t *dir, const wchar_t *podTitle,
-                          const wchar_t *epTitle, unsigned long h,
+                          const wchar_t *epTitle, unsigned int h,
                           wchar_t *out, int outMax)
 {
     wchar_t pod[72], ep[72];
@@ -3328,12 +3342,12 @@ static void CacheNameBase(const wchar_t *dir, const wchar_t *podTitle,
         else if (ne > 8) ep[--ne] = 0;
         else break;
     }
-    swprintf(out, outMax, L"%ls%ls_%ls_%08lx", dir, pod, ep, h);
+    swprintf(out, outMax, L"%ls%ls_%ls_%08x", dir, pod, ep, h);
 }
 
 /* 音频缓存全路径：主名 + .mp3（与字幕同名，仅扩展名不同） */
 static void CacheNameFor(const wchar_t *dir, const wchar_t *podTitle,
-                         const wchar_t *epTitle, unsigned long h,
+                         const wchar_t *epTitle, unsigned int h,
                          wchar_t *out, int outMax)
 {
     wchar_t base[MAX_PATH];
@@ -3342,14 +3356,14 @@ static void CacheNameFor(const wchar_t *dir, const wchar_t *podTitle,
 }
 
 /* 查找某哈希已有的缓存文件：先找可读名 *_<hash>.mp3，再找旧格式 <hash>.mp3 */
-static int CacheFindFor(unsigned long h, wchar_t *out, int outMax)
+static int CacheFindFor(unsigned int h, wchar_t *out, int outMax)
 {
     wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[16];
     WIN32_FIND_DATAW fd;
     HANDLE f;
 
     CacheDir(dir, MAX_PATH);
-    swprintf(suffix, 16, L"_%08lx.mp3", h);
+    swprintf(suffix, 16, L"_%08x.mp3", h);
     swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
@@ -3366,7 +3380,7 @@ static int CacheFindFor(unsigned long h, wchar_t *out, int outMax)
             return 1;
         }
     }
-    swprintf(pat, MAX_PATH, L"%ls%08lx.mp3", dir, h);
+    swprintf(pat, MAX_PATH, L"%ls%08x.mp3", dir, h);
     if (GetFileAttributesW(pat) != INVALID_FILE_ATTRIBUTES) {
         wcsncpy(out, pat, outMax - 1);
         out[outMax - 1] = 0;
@@ -3378,11 +3392,11 @@ static int CacheFindFor(unsigned long h, wchar_t *out, int outMax)
 /* 缓存路径：已存在的文件（新/旧命名）优先，都没有则给旧格式路径供下载线程写入 */
 static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
 {
-    unsigned long h = CacheUrlHash(url);
+    unsigned int h = CacheUrlHash(url);
     wchar_t dir[MAX_PATH];
     if (CacheFindFor(h, out, outMax)) return;
     CacheDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%ls%08lx.mp3", dir, h);
+    swprintf(out, outMax, L"%ls%08x.mp3", dir, h);
 }
 
 /* 顺手删掉断点续传中间文件 <path>.part（删缓存/清空时用） */
@@ -3394,7 +3408,8 @@ static void DeletePartFile(const wchar_t *path)
 }
 
 /* 查找某剧集已有的字幕：可读名 *_<hash>.vtt/.srt 优先，兼容旧 sub_<hash>.* */
-static int CacheSubFind(unsigned long h, wchar_t *out, int outMax)
+/* 字幕缓存查找：先找可读名 *_<hash>.vtt/.srt，再找旧格式 sub_<hash>.vtt/.srt */
+static int CacheSubFind(unsigned int h, wchar_t *out, int outMax)
 {
     static const wchar_t *exts[2] = { L"vtt", L"srt" };
     wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[24];
@@ -3407,7 +3422,7 @@ static int CacheSubFind(unsigned long h, wchar_t *out, int outMax)
         size_t sl;
         int hit = 0;
 
-        swprintf(suffix, 24, L"_%08lx.%ls", h, exts[i]);
+        swprintf(suffix, 24, L"_%08x.%ls", h, exts[i]);
         swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
         sl = wcslen(suffix);
         f = FindFirstFileW(pat, &fd);
@@ -3423,14 +3438,14 @@ static int CacheSubFind(unsigned long h, wchar_t *out, int outMax)
             swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
             return 1;
         }
-        swprintf(out, outMax, L"%lssub_%08lx.%ls", dir, h, exts[i]);
+        swprintf(out, outMax, L"%lssub_%08x.%ls", dir, h, exts[i]);
         if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
     }
     return 0;
 }
 
 /* 删除某剧集全部字幕缓存（新旧两种命名都覆盖） */
-static void CacheSubDelete(unsigned long h)
+static void CacheSubDelete(unsigned int h)
 {
     wchar_t p[MAX_PATH];
     while (CacheSubFind(h, p, MAX_PATH)) DeleteFileW(p);
@@ -3442,7 +3457,7 @@ static void CacheRenameOne(const wchar_t *url, const wchar_t *podTitle,
                            const wchar_t *epTitle, wchar_t *out, int outMax)
 {
     wchar_t dir[MAX_PATH], dst[MAX_PATH];
-    unsigned long h;
+    unsigned int h;
     int legacy = 0;
     const wchar_t *fn;
 
@@ -3475,7 +3490,7 @@ static void CacheRenameKnownAll(void)
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         wchar_t src[MAX_PATH];
-        unsigned long fh;
+        unsigned int fh;
         int legacy, pi, ei, found = 0;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (!AudioNameHash(fd.cFileName, &fh, &legacy) || !legacy) continue;
@@ -3654,7 +3669,7 @@ static void LoadCachePodcast(void)
         dot = (int)wcslen(base);
         if (dot >= 4) base[dot - 4] = 0;
         {
-            unsigned long fh;
+            unsigned int fh;
             int legacy = 0;
             if (AudioNameHash(fd.cFileName, &fh, &legacy) && !legacy &&
                 dot > 9 && base[dot - 9] == L'_')
@@ -3971,40 +3986,53 @@ static const char* SubOvFind(unsigned int hash)
     return NULL;
 }
 
-/* url 为空/NULL 删除记录，否则写入（同一哈希只留一条） */
+/* SubOv 语义升级：
+ *   NULL entry          → 无覆盖（用 RSS 原始 transcriptUrl）
+ *   entry.url == ""     → 显式覆盖为空（不加载任何字幕，忽略 RSS）
+ *   entry.url == "local"→ 本地导入覆盖（CacheSubFind 命中的本地文件有效，忽略 RSS）
+ *   entry.url == http…  → 网络地址覆盖
+ * 空串/NULL 不再删除 entry，而是保留一个空 entry（能跟"无覆盖"区分开）。
+ * 彻底删除 entry 用 SubOvRemove(h)——供"清除本地字幕缓存+恢复RSS默认"使用 */
 static void SubOvSet(unsigned int hash, const char *url)
 {
     int i;
     if (hash == 0) return;
     for (i = 0; i < g_subOvCount; i++) {
         if (g_subOvs[i].hash == hash) {
-            if (!url || !*url) {
-                free(g_subOvs[i].url);
-                memmove(&g_subOvs[i], &g_subOvs[i + 1],
-                        (g_subOvCount - i - 1) * sizeof(SubOv));
-                g_subOvCount--;
-                return;
-            }
-            {
-                char *nu = _strdup(url);
-                if (!nu) return;
-                free(g_subOvs[i].url);
-                g_subOvs[i].url = nu;
-            }
+            char *nu = _strdup(url ? url : "");
+            if (!nu) return;
+            free(g_subOvs[i].url);
+            g_subOvs[i].url = nu;
             return;
         }
     }
-    if (!url || !*url || g_subOvCount >= 256) return;
+    if (g_subOvCount >= 256) return;
     if (g_subOvCount >= g_subOvCap) {
         int nc = g_subOvCap ? g_subOvCap * 2 : 16;
         SubOv *nb = (SubOv*)realloc(g_subOvs, nc * sizeof(SubOv));
         if (!nb) return;
         g_subOvs = nb; g_subOvCap = nc;
     }
-    g_subOvs[g_subOvCount].url = _strdup(url);
+    g_subOvs[g_subOvCount].url = _strdup(url ? url : "");
     if (!g_subOvs[g_subOvCount].url) return;
     g_subOvs[g_subOvCount].hash = hash;
     g_subOvCount++;
+}
+
+/* 从覆盖表中完全移除 entry（与 SubOvSet 相反） */
+static void SubOvRemove(unsigned int hash)
+{
+    int i;
+    if (hash == 0) return;
+    for (i = 0; i < g_subOvCount; i++) {
+        if (g_subOvs[i].hash == hash) {
+            free(g_subOvs[i].url);
+            memmove(&g_subOvs[i], &g_subOvs[i + 1],
+                    (g_subOvCount - i - 1) * sizeof(SubOv));
+            g_subOvCount--;
+            return;
+        }
+    }
 }
 
 static void SubOvFreeAll(void)
@@ -5471,7 +5499,7 @@ typedef struct {
     char *epUrl;
     char *transUrl;
     wchar_t *subPath;
-    unsigned long hash;   /* 剧集 URL 哈希，与音频同主名 */
+    unsigned int hash;   /* 剧集 URL 哈希，与音频同主名 */
 } SubLoadParam;
 
 static DWORD WINAPI TranscriptLoaderThread(LPVOID param)
@@ -7715,14 +7743,30 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
     SetWindowTextW(g_editDesc, buf);
 
     /* 加载该集字幕（异步，下载完回 UI 线程解析刷新）。
-     * 手动指定的地址优先于 RSS 里的 podcast:transcript；
+     * SubOv 四种状态决定 LoadTranscript 参数：
+     *   NULL      → RSS 原始 transcriptUrl（默认）
+     *   ""        → 显式清除：完全不加载字幕
+     *   "local"   → 本地导入：让 CacheSubFind 命中本地文件；没命中也不联网
+     *   http…     → 网络 URL 覆盖：命中本地则用，没命中则联网下载
      * 正在播别的一集时（只是浏览）不动字幕，桌面字幕继续跟播放内容 */
     if (SubFollowsEpisode(e->url)) {
-        char *u8 = e->localFile ? NULL : WToU8(e->url);
-        const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
-        LoadTranscript(e->localFile ? NULL : e->url, p->title, e->title,
-                       ov ? ov : e->transcriptUrl);
-        free(u8);
+        if (e->localFile) {
+            LoadTranscript(NULL, p->title, e->title, NULL);
+        } else {
+            char *u8 = WToU8(e->url);
+            const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
+            const char *tu;
+            const wchar_t *eu;
+            if (ov && ov[0] == 0) {       /* 显式空：不管 RSS 原始还是本地缓存，都不加载 */
+                eu = NULL; tu = NULL;
+            } else if (ov && strcmp(ov, "local") == 0) {  /* 本地覆盖：走缓存查找，不联网 */
+                eu = e->url; tu = NULL;
+            } else {                                        /* NULL / http… */
+                eu = e->url; tu = (ov && ov[0]) ? ov : e->transcriptUrl;
+            }
+            LoadTranscript(eu, p->title, e->title, tu);
+            free(u8);
+        }
         SubRefreshUI();
     }
 }
@@ -8306,8 +8350,9 @@ static void RefreshSinglePodcast(int i)
     EnqueueRefreshUrl(g_pods[i].feedUrl);
 }
 
-/* 删除某集的字幕缓存（可读名/旧 sub_ 名，外加旧版本按字幕地址存的 trans_）；
- * 离线视图的本地文件没有字幕缓存，直接跳过 */
+/* 删除某集的字幕缓存（可读名/旧 sub_ 名，外加旧版本按字幕地址存的 trans_）。
+ * 同时移除 SubOv 里的覆盖 entry——删完字幕就回到"RSS 默认"状态，
+ * 不会再因为还留着 URL 覆盖而自动重下。离线视图的本地文件没有字幕缓存，跳过 */
 static void DropEpTranscript(const Episode *e)
 {
     char *u8;
@@ -8317,11 +8362,12 @@ static void DropEpTranscript(const Episode *e)
     u8 = WToU8(e->url);
     if (!u8) return;
     t = SubOvFind(LastEpHash(u8));
+    /* 移除覆盖 entry：不管原来是网络 URL / "local" / ""，都彻底恢复默认 */
+    SubOvRemove(LastEpHash(u8));
     free(u8);
 
     CacheSubDelete(CacheUrlHash(e->url));
-    if (!t) t = e->transcriptUrl;
-    if (t) {
+    if (t && t[0] && strcmp(t, "local") != 0) {
         UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
         DeleteFileW(path);
     }
@@ -8429,7 +8475,7 @@ static void DeleteAllCacheFiles(void)
         static const wchar_t *sExts[2] = { L"vtt", L"srt" };
         int si;
         for (si = 0; si < 2; si++) {
-            unsigned long fh;
+            unsigned int fh;
             swprintf(pat, MAX_PATH, L"%ls*.%ls", cdir, sExts[si]);
             h = FindFirstFileW(pat, &fd);
             if (h == INVALID_HANDLE_VALUE) continue;
@@ -9305,7 +9351,9 @@ static int AskInputBox(const wchar_t *title, int mode)
     }
     EnableWindow(g_hwnd, TRUE);
     SetForegroundWindow(g_hwnd);
-    return g_ibResult && g_ibBuf[0];
+    /* mode=2（字幕地址）允许空输入（留空 = 清除覆盖）；
+     * 其他 mode 必须非空（订阅 URL、定时分钟数都不能空） */
+    return g_ibResult && (g_ibMode == 2 || g_ibBuf[0]);
 }
 
 /* 弹出输入框；确认后追加订阅并自动刷新 */
@@ -9334,7 +9382,7 @@ static int SaveLocalSub(const Podcast *p, const Episode *e, const wchar_t *srcPa
 {
     char *data;
     DWORD len = 0;
-    unsigned long h;
+    unsigned int h;
     const wchar_t *slash, *dot;
     wchar_t ext[8], dir[MAX_PATH], base[MAX_PATH], dstPath[MAX_PATH];
     FILE *f;
@@ -9376,16 +9424,66 @@ static int SaveLocalSub(const Podcast *p, const Episode *e, const wchar_t *srcPa
     return 1;
 }
 
-/* 导入字幕：可填网络地址，也可填本地文件路径（留空=清除覆盖）。
- * 本地文件复制进 sub_ 缓存；网络地址写入覆盖表；随后立即重载 */
+/* 把本地字幕文件复制进缓存并立即生效（菜单导入 / 拖放共用）。
+ * 同时清掉网络地址覆盖，保证本地同名文件优先。 */
+static void BindLocalSub(int podIdx, int epIdx, const wchar_t *srcPath)
+{
+    Podcast *p;
+    Episode *e;
+    char *u8;
+    unsigned int h;
+
+    if (podIdx == g_podCount) p = &g_cachePod;
+    else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
+    else return;
+    if (epIdx < 0 || epIdx >= p->epCount) return;
+    e = &p->eps[epIdx];
+    if (e->localFile || !e->url) return;
+    if (!SaveLocalSub(p, e, srcPath)) return;
+
+    u8 = WToU8(e->url);
+    if (u8) {
+        h = LastEpHash(u8);
+        free(u8);
+        if (h) {
+            /* 本地导入后：SubOv 标记 "local"（让 LoadTranscript 忽略 RSS 原始，
+             * 让 CacheSubFind 命中本地文件即可）。
+             * SaveLocalSub 内部已先删旧字幕缓存（幂等）再写新的 */
+            SubOvSet(h, "local");
+        }
+    }
+    SetStatusTemp(tr(TR_SUB_SAVED));
+
+    /* 正在播别的集时只保存，等真正播这一集再生效 */
+    if (SubFollowsEpisode(e->url)) {
+        free(g_subTransUrl);
+        g_subTransUrl = NULL;
+        LoadTranscript(e->url, p->title, e->title, e->transcriptUrl);
+        SubRefreshUI();
+    }
+}
+
+/* 导入字幕：对话框预填明确区分四种覆盖状态，提交分支清晰。
+ *
+ * SubOv 四种状态 → 输入框预填:
+ *   NULL        (无覆盖)   → 空（默认用 RSS 原始 transcriptUrl）
+ *   ""          (显式空)   → 空（不管 RSS，都不加载字幕）
+ *   "local"     (本地导入) → 显示缓存中的文件名（让用户看得见"有本地字幕"）
+ *   http…       (网络地址) → 显示 URL
+ *
+ * 用户留空 OK 的语义：
+ *   原来 NULL  → 啥都不做（用户没改，别瞎改配置）
+ *   原来有覆盖 → 移除覆盖 + 删本地缓存（恢复 RSS 默认）
+ *
+ * 用户填 URL → SubOvSet + 删旧本地；填本地路径 → BindLocalSub */
 static void ImportSubtitle(int podIdx, int epIdx)
 {
     Podcast *p;
     Episode *e;
-    unsigned int h;
+    unsigned int h;   /* SubOv 用：LastEpHash(e->url as UTF-8) */
+    unsigned int ah;  /* 字幕缓存用：CacheUrlHash(e->url) */
     char *u8;
     const char *ov;
-    wchar_t *pre;
     int isUrl;
 
     if (podIdx == g_podCount) p = &g_cachePod;
@@ -9394,45 +9492,70 @@ static void ImportSubtitle(int podIdx, int epIdx)
     if (epIdx < 0 || epIdx >= p->epCount) return;
     e = &p->eps[epIdx];
     if (e->localFile || !e->url) return;
+
+    /* 两种不同哈希：SubOv（配置里"URL 覆盖表"）用 LastEpHash；
+     * 字幕缓存文件用 CacheUrlHash（和音频同主名的哈希）。
+     * 后者是字幕实际落盘的查找依据 */
     u8 = WToU8(e->url);
     if (!u8) return;
     h = LastEpHash(u8);
+    ah = CacheUrlHash(e->url);
     free(u8);
     if (h == 0) return;
 
-    /* 预填当前生效的地址（手动值优先） */
+    /* 预填：让用户一眼看出当前字幕状态 */
     ov = SubOvFind(h);
     g_ibBuf[0] = 0;
-    pre = U8ToW(ov ? ov : e->transcriptUrl);
-    if (pre) {
-        wcsncpy(g_ibBuf, pre, 2047);
-        g_ibBuf[2047] = 0;
-        free(pre);
+    if (ov && strcmp(ov, "local") == 0) {
+        /* 本地导入 → 显示缓存里的文件名（不是源路径，是当前生效的那个） */
+        wchar_t found[MAX_PATH], *fn;
+        if (CacheSubFind(ah, found, MAX_PATH)) {
+            fn = wcsrchr(found, L'\\');
+            fn = fn ? fn + 1 : found;
+            wcsncpy(g_ibBuf, fn, 2047);
+            g_ibBuf[2047] = 0;
+        }
+    } else if (ov && ov[0]) {
+        /* 网络 URL → 直接显示 */
+        wchar_t *w = U8ToW(ov);
+        if (w) { wcsncpy(g_ibBuf, w, 2047); g_ibBuf[2047] = 0; free(w); }
     }
-    if (!AskInputBox(tr(TR_SUB_TITLE), 2)) return;
+    /* ov==NULL 或 ov=="" → 输入框空（默认状态或显式清除状态） */
+
+    if (!AskInputBox(tr(TR_SUB_TITLE), 2)) return;   /* Cancel 不做改动 */
 
     isUrl = (wcsncmp(g_ibBuf, L"http://", 7) == 0 ||
              wcsncmp(g_ibBuf, L"https://", 8) == 0);
-    if (g_ibBuf[0] && !isUrl) {
-        /* 本地文件：复制进 sub_ 缓存，并清掉旧的网络地址覆盖 */
-        if (!SaveLocalSub(p, e, g_ibBuf)) return;
-        SubOvSet(h, "");
-    } else {
-        u8 = WToU8(g_ibBuf);
-        SubOvSet(h, u8);          /* 空串 = 删除覆盖 */
-        free(u8);
-        /* 旧本地字幕一并清掉：否则同名文件会继续优先于新地址/清除操作 */
-        CacheSubDelete(CacheUrlHash(e->url));
-    }
-    SetStatusTemp(tr(TR_SUB_SAVED));
 
-    /* 正在播别的集时只保存，等真正播这一集再生效 */
+    if (g_ibBuf[0] == 0) {
+        /* 留空 OK：只有原来有覆盖才清除。
+         * 原来 NULL（无覆盖）时啥都不做——用户看到空框直接 OK 不应该改配置 */
+        if (ov == NULL) return;
+        SubOvRemove(h);
+        CacheSubDelete(ah);
+        SetStatusTemp(tr(TR_SUB_SAVED));
+    } else if (!isUrl) {
+        /* 本地文件路径 → BindLocalSub（内部做 SubOvSet("local") + 删旧缓存 + SaveLocalSub） */
+        BindLocalSub(podIdx, epIdx, g_ibBuf);
+        return;   /* BindLocalSub 已经处理重载 */
+    } else {
+        /* 网络 URL → 写覆盖 + 删本地缓存 */
+        u8 = WToU8(g_ibBuf);
+        if (!u8) return;
+        SubOvSet(h, u8);
+        free(u8);
+        CacheSubDelete(ah);   /* 旧本地字幕一并清掉，否则同名文件会继续优先于新地址 */
+        SetStatusTemp(tr(TR_SUB_SAVED));
+    }
+
+    /* 走到这里：清除了覆盖（留空 OK 且原来有覆盖）或写了新 URL —— 都需要重载。
+     * BindLocalSub 已提前 return，不会走过来 */
     if (SubFollowsEpisode(e->url)) {
-        /* 刚导入/改了地址：清掉去重标识强制重载 */
         free(g_subTransUrl);
         g_subTransUrl = NULL;
         ov = SubOvFind(h);
-        LoadTranscript(e->url, p->title, e->title, ov ? ov : e->transcriptUrl);
+        LoadTranscript(e->url, p->title, e->title,
+                       (ov && ov[0] && strcmp(ov, "local") != 0) ? ov : e->transcriptUrl);
         SubRefreshUI();
     }
 }
@@ -11697,7 +11820,8 @@ static char *StripCachedir(const char *src, DWORD srcLen, DWORD *outLen)
     return dst;
 }
 
-/* 导入：带标记头的配置 ini（全量恢复，写回尾部后退出生效）或 OPML（合并订阅） */
+/* 菜单“导入…”：选文件后交给 ImportFileAt */
+static void ImportFileAt(const wchar_t *path);
 static void DoImport(void)
 {
     static const wchar_t *FILTER =
@@ -11705,10 +11829,18 @@ static void DoImport(void)
         L"OPML (*.opml)\0*.opml\0Configuration (*.ini)\0*.ini\0"
         L"All Files (*.*)\0*.*\0";
     wchar_t path[MAX_PATH];
+
+    if (!FileDlg(g_hwnd, 0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
+    ImportFileAt(path);
+}
+
+/* 导入指定文件：带标记头的配置 ini（全量恢复，写回尾部后退出生效）
+ * 或 OPML（合并订阅）。菜单导入与窗口拖放共用 */
+static void ImportFileAt(const wchar_t *path)
+{
     DWORD len = 0;
     char *buf;
 
-    if (!FileDlg(g_hwnd, 0, tr(TR_IMP_TITLE), FILTER, NULL, path, MAX_PATH)) return;
     buf = ReadFileAll(path, &len);
     if (!buf) {
         MessageBoxTh(g_hwnd, tr(TR_IMP_FAIL), L"LiteTune", MB_OK | MB_ICONERROR);
@@ -13118,6 +13250,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         SetTimer(hwnd, 1, 500, NULL);
         SetTimer(hwnd, 5, 150, NULL);   /* 简介折叠按钮的悬停探测 */
+        SetTimer(hwnd, 8, 150, NULL);   /* 拖放悬停高亮（SDK 原生拖放无悬停消息，轮询） */
 
         /* 媒体键（全局热键）：播放/暂停、停止、上一曲、下一曲。
          * 失败不影响主功能（可能被其他程序占用） */
@@ -14287,15 +14420,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             lastmark = 1;
                     }
                     if (playing) {
-                        /* 播放行同时是选中行（默认蓝底白字会盖住绿字），
-                         * 自己铺一层浅绿底再用深绿字 */
                         FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThGreenBg());
                         cd->clrText = ThGreen();
                     } else {
-                        /* 选中行自己铺主题高亮色（暗色下系统高亮仍是浅色） */
                         if (sel)
                             FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThSel());
-                        /* 优先级：批量队列蓝 > 上次听到橙 > 已缓存黄 */
+                        /* 拖放悬停行：跟原生选中一样涂 ThSel()，
+                         * 视觉一致但不真的改 ListView 选中状态 */
+                        if (row == g_dragRow)
+                            FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThSel());
                         cd->clrText = queued
                             ? ThBlue()
                             : lastmark ? ThLastListen()
@@ -14431,6 +14564,61 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_fly) ShowWindow(g_fly, SW_HIDE);
                 FlyTipShow(g_fly, -1);
                 KillTimer(hwnd, 7);
+            }
+            return 0;
+        }
+        if (wParam == 8) {
+            /* 拖放悬停面板联动：SDK 原生 DragAcceptFiles 无悬停消息，
+             * 且普通鼠标左键按下（拖动选多集）也会被误判。
+             *
+             * 唯一可靠判断：系统壳拖文件进 LiteTune 时，前景窗口是
+             * 资源管理器而不是 LiteTune（拖放发起方持有鼠标捕获）。
+             * GetForegroundWindow() != hwnd 才是真·拖入态。
+             *
+             * 只做面板文本预览（不选行、不载字幕、不改 g_curEp），
+             * 避免干扰 ListView 原生操作、避免闪烁。 */
+            POINT sp, cp;
+            RECT lr;
+            int row = -1;
+            if (GetForegroundWindow() == g_hwnd) { g_dragRow = -1; return 0; }
+            GetCursorPos(&sp);
+            GetWindowRect(g_listEp, &lr);
+            if (PtInRect(&lr, sp)) {
+                LVHITTESTINFO hit;
+                cp = sp;
+                ScreenToClient(g_listEp, &cp);
+                ZeroMemory(&hit, sizeof(hit));
+                hit.pt = cp;
+                if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) >= 0 &&
+                    !(hit.flags & LVHT_NOWHERE))
+                    row = hit.iItem;
+            }
+            if (row != g_dragRow) {
+                Podcast *p; Episode *e; int podIdx, epIdx;
+                g_dragRow = row;
+                if (row < 0) {
+                    /* 拖离剧集面板：面板恢复到当前选中集的简介 */
+                    if (g_viewCached) p = &g_cachePod;
+                    else if (g_curPod >= 0 && g_curPod < g_podCount) p = &g_pods[g_curPod];
+                    else p = NULL;
+                    if (p && g_curEp >= 0 && g_curEp < p->epCount)
+                        SetWindowTextW(g_editDesc, p->eps[g_curEp].desc ? p->eps[g_curEp].desc : L"");
+                    else
+                        SetWindowTextW(g_editDesc, L"");
+                    return 0;
+                }
+                epIdx = EpIdxOfRow(row);
+                podIdx = g_viewCached ? g_podCount : g_curPod;
+                if (podIdx == g_podCount) p = &g_cachePod;
+                else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
+                else p = NULL;
+                if (p && epIdx >= 0 && epIdx < p->epCount) {
+                    e = &p->eps[epIdx];
+                    SetWindowTextW(g_editDesc, e->desc ? e->desc : L"");
+                }
+                /* 只换面板文本，列表选中状态由 CDDS_ITEMPREPAINT 用
+                 * g_dragRow 自行绘蓝底（和原生选中色 ThSel 完全一致） */
+                InvalidateRect(g_listEp, NULL, FALSE);
             }
             return 0;
         }
@@ -14939,6 +15127,72 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
+    /* 拖放：opml/ini 直接导入；vtt/srt 绑到悬停/选中的那一集。
+     * 注意：SDK 原生 DragAcceptFiles 只发 WM_DROPFILES，没有悬停消息；
+     * 拖放悬停高亮由 Timer 8 轮询维护（见 WM_TIMER case 8） */
+    case WM_DROPFILES: {
+        HDROP hd = (HDROP)wParam;
+        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+        UINT i;
+        int podIdx = g_viewCached ? g_podCount : g_curPod;
+        int epIdx = -1;
+        wchar_t path[MAX_PATH];
+
+        /* 落点命中：优先用悬停时已算出的 g_dragRow（准确、零开销），
+         * 否则再做一次 HitTest 回退到当前选中行 */
+        if (g_dragRow >= 0)
+            epIdx = EpIdxOfRow(g_dragRow);
+        else {
+            POINT sp, cp;
+            RECT lr;
+            GetCursorPos(&sp);
+            GetWindowRect(g_listEp, &lr);
+            if (PtInRect(&lr, sp)) {
+                LVHITTESTINFO hit;
+                cp = sp;
+                ScreenToClient(g_listEp, &cp);
+                ZeroMemory(&hit, sizeof(hit));
+                hit.pt = cp;
+                if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) >= 0 &&
+                    !(hit.flags & LVHT_NOWHERE))
+                    epIdx = EpIdxOfRow(hit.iItem);
+            }
+        }
+        if (epIdx < 0)
+            epIdx = EpIdxOfRow((int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                                (WPARAM)-1, LVNI_SELECTED));
+
+        for (i = 0; i < n; i++) {
+            const wchar_t *ext;
+            if (!DragQueryFileW(hd, i, path, MAX_PATH)) continue;
+            ext = wcsrchr(path, L'.');
+            if (ext && (_wcsicmp(ext, L".opml") == 0 || _wcsicmp(ext, L".ini") == 0)) {
+                ImportFileAt(path);
+                if (!IsWindow(hwnd)) {   /* 导入配置会重启退出 */
+                    DragFinish(hd);
+                    return 0;
+                }
+            } else if (ext && (_wcsicmp(ext, L".vtt") == 0 ||
+                               _wcsicmp(ext, L".srt") == 0)) {
+                if (epIdx >= 0) BindLocalSub(podIdx, epIdx, path);
+                else SetStatusTemp(tr(TR_DROP_NO_EP));
+            }
+        }
+        DragFinish(hd);
+        if (g_dragRow >= 0) {
+            Podcast *p;
+            g_dragRow = -1;
+            InvalidateRect(g_listEp, NULL, FALSE);   /* 整个列表重绘清蓝底 */
+            /* 面板恢复到当前选中集的简介（悬停预览时改过） */
+            if (g_viewCached) p = &g_cachePod;
+            else if (g_curPod >= 0 && g_curPod < g_podCount) p = &g_pods[g_curPod];
+            else p = NULL;
+            if (p && g_curEp >= 0 && g_curEp < p->epCount)
+                SetWindowTextW(g_editDesc, p->eps[g_curEp].desc ? p->eps[g_curEp].desc : L"");
+        }
+        return 0;
+    }
+
     /* 关闭按钮：直接退出（收进托盘走最小化按钮；托盘浮窗右侧也有退出按钮） */
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -14958,6 +15212,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 4);
         KillTimer(hwnd, 6);   /* 自动刷新 */
         KillTimer(hwnd, 7);   /* 托盘悬停浮窗轮询 */
+        KillTimer(hwnd, 8);   /* 拖放悬停高亮 */
         UnregisterHotKey(hwnd, 1);
         UnregisterHotKey(hwnd, 2);
         UnregisterHotKey(hwnd, 3);
@@ -15191,6 +15446,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         NULL, NULL, hInst, NULL);
     if (!hwnd) return 1;
     g_hwnd = hwnd;
+    DragAcceptFiles(hwnd, TRUE);   /* 支持拖入 opml/ini/vtt/srt */
 
     ApplyTheme();    /* 显示前应用主题（含暗色标题栏）：首帧即终态，不闪 */
     ShowWindow(hwnd, nCmdShow);

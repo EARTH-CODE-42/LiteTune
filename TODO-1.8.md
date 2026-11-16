@@ -55,9 +55,12 @@
 
 ## P2（新功能）
 
-- [ ] **拖放**：`DragAcceptFiles` + `WM_DROPFILES`（当前代码完全没有）
-  - 整窗：.opml / .ini / .vtt
-  - 拖到具体剧集行：`DragQueryPoint` + `LVHITTEST` → 绑定该集字幕（依赖 P0 的 sub_ 命名先落地）
+- [x] **拖放**：`DragAcceptFiles` + `WM_DROPFILES`
+  - 整窗：.opml / .ini 拖入即导入（复用菜单导入逻辑，配置 ini 仍需确认后重启生效）
+  - 拖到具体剧集行：按屏幕坐标命中行（`LVM_HITTEST`）→ 复制进字幕缓存并立即生效；
+    未命中行则绑到当前选中集，没有选中集时提示"请把字幕拖到某一集上"
+  - 落地：`ImportFileAt(path)` 从菜单导入中拆出供拖放复用；新增 `BindLocalSub`
+    统一"本地字幕→缓存→清地址覆盖→重载"流程（菜单导入与拖放共用）
 - [ ] **章节支持**（Podcasting 2.0 chapters JSON）：章节列表复用字幕列表 UI，点击跳转；很多英文播客自带
 - [ ] **重构与死代码审计**
   - `MessageBoxTh` 仍是系统 MessageBoxW + WH_CBT 钩子做暗色，统一到已有的自绘弹窗，删掉钩子
