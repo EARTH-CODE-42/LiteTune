@@ -36,6 +36,8 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <winhttp.h>
+#include <ole2.h>
+#include <oleidl.h>
 #include <propidl.h>
 #include <propsys.h>
 #include <mfapi.h>
@@ -431,14 +433,9 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_SEARCH_DONE    (WM_APP + 17) /* lParam=SearchResult* */
 #define WM_APP_CACHE_NOT_WRITABLE (WM_APP + 18)  /* 缓存目录不可写（UI 线程提示） */
 
-/* 拖放高亮：悬停剧集行（用于字幕拖放时视觉提示） */
-static int g_dragRow = -1;   /* -1 = 不在拖放态或未悬停到剧集行 */
-#ifndef WM_DRAGOVER
-#define WM_DRAGOVER  0x02E3
-#endif
-#ifndef WM_DRAGLEAVE
-#define WM_DRAGLEAVE 0x02E4
-#endif
+/* 拖放（OLE IDropTarget）：悬停行与拖放状态，实现见 WndProc 之前 */
+static IDropTarget *g_pDrop;             /* 全局拖放目标（进程内单例） */
+static int g_dragRow = -1;               /* 当前悬停的剧集行，-1=不在剧集列表上 */
 #define WM_APP_FEED_PROGRESS (WM_APP + 15) /* wParam=已加载数, lParam=总数 */
 
 /* ================= 多语言（简体中文 / English） ================= */
@@ -516,6 +513,7 @@ enum {
     TR_CTX_IMPORT_SUB, TR_SUB_TITLE, TR_SUB_LABEL, TR_SUB_SAVED, TR_SUB_BAD,
     TR_DROP_NO_EP,
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
+    TR_DROP_HINT_FMT, TR_DROP_HINT_SEL, TR_DROP_HINT_IMPORT,
     TR_N
 };
 
@@ -635,7 +633,10 @@ static const wchar_t *tr(int id)
         L"字幕已保存",
         L"需填写 http:// 或 https:// 开头的地址，或选择一个存在的字幕文件",
         L"请把字幕拖到某一集上",
-        L"简介", L"字幕", L"字幕开", L"字幕关"
+        L"简介", L"字幕", L"字幕开", L"字幕关",
+        L"松开鼠标即把字幕挂到「%ls」",
+        L"松开鼠标即把字幕挂到当前选中的剧集",
+        L"松开鼠标即导入"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -772,7 +773,10 @@ static const wchar_t *tr(int id)
         L"Subtitle saved",
         L"Enter a URL starting with http:// or https://, or pick an existing subtitle file",
         L"Drop the subtitle onto an episode row",
-        L"Notes", L"Subs", L"Subs on", L"Subs off"
+        L"Notes", L"Subs", L"Subs on", L"Subs off",
+        L"Release to attach the subtitle to \"%ls\"",
+        L"Release to attach the subtitle to the selected episode",
+        L"Release to import"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -2153,6 +2157,15 @@ static void SetStatusTemp(const wchar_t *text)
     g_statusTempOn = 1;
     StatusShow(text ? text : L"");
     SetTimer(g_hwnd, 4, TEMP_STATUS_MS, NULL);   /* 重复调用会自动重置计时 */
+}
+
+/* 常驻临时提示（拖放悬停用）：一直显示到调用 RestoreBaseStatus，
+ * 期间其它 SetStatus 只更新基础文本，不会抢走提示 */
+static void SetStatusSticky(const wchar_t *text)
+{
+    g_statusTempOn = 1;
+    StatusShow(text ? text : L"");
+    KillTimer(g_hwnd, 4);
 }
 
 /* 临时提示到期：恢复显示持久状态 */
@@ -3562,14 +3575,15 @@ static int EnsureCacheDirWritable(void)
 }
 
 /* 启动时清理 g_cacheDays 天前的旧缓存（0=关）。
- * 覆盖全部缓存类型：音频、断点续传中间文件、字幕、订阅、封面。
+ * 覆盖音频、断点续传中间文件、订阅、封面。
+ * 字幕不参与自动清理：它可能是用户手工导入的，且体积很小，
+ * 静默删除用户数据的代价远大于省下的空间（删缓存请用右键菜单）。
  * 只删符合「<8hex>.<ext>」或「可读名_<8hex>.<ext>」命名规则的文件，
  * 因此自定义目录里有别的同名扩展名文件也不会被误删 */
 static void CacheAutoClean(void)
 {
     static const wchar_t *const exts[] = {
         L"mp3", L"mp3.part",           /* 音频 / 未下完的音频 */
-        L"vtt", L"srt",                /* 字幕（可读名/trans_/sub_ 都覆盖） */
         L"xml", L"hdr",                /* 订阅 XML / 验证器 */
         L"jpg", L"jpeg", L"png", L"gif", L"webp", L"bmp", L"img",  /* 封面 */
     };
@@ -13021,6 +13035,310 @@ static void PaintCaption(HWND hwnd)
     ReleaseDC(hwnd, hdc);
 }
 
+/* ================= 拖放（OLE IDropTarget） ================= */
+/* 旧的 DragAcceptFiles 只发一个 WM_DROPFILES：没有进入/移动/离开事件，
+ * 做不出“拖到哪一集”的悬停反馈。这里实现 IDropTarget，拿真实的
+ * DragEnter/DragOver/DragLeave；注册失败时回退 WM_DROPFILES。 */
+
+/* 落点屏幕坐标 → 剧集行号；不在剧集列表内返回 -1 */
+static int DragRowAt(POINTL ptl)
+{
+    POINT p;
+    RECT lr;
+    LVHITTESTINFO hit;
+    p.x = ptl.x;
+    p.y = ptl.y;
+    GetWindowRect(g_listEp, &lr);
+    if (!PtInRect(&lr, p)) return -1;
+    ScreenToClient(g_listEp, &p);
+    ZeroMemory(&hit, sizeof(hit));
+    hit.pt = p;
+    if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) < 0) return -1;
+    if (hit.flags & LVHT_NOWHERE) return -1;
+    return hit.iItem;
+}
+
+/* 处理一次拖放：opml/ini 导入；vtt/srt 绑到 row 对应剧集
+ *（row<0 时按落点、再退到当前选中行）。不负责 DragFinish/ReleaseStgMedium */
+static void HandleDroppedFiles(HDROP hd, int row, POINT ptScreen)
+{
+    UINT n = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+    UINT i;
+    int podIdx = g_viewCached ? g_podCount : g_curPod;
+    int epIdx = row >= 0 ? EpIdxOfRow(row) : -1;
+    wchar_t path[MAX_PATH];
+
+    if (epIdx < 0) {
+        RECT lr;
+        POINT cp = ptScreen;
+        GetWindowRect(g_listEp, &lr);
+        if (PtInRect(&lr, ptScreen)) {
+            LVHITTESTINFO hit;
+            ScreenToClient(g_listEp, &cp);
+            ZeroMemory(&hit, sizeof(hit));
+            hit.pt = cp;
+            if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) >= 0 &&
+                !(hit.flags & LVHT_NOWHERE))
+                epIdx = EpIdxOfRow(hit.iItem);
+        }
+    }
+    if (epIdx < 0)
+        epIdx = EpIdxOfRow((int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
+                                            (WPARAM)-1, LVNI_SELECTED));
+
+    for (i = 0; i < n; i++) {
+        const wchar_t *ext;
+        if (!DragQueryFileW(hd, i, path, MAX_PATH)) continue;
+        ext = wcsrchr(path, L'.');
+        if (ext && (_wcsicmp(ext, L".opml") == 0 || _wcsicmp(ext, L".ini") == 0)) {
+            ImportFileAt(path);
+            if (!IsWindow(g_hwnd)) return;   /* 导入配置会重启退出 */
+        } else if (ext && (_wcsicmp(ext, L".vtt") == 0 ||
+                           _wcsicmp(ext, L".srt") == 0)) {
+            if (epIdx >= 0) BindLocalSub(podIdx, epIdx, path);
+            else SetStatusTemp(tr(TR_DROP_NO_EP));
+        }
+    }
+}
+
+/* 悬停状态：0=空闲 1=悬停在剧集行 2=在列表外 3=导入配置/OPML */
+static int g_dragMode;
+static int g_dragSub;    /* 1=拖的是字幕（vtt/srt），0=配置 */
+
+/* 悬停更新：只在状态变化时动，避免每次 DragOver 都重排/重绘 */
+static void DropHoverUpdate(POINTL ptl)
+{
+    int row;
+    int ep;
+    Podcast *p;
+
+    if (!g_dragSub) {
+        if (g_dragMode == 3) return;
+        g_dragMode = 3;
+        g_dragRow = -1;
+        SetStatusSticky(tr(TR_DROP_HINT_IMPORT));
+        return;
+    }
+    row = DragRowAt(ptl);
+    if (row >= 0) {
+        if (g_dragMode == 1 && row == g_dragRow) return;
+        g_dragMode = 1;
+        g_dragRow = row;
+        ep = EpIdxOfRow(row);
+        p = ActivePodcast();
+        HighlightEpisodeRow(ep);   /* 真·选中：蓝底 + 右侧简介跟随 */
+        if (p && ep >= 0 && ep < p->epCount) {
+            wchar_t hint[512];
+            swprintf(hint, 512, tr(TR_DROP_HINT_FMT),
+                     p->eps[ep].title ? p->eps[ep].title : L"");
+            SetStatusSticky(hint);
+        }
+    } else {
+        if (g_dragMode == 2) return;
+        g_dragMode = 2;
+        g_dragRow = -1;
+        SetStatusSticky(tr(TR_DROP_HINT_SEL));
+    }
+}
+
+/* 清除悬停态并恢复状态栏（不清 g_dragSub：DragLeave/DragEnter 的先后
+ * 顺序由 OLE 决定，若在 DragLeave 里清掉类型，紧随其后的 DragOver 会误判） */
+static void DropHoverClear(void)
+{
+    g_dragRow = -1;
+    g_dragMode = 0;
+    if (g_statusTempOn) RestoreBaseStatus();
+}
+
+/* ---- IDropTarget 实现 ---- */
+typedef struct { IDropTargetVtbl *lpVtbl; LONG ref; } LtDrop;
+
+static HRESULT STDMETHODCALLTYPE LtDrop_QueryInterface(IDropTarget *self,
+                                                       REFIID riid, void **ppv)
+{
+    if (!ppv) return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropTarget)) {
+        *ppv = self;
+        self->lpVtbl->AddRef(self);
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE LtDrop_AddRef(IDropTarget *self)
+{
+    return (ULONG)InterlockedIncrement(&((LtDrop*)self)->ref);
+}
+
+static ULONG STDMETHODCALLTYPE LtDrop_Release(IDropTarget *self)
+{
+    LONG r = InterlockedDecrement(&((LtDrop*)self)->ref);
+    if (r == 0) {
+        if (g_pDrop == self) g_pDrop = NULL;
+        free(self);
+    }
+    return (ULONG)r;
+}
+
+/* 拖入的数据里有没有我们认识的扩展名：0=无 1=字幕 2=配置 */
+static int DropKindOf(IDataObject *obj)
+{
+    FORMATETC fe;
+    STGMEDIUM stm;
+    HDROP hd;
+    UINT n, i;
+    int kind = 0;
+    wchar_t path[MAX_PATH];
+
+    fe.cfFormat = CF_HDROP;
+    fe.ptd = NULL;
+    fe.dwAspect = DVASPECT_CONTENT;
+    fe.lindex = -1;
+    fe.tymed = TYMED_HGLOBAL;
+    if (obj->lpVtbl->GetData(obj, &fe, &stm) != S_OK) return 0;
+    hd = (HDROP)GlobalLock(stm.hGlobal);
+    if (hd) {
+        n = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+        for (i = 0; i < n && !kind; i++) {
+            const wchar_t *ext;
+            if (!DragQueryFileW(hd, i, path, MAX_PATH)) continue;
+            ext = wcsrchr(path, L'.');
+            if (!ext) continue;
+            if (_wcsicmp(ext, L".vtt") == 0 || _wcsicmp(ext, L".srt") == 0)
+                kind = 1;
+            else if (_wcsicmp(ext, L".opml") == 0 || _wcsicmp(ext, L".ini") == 0)
+                kind = 2;
+        }
+        GlobalUnlock(stm.hGlobal);
+    }
+    ReleaseStgMedium(&stm);
+    return kind;
+}
+
+static HRESULT STDMETHODCALLTYPE LtDrop_DragEnter(IDropTarget *self,
+        IDataObject *obj, DWORD keys, POINTL pt, DWORD *effect)
+{
+    int kind = DropKindOf(obj);
+    (void)self; (void)keys;
+    if (!kind) {
+        if (effect) *effect = DROPEFFECT_NONE;
+        return S_OK;
+    }
+    if (effect) *effect = DROPEFFECT_COPY;
+    g_dragSub = (kind == 1);
+    g_dragMode = 0;
+    g_dragRow = -1;
+    DropHoverUpdate(pt);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE LtDrop_DragOver(IDropTarget *self,
+        DWORD keys, POINTL pt, DWORD *effect)
+{
+    (void)self; (void)keys;
+    if (effect) *effect = DROPEFFECT_COPY;
+    DropHoverUpdate(pt);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE LtDrop_DragLeave(IDropTarget *self)
+{
+    (void)self;
+    DropHoverClear();
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE LtDrop_Drop(IDropTarget *self, IDataObject *obj,
+        DWORD keys, POINTL pt, DWORD *effect)
+{
+    FORMATETC fe;
+    STGMEDIUM stm;
+    int row = g_dragRow;
+    POINT scr;
+    (void)self; (void)keys;
+
+    scr.x = pt.x;
+    scr.y = pt.y;
+    if (effect) *effect = DROPEFFECT_COPY;
+    /* 先复位悬停态（会恢复状态栏），再真正落盘：
+     * 否则会把 BindLocalSub 刚设的“字幕已保存”立刻清掉 */
+    DropHoverClear();
+
+    fe.cfFormat = CF_HDROP;
+    fe.ptd = NULL;
+    fe.dwAspect = DVASPECT_CONTENT;
+    fe.lindex = -1;
+    fe.tymed = TYMED_HGLOBAL;
+    if (obj->lpVtbl->GetData(obj, &fe, &stm) == S_OK) {
+        HDROP hd = (HDROP)GlobalLock(stm.hGlobal);
+        if (hd) {
+            HandleDroppedFiles(hd, row, scr);
+            GlobalUnlock(stm.hGlobal);
+        }
+        ReleaseStgMedium(&stm);
+    }
+    g_dragSub = 0;
+    return S_OK;
+}
+
+static IDropTargetVtbl g_dropVtbl = {
+    LtDrop_QueryInterface,
+    LtDrop_AddRef,
+    LtDrop_Release,
+    LtDrop_DragEnter,
+    LtDrop_DragOver,
+    LtDrop_DragLeave,
+    LtDrop_Drop
+};
+
+/* 把主窗口和几个子控件都注册成拖放目标：拖到列表/简介上才收得到事件。
+ * 返回 1 表示主窗口注册成功（此时不再需要 DragAcceptFiles） */
+static HWND g_dropWnds[4];
+static int g_dropWndCount;
+
+static void DropTargetUninstall(void);
+
+static int DropTargetInstall(HWND hwnd)
+{
+    LtDrop *dt = (LtDrop*)calloc(1, sizeof(LtDrop));
+    HWND wnds[4];
+    int i;
+    if (!dt) return 0;
+    dt->lpVtbl = &g_dropVtbl;
+    dt->ref = 1;
+    g_pDrop = (IDropTarget*)dt;
+
+    wnds[0] = hwnd;
+    wnds[1] = g_listEp;
+    wnds[2] = g_listPod;
+    wnds[3] = g_editDesc;
+    g_dropWndCount = 0;
+    for (i = 0; i < 4; i++) {
+        if (!wnds[i] || !IsWindow(wnds[i])) continue;
+        if (FAILED(RegisterDragDrop(wnds[i], (IDropTarget*)dt))) continue;
+        g_dropWnds[g_dropWndCount++] = wnds[i];
+    }
+    if (g_dropWndCount == 0 || g_dropWnds[0] != hwnd) {
+        DropTargetUninstall();
+        return 0;
+    }
+    return 1;
+}
+
+static void DropTargetUninstall(void)
+{
+    int i;
+    for (i = 0; i < g_dropWndCount; i++)
+        RevokeDragDrop(g_dropWnds[i]);
+    g_dropWndCount = 0;
+    if (g_pDrop) {
+        IDropTarget *p = g_pDrop;
+        g_pDrop = NULL;
+        p->lpVtbl->Release(p);
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     /* 任务栏缩略图工具栏：Explorer 广播此消息后初始化 */
@@ -13250,7 +13568,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         SetTimer(hwnd, 1, 500, NULL);
         SetTimer(hwnd, 5, 150, NULL);   /* 简介折叠按钮的悬停探测 */
-        SetTimer(hwnd, 8, 150, NULL);   /* 拖放悬停高亮（SDK 原生拖放无悬停消息，轮询） */
 
         /* 媒体键（全局热键）：播放/暂停、停止、上一曲、下一曲。
          * 失败不影响主功能（可能被其他程序占用） */
@@ -14425,10 +14742,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     } else {
                         if (sel)
                             FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThSel());
-                        /* 拖放悬停行：跟原生选中一样涂 ThSel()，
-                         * 视觉一致但不真的改 ListView 选中状态 */
-                        if (row == g_dragRow)
-                            FillRectColor(cd->nmcd.hdc, &cd->nmcd.rc, ThSel());
                         cd->clrText = queued
                             ? ThBlue()
                             : lastmark ? ThLastListen()
@@ -14564,61 +14877,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_fly) ShowWindow(g_fly, SW_HIDE);
                 FlyTipShow(g_fly, -1);
                 KillTimer(hwnd, 7);
-            }
-            return 0;
-        }
-        if (wParam == 8) {
-            /* 拖放悬停面板联动：SDK 原生 DragAcceptFiles 无悬停消息，
-             * 且普通鼠标左键按下（拖动选多集）也会被误判。
-             *
-             * 唯一可靠判断：系统壳拖文件进 LiteTune 时，前景窗口是
-             * 资源管理器而不是 LiteTune（拖放发起方持有鼠标捕获）。
-             * GetForegroundWindow() != hwnd 才是真·拖入态。
-             *
-             * 只做面板文本预览（不选行、不载字幕、不改 g_curEp），
-             * 避免干扰 ListView 原生操作、避免闪烁。 */
-            POINT sp, cp;
-            RECT lr;
-            int row = -1;
-            if (GetForegroundWindow() == g_hwnd) { g_dragRow = -1; return 0; }
-            GetCursorPos(&sp);
-            GetWindowRect(g_listEp, &lr);
-            if (PtInRect(&lr, sp)) {
-                LVHITTESTINFO hit;
-                cp = sp;
-                ScreenToClient(g_listEp, &cp);
-                ZeroMemory(&hit, sizeof(hit));
-                hit.pt = cp;
-                if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) >= 0 &&
-                    !(hit.flags & LVHT_NOWHERE))
-                    row = hit.iItem;
-            }
-            if (row != g_dragRow) {
-                Podcast *p; Episode *e; int podIdx, epIdx;
-                g_dragRow = row;
-                if (row < 0) {
-                    /* 拖离剧集面板：面板恢复到当前选中集的简介 */
-                    if (g_viewCached) p = &g_cachePod;
-                    else if (g_curPod >= 0 && g_curPod < g_podCount) p = &g_pods[g_curPod];
-                    else p = NULL;
-                    if (p && g_curEp >= 0 && g_curEp < p->epCount)
-                        SetWindowTextW(g_editDesc, p->eps[g_curEp].desc ? p->eps[g_curEp].desc : L"");
-                    else
-                        SetWindowTextW(g_editDesc, L"");
-                    return 0;
-                }
-                epIdx = EpIdxOfRow(row);
-                podIdx = g_viewCached ? g_podCount : g_curPod;
-                if (podIdx == g_podCount) p = &g_cachePod;
-                else if (podIdx >= 0 && podIdx < g_podCount) p = &g_pods[podIdx];
-                else p = NULL;
-                if (p && epIdx >= 0 && epIdx < p->epCount) {
-                    e = &p->eps[epIdx];
-                    SetWindowTextW(g_editDesc, e->desc ? e->desc : L"");
-                }
-                /* 只换面板文本，列表选中状态由 CDDS_ITEMPREPAINT 用
-                 * g_dragRow 自行绘蓝底（和原生选中色 ThSel 完全一致） */
-                InvalidateRect(g_listEp, NULL, FALSE);
             }
             return 0;
         }
@@ -15127,69 +15385,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    /* 拖放：opml/ini 直接导入；vtt/srt 绑到悬停/选中的那一集。
-     * 注意：SDK 原生 DragAcceptFiles 只发 WM_DROPFILES，没有悬停消息；
-     * 拖放悬停高亮由 Timer 8 轮询维护（见 WM_TIMER case 8） */
+    /* 拖放回退路径：IDropTarget 注册失败时才会收到（没有悬停事件） */
     case WM_DROPFILES: {
         HDROP hd = (HDROP)wParam;
-        UINT n = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
-        UINT i;
-        int podIdx = g_viewCached ? g_podCount : g_curPod;
-        int epIdx = -1;
-        wchar_t path[MAX_PATH];
-
-        /* 落点命中：优先用悬停时已算出的 g_dragRow（准确、零开销），
-         * 否则再做一次 HitTest 回退到当前选中行 */
-        if (g_dragRow >= 0)
-            epIdx = EpIdxOfRow(g_dragRow);
-        else {
-            POINT sp, cp;
-            RECT lr;
-            GetCursorPos(&sp);
-            GetWindowRect(g_listEp, &lr);
-            if (PtInRect(&lr, sp)) {
-                LVHITTESTINFO hit;
-                cp = sp;
-                ScreenToClient(g_listEp, &cp);
-                ZeroMemory(&hit, sizeof(hit));
-                hit.pt = cp;
-                if (SendMessageW(g_listEp, LVM_HITTEST, 0, (LPARAM)&hit) >= 0 &&
-                    !(hit.flags & LVHT_NOWHERE))
-                    epIdx = EpIdxOfRow(hit.iItem);
-            }
-        }
-        if (epIdx < 0)
-            epIdx = EpIdxOfRow((int)SendMessageW(g_listEp, LVM_GETNEXTITEM,
-                                                (WPARAM)-1, LVNI_SELECTED));
-
-        for (i = 0; i < n; i++) {
-            const wchar_t *ext;
-            if (!DragQueryFileW(hd, i, path, MAX_PATH)) continue;
-            ext = wcsrchr(path, L'.');
-            if (ext && (_wcsicmp(ext, L".opml") == 0 || _wcsicmp(ext, L".ini") == 0)) {
-                ImportFileAt(path);
-                if (!IsWindow(hwnd)) {   /* 导入配置会重启退出 */
-                    DragFinish(hd);
-                    return 0;
-                }
-            } else if (ext && (_wcsicmp(ext, L".vtt") == 0 ||
-                               _wcsicmp(ext, L".srt") == 0)) {
-                if (epIdx >= 0) BindLocalSub(podIdx, epIdx, path);
-                else SetStatusTemp(tr(TR_DROP_NO_EP));
-            }
-        }
+        POINT sp;
+        GetCursorPos(&sp);
+        DropHoverClear();
+        HandleDroppedFiles(hd, -1, sp);
         DragFinish(hd);
-        if (g_dragRow >= 0) {
-            Podcast *p;
-            g_dragRow = -1;
-            InvalidateRect(g_listEp, NULL, FALSE);   /* 整个列表重绘清蓝底 */
-            /* 面板恢复到当前选中集的简介（悬停预览时改过） */
-            if (g_viewCached) p = &g_cachePod;
-            else if (g_curPod >= 0 && g_curPod < g_podCount) p = &g_pods[g_curPod];
-            else p = NULL;
-            if (p && g_curEp >= 0 && g_curEp < p->epCount)
-                SetWindowTextW(g_editDesc, p->eps[g_curEp].desc ? p->eps[g_curEp].desc : L"");
-        }
+        g_dragSub = 0;
         return 0;
     }
 
@@ -15212,7 +15416,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, 4);
         KillTimer(hwnd, 6);   /* 自动刷新 */
         KillTimer(hwnd, 7);   /* 托盘悬停浮窗轮询 */
-        KillTimer(hwnd, 8);   /* 拖放悬停高亮 */
+        DropTargetUninstall();
         UnregisterHotKey(hwnd, 1);
         UnregisterHotKey(hwnd, 2);
         UnregisterHotKey(hwnd, 3);
@@ -15258,7 +15462,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_fontBold) DeleteObject(g_fontBold);
         if (g_fontSmall) DeleteObject(g_fontSmall);
         MFShutdown();
-        CoUninitialize();
+        OleUninitialize();
         PostQuitMessage(0);
         return 0;
     }
@@ -15324,7 +15528,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         /* 首个实例持有句柄直到进程退出，以维持单实例标志 */
     }
 
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    /* OleInitialize 内含 CoInitializeEx(STA)：MFPlay 需要 COM，
+     * 拖放注册（RegisterDragDrop）也需要 OLE 初始化 */
+    OleInitialize(NULL);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
     InitializeCriticalSection(&g_nowCs);
     InitializeCriticalSection(&g_dlCs);
@@ -15446,7 +15652,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         NULL, NULL, hInst, NULL);
     if (!hwnd) return 1;
     g_hwnd = hwnd;
-    DragAcceptFiles(hwnd, TRUE);   /* 支持拖入 opml/ini/vtt/srt */
+    /* 拖放：优先 OLE IDropTarget（有悬停事件，能做“拖到哪一集”提示）；
+     * 注册失败才回退到 DragAcceptFiles 的 WM_DROPFILES（无悬停提示） */
+    if (!DropTargetInstall(hwnd))
+        DragAcceptFiles(hwnd, TRUE);
 
     ApplyTheme();    /* 显示前应用主题（含暗色标题栏）：首帧即终态，不闪 */
     ShowWindow(hwnd, nCmdShow);
