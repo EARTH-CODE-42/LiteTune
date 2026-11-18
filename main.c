@@ -124,6 +124,7 @@ typedef struct {
     wchar_t *desc;
     wchar_t *url;        /* enclosure URL（离线视图里是本地 mp3 完整路径） */
     char    *transcriptUrl;  /* podcast:transcript 的 VTT/SRT 地址，无则 NULL */
+    char    *chaptersUrl;    /* podcast:chapters 的 JSON 地址，无则 NULL */
     wchar_t *author;     /* itunes:author（离线视图里是播客名称） */
     wchar_t  dateText[24];
     long long dateKey;   /* YYYYMMDDHHMM 分钟级，0=未知 */
@@ -338,7 +339,7 @@ static SubCue *g_subCues = NULL;     /* 当前剧集的字幕条目 */
 static int     g_subCueCount = 0;
 static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标，-1=无 */
 static int     g_subShownIdx = -1;   /* 外挂窗最后显示过的字幕下标（间隙时沿用） */
-static char   *g_subTransUrl = NULL; /* 当前加载字幕的 transcript URL（去重用） */
+static char   *g_subTransUrl = NULL; /* 当前加载内容的 URL（去重用）：字幕时是 transcriptUrl，章节时是 chaptersUrl */
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
 static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕列表（按钮1） */
 static HWND    g_listSub = NULL;     /* 简介区字幕列表 */
@@ -2978,7 +2979,21 @@ static long long JsonGetNumber(const char *begin, const char *end,
     return atoll(v);
 }
 
-/* 作者名：JSON Feed 1.1 的 authors[0].name，兼容 1.0 的 author.name */
+/* 按 key 取浮点数（Podcasting 2.0 chapters startTime 是秒的浮点） */
+static double JsonGetNumberDouble(const char *begin, const char *end,
+                                  const char *key, int *found)
+{
+    const char *v = JsonFindKey(begin, end, key);
+    if (!v) { if (found) *found = 0; return 0.0; }
+    /* 跳过负号 */
+    if (*v == '-') v++;
+    if (!isdigit((unsigned char)*v) && *v != '.') {
+        if (found) *found = 0;
+        return 0.0;
+    }
+    if (found) *found = 1;
+    return atof(JsonFindKey(begin, end, key));
+}
 static wchar_t* JsonAuthorName(const char *begin, const char *end)
 {
     const char *v = JsonFindKey(begin, end, "authors");
@@ -3084,6 +3099,27 @@ static int ParseJsonFeed(const char *json, Podcast *pod)
                 if (found && dur > 0 && dur < 7 * 24 * 3600)
                     e->durationSec = (int)dur;
             }
+            /* JSON Feed podcast namespace：transcript 和 chapters 各自处理 */
+            {
+                const char *trV = JsonFindKey(p, objEnd, "transcript");
+                if (trV) {
+                    if (*trV == '"') {
+                        e->transcriptUrl = JsonGetStrDup(p, objEnd, "transcript");
+                    } else if (*trV == '{') {
+                        e->transcriptUrl = JsonGetStrDup(trV, JsonSkipValue(trV), "url");
+                    }
+                }
+            }
+            {
+                const char *chV = JsonFindKey(p, objEnd, "chapters");
+                if (chV) {
+                    if (*chV == '"') {
+                        e->chaptersUrl = JsonGetStrDup(p, objEnd, "chapters");
+                    } else if (*chV == '{') {
+                        e->chaptersUrl = JsonGetStrDup(chV, JsonSkipValue(chV), "url");
+                    }
+                }
+            }
             /* 发布日期：date_published（RFC3339），date_modified 兜底 */
             d = JsonGetStrDup(p, objEnd, "date_published");
             if (!d) d = JsonGetStrDup(p, objEnd, "date_modified");
@@ -3159,6 +3195,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
         Episode *e;
         char *encUrl = NULL;
         char *e_transUrl = NULL;
+        char *e_chaptersUrl = NULL;
 
         if (!itemEnd) break;
         segLen = (size_t)(itemEnd - item) + 7;
@@ -3200,6 +3237,17 @@ static int ParseFeed(const char *xml, Podcast *pod)
             }
         }
 
+        /* podcast:chapters：章节 JSON 地址（Podcasting 2.0） */
+        {
+            const char *ch = strstr(seg, "<podcast:chapters");
+            if (ch) {
+                const char *chClose = strchr(ch, '>');
+                if (chClose) {
+                    e_chaptersUrl = XmlAttrRange(ch, chClose + 1, "url");
+                }
+            }
+        }
+
         if (encUrl && pod->epCount < 10000) {
             char *d;
             if (pod->epCount >= pod->epCap) {
@@ -3208,7 +3256,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
                 Episode *ne;
                 pod->epCap = pod->epCap ? pod->epCap * 2 : 32;
                 ne = (Episode*)realloc(pod->eps, pod->epCap * sizeof(Episode));
-                if (!ne) { free(encUrl); free(e_transUrl); free(seg); return 0; }
+                if (!ne) { free(encUrl); free(e_transUrl); free(e_chaptersUrl); free(seg); return 0; }
                 pod->eps = ne;
             }
             e = &pod->eps[pod->epCount];
@@ -3226,11 +3274,12 @@ static int ParseFeed(const char *xml, Podcast *pod)
             if (!e->url) {
                 /* 槽位复用前释放已 dup 的字段，防止泄漏 */
                 free(e->title); free(e->desc); free(e->author);
-                free(encUrl); free(e_transUrl); free(seg);
+                free(encUrl); free(e_transUrl); free(e_chaptersUrl); free(seg);
                 item = FindOpenTag(itemEnd, "item");
                 continue;
             }
             if (e_transUrl) { CleanXmlText(e_transUrl); e->transcriptUrl = e_transUrl; e_transUrl = NULL; }
+            if (e_chaptersUrl) { CleanXmlText(e_chaptersUrl); e->chaptersUrl = e_chaptersUrl; e_chaptersUrl = NULL; }
             d = XmlText(seg, "itunes:duration");
             if (!d) d = XmlText(seg, "duration");
             if (d) { e->durationSec = ParseDuration(d); free(d); }
@@ -3248,7 +3297,7 @@ static int ParseFeed(const char *xml, Podcast *pod)
             free(encUrl);
         } else {
             free(encUrl);     /* 超过 10000 集上限时同样要释放 */
-            free(e_transUrl); /* 没用到的字幕地址也释放 */
+            free(e_transUrl); free(e_chaptersUrl); /* 没用到的地址也释放 */
         }
         free(seg);
         item = FindOpenTag(itemEnd, "item");
@@ -3468,6 +3517,43 @@ static void CacheSubDelete(unsigned int h)
 {
     wchar_t p[MAX_PATH];
     while (CacheSubFind(h, p, MAX_PATH)) DeleteFileW(p);
+}
+
+/* 章节缓存查找：播客_剧集_<hash>.chapters.json，或旧 chapters_<hash>.json */
+static int CacheChaptersFind(unsigned int h, wchar_t *out, int outMax)
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[32];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    size_t sl;
+    int hit = 0;
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(suffix, 32, L"_%08x.chapters.json", h);
+    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    sl = wcslen(suffix);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            size_t nl = wcslen(fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    if (hit) {
+        swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+        return 1;
+    }
+    /* 兜底旧命名：chapters_<hash>.json */
+    swprintf(out, outMax, L"%lschapters_%08x.json", dir, h);
+    return (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES);
+}
+
+static void CacheChaptersDelete(unsigned int h)
+{
+    wchar_t p[MAX_PATH];
+    if (CacheChaptersFind(h, p, MAX_PATH)) DeleteFileW(p);
 }
 
 /* 下载完成后把 <hash>.mp3 改名为可读名，并把最终路径写进 out。
@@ -5505,12 +5591,83 @@ static void ParseTranscript(const char *data, int len)
     if (start >= 0) AddSubCue(start, endT, textBuf);
 }
 
+/* 解析 Podcasting 2.0 chapters JSON 到 g_subCues。
+ * 格式：{"version":"1.0.0","chapters":[{"startTime":0.0,"title":"...","img":"...","url":"..."}]}
+ * endTime 缺省时用下一章的 startTime 作边界，最后一章兜底 duration。 */
+static void ParseChaptersJson(const char *data, int len)
+{
+    const char *jend, *chapV, *p;
+    int idx, nchap;
+
+    FreeSubCues();
+    if (!data || len <= 0) return;
+    jend = data + len;
+
+    chapV = JsonFindKey(data, jend, "chapters");
+    if (!chapV || *chapV != '[') return;
+    jend = JsonSkipValue(chapV);
+
+    nchap = 0;
+    p = chapV + 1;
+    while (p < jend) {
+        const char *objEnd;
+        SubCue *nc;
+        int found;
+        double st;
+        wchar_t *title;
+        while (p < jend && *p != '{' && *p != ']') p++;
+        if (p >= jend || *p == ']') break;
+        objEnd = JsonSkipValue(p);
+        if (objEnd <= p) break;
+
+        st = JsonGetNumberDouble(p, objEnd, "startTime", &found);
+        title = JsonGetTextW(p, objEnd, "title", 0);
+        if (found && title && st >= 0) {
+            if (nchap % 32 == 0) {
+                nc = (SubCue*)realloc(g_subCues, (nchap + 32) * sizeof(SubCue));
+                if (!nc) { free(title); return; }
+                g_subCues = nc;
+            }
+            nc = &g_subCues[nchap];
+            nc->start = st;
+            nc->end = -1.0;
+            nc->text = title;
+            nchap++;
+        } else {
+            free(title);
+        }
+        p = objEnd;
+    }
+    g_subCueCount = nchap;
+
+    if (nchap >= 2) {
+        /* 简单插入排序（章节数一般 <200） */
+        for (idx = 1; idx < nchap; idx++) {
+            SubCue key = g_subCues[idx];
+            int j = idx - 1;
+            while (j >= 0 && g_subCues[j].start > key.start) {
+                g_subCues[j + 1] = g_subCues[j];
+                j--;
+            }
+            g_subCues[j + 1] = key;
+        }
+    }
+    /* 填 end：下一章的 start；最后一章兜底 startTime + 3600 */
+    for (idx = 0; idx < nchap; idx++) {
+        if (idx + 1 < nchap)
+            g_subCues[idx].end = g_subCues[idx + 1].start;
+        else
+            g_subCues[idx].end = g_subCues[idx].start + 3600.0;
+    }
+}
+
 /* 异步加载字幕：工作线程下载（先查本地 sub_ 缓存 → 网络 trans_ 缓存 → 联网），
  * 完成后 PostMessage 回 UI 线程解析。同一 URL 不重复加载 */
 typedef struct {
     char *url;     /* 字幕标识：有 transcriptUrl 则用它，否则用剧集 URL；UI 端校验去重用 */
     char *data;    /* 原始文本（已 \0 结尾），NULL 表示失败 */
     int   len;
+    int   isChapters; /* 1=章节 JSON，0=字幕 VTT/SRT */
 } SubRaw;
 
 /* 线程参数：剧集 URL（查本地字幕）+ transcript URL（联网下载）+ 落盘路径。
@@ -5611,16 +5768,108 @@ static void LoadTranscript(const wchar_t *epUrlW, const wchar_t *podTitle,
     }
 }
 
+/* 章节加载线程参数 */
+typedef struct {
+    char *chapUrl;           /* podcast:chapters 的 JSON URL */
+    wchar_t *chapPath;       /* 本地缓存落盘路径（播客_剧集_<hash>.chapters.json） */
+    unsigned int hash;
+} ChapLoadParam;
+
+static DWORD WINAPI ChaptersLoaderThread(LPVOID param)
+{
+    ChapLoadParam *cp = (ChapLoadParam*)param;
+    SubRaw *sr = (SubRaw*)calloc(1, sizeof(SubRaw));
+    if (!sr) { free(cp->chapUrl); free(cp->chapPath); free(cp); return 0; }
+
+    sr->isChapters = 1;
+    sr->url = _strdup(cp->chapUrl);
+    {
+        DWORD len = 0;
+        char *data = NULL;
+        wchar_t found[MAX_PATH];
+
+        /* 优先级 1：本地已有 chapters.json */
+        if (cp->hash && CacheChaptersFind(cp->hash, found, MAX_PATH))
+            data = ReadWholeFile(found, &len);
+
+        /* 优先级 2：联网下载并落盘 */
+        if (!data && cp->chapUrl && cp->chapUrl[0]) {
+            wchar_t *wurl = U8ToW(cp->chapUrl);
+            if (wurl) {
+                data = HttpFetch(wurl, &len, 0, NULL, NULL);
+                free(wurl);
+                if (data && len > 0 && cp->chapPath) {
+                    FILE *f;
+                    EnsureCacheDir();
+                    f = _wfopen(cp->chapPath, L"wb");
+                    if (f) { fwrite(data, 1, len, f); fclose(f); }
+                }
+            }
+        }
+
+        sr->data = data;
+        sr->len = (int)len;
+    }
+    free(cp->chapPath);
+    free(cp->chapUrl);
+    free(cp);
+    PostMessageW(g_hwnd, WM_APP_SUB_READY, 0, (LPARAM)sr);
+    return 0;
+}
+
+/* 异步加载章节 JSON：本地播客_剧集_<hash>.chapters.json 优先；
+ * 没有再用 chaptersUrl 联网下载并落盘成同名文件 */
+static void LoadChapters(const wchar_t *epUrlW, const wchar_t *podTitle,
+                         const wchar_t *epTitle, const char *chaptersUrl)
+{
+    const char *key;
+
+    if (!chaptersUrl || !chaptersUrl[0]) {
+        FreeSubCues();
+        free(g_subTransUrl); g_subTransUrl = NULL;
+        return;
+    }
+    key = chaptersUrl;
+    if (g_subTransUrl && key && strcmp(g_subTransUrl, key) == 0) return;
+
+    free(g_subTransUrl);
+    g_subTransUrl = _strdup(key);
+    {
+        ChapLoadParam *cp = (ChapLoadParam*)calloc(1, sizeof(ChapLoadParam));
+        if (!cp) return;
+        cp->chapUrl = _strdup(chaptersUrl);
+        cp->hash = (epUrlW && epUrlW[0]) ? CacheUrlHash(epUrlW) : 0;
+        if (cp->hash) {
+            wchar_t dir[MAX_PATH], base[MAX_PATH];
+            size_t bl;
+            CacheDir(dir, MAX_PATH);
+            CacheNameBase(dir, podTitle, epTitle, cp->hash, base, MAX_PATH);
+            bl = wcslen(base);
+            cp->chapPath = (wchar_t*)malloc((bl + 16) * sizeof(wchar_t));
+            if (cp->chapPath) swprintf(cp->chapPath, (int)bl + 16, L"%ls.chapters.json", base);
+        }
+        {
+            HANDLE th = CreateThread(NULL, 0, ChaptersLoaderThread, cp, 0, NULL);
+            if (th) CloseHandle(th);
+            else { free(cp->chapUrl); free(cp->chapPath); free(cp); }
+        }
+    }
+}
+
 /* UI 线程：字幕下载完成 → 解析 + 刷新列表/外挂窗 */
 static void SubRefreshUI(void);   /* 定义在 UI 段 */
 static void SubUpdateBar(void);   /* 定义在 外挂字幕窗 段 */
 static void OnSubReady(SubRaw *sr)
 {
     if (sr) {
-        /* 仅当返回的 URL 仍是当前剧集的字幕时才采用，避免快速切集时旧结果覆盖新结果 */
+        /* 仅当返回的 URL 仍是当前剧集的字幕/章节时才采用，避免快速切集时旧结果覆盖新结果 */
         if (sr->url && g_subTransUrl && strcmp(sr->url, g_subTransUrl) == 0) {
-            if (sr->data && sr->len > 0) ParseTranscript(sr->data, sr->len);
-            else FreeSubCues();
+            if (sr->data && sr->len > 0) {
+                if (sr->isChapters) ParseChaptersJson(sr->data, sr->len);
+                else ParseTranscript(sr->data, sr->len);
+            } else {
+                FreeSubCues();
+            }
             SubRefreshUI();
         }
         free(sr->url);
@@ -7762,15 +8011,18 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
                     e->localFile ? tr(TR_F_LOCALFILE) : tr(TR_F_LINK), e->url);
     SetWindowTextW(g_editDesc, buf);
 
-    /* 加载该集字幕（异步，下载完回 UI 线程解析刷新）。
-     * SubOv 四种状态决定 LoadTranscript 参数：
+    /* 加载该集字幕/章节（异步，下载完回 UI 线程解析刷新）。
+     * 章节优先：e->chaptersUrl 存在时加载章节 JSON，否则走字幕 VTT/SRT 链路。
+     * SubOv 四种状态决定 LoadTranscript 参数（仅章节缺失时生效）：
      *   NULL      → RSS 原始 transcriptUrl（默认）
      *   ""        → 显式清除：完全不加载字幕
      *   "local"   → 本地导入：让 CacheSubFind 命中本地文件；没命中也不联网
      *   http…     → 网络 URL 覆盖：命中本地则用，没命中则联网下载
      * 正在播别的一集时（只是浏览）不动字幕，桌面字幕继续跟播放内容 */
     if (SubFollowsEpisode(e->url)) {
-        if (e->localFile) {
+        if (e->chaptersUrl && e->chaptersUrl[0]) {
+            LoadChapters(e->url, p->title, e->title, e->chaptersUrl);
+        } else if (e->localFile) {
             LoadTranscript(NULL, p->title, e->title, NULL);
         } else {
             char *u8 = WToU8(e->url);
@@ -8168,6 +8420,7 @@ static void FreePodcast(Podcast *p)
         free(p->eps[j].desc);
         free(p->eps[j].url);
         free(p->eps[j].transcriptUrl);
+        free(p->eps[j].chaptersUrl);
         free(p->eps[j].author);
     }
     free(p->eps);
@@ -8387,6 +8640,7 @@ static void DropEpTranscript(const Episode *e)
     free(u8);
 
     CacheSubDelete(CacheUrlHash(e->url));
+    CacheChaptersDelete(CacheUrlHash(e->url));
     if (t && t[0] && strcmp(t, "local") != 0) {
         UrlCachePath(t, L"trans_", L"vtt", path, MAX_PATH);
         DeleteFileW(path);
