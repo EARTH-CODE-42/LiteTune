@@ -184,7 +184,7 @@ enum {
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
     IDC_SB_SUB, IDC_SB_SUB_H,
     IDC_TAB_DESC,
-    IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_LIST_SUB
+    IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_BTN_CHAPTERS, IDC_LIST_SUB
 };
 
 /* ================= 全局状态 ================= */
@@ -341,11 +341,12 @@ static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标�
 static int     g_subShownIdx = -1;   /* 外挂窗最后显示过的字幕下标（间隙时沿用） */
 static char   *g_subTransUrl = NULL; /* 当前加载内容的 URL（去重用）：字幕时是 transcriptUrl，章节时是 chaptersUrl */
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
-static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕列表（按钮1） */
-static HWND    g_listSub = NULL;     /* 简介区字幕列表 */
+static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕 2=章节 */
+static HWND    g_listSub = NULL;     /* 简介区字幕/章节共用列表 */
 static HWND    g_btnSubView = NULL;  /* tab1：简介 */
-static HWND    g_btnSubTab = NULL;   /* tab2：字幕列表 */
-static HWND    g_btnSubOn = NULL;    /* 按钮：字幕开关 */
+static HWND    g_btnSubTab = NULL;   /* tab2：字幕 */
+static HWND    g_btnSubChap = NULL;  /* tab3：章节 */
+static HWND    g_btnSubOn = NULL;    /* 方形按钮：外挂字幕开关（图案） */
 static HWND    g_hwndSubBar = NULL;  /* 外挂置顶字幕窗口 */
 static int     g_subNoSeek = 0;      /* 程序式 LB_SETCURSEL 时置 1，跳过点击跳转 */
 static int     g_subTextW = 0;       /* 最长一条字幕的像素宽（横向滚动上限） */
@@ -521,6 +522,7 @@ enum {
     TR_DROP_NO_EP,
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_DROP_HINT_FMT, TR_DROP_HINT_SEL, TR_DROP_HINT_IMPORT,
+    TR_SUB_VIEW_CHAPTERS,
     TR_N
 };
 
@@ -643,7 +645,8 @@ static const wchar_t *tr(int id)
         L"简介", L"字幕", L"字幕开", L"字幕关",
         L"松开鼠标即把字幕挂到「%ls」",
         L"松开鼠标即把字幕挂到当前选中的剧集",
-        L"松开鼠标即导入"
+        L"松开鼠标即导入",
+        L"章节"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -783,7 +786,8 @@ static const wchar_t *tr(int id)
         L"Notes", L"Subs", L"Subs on", L"Subs off",
         L"Release to attach the subtitle to \"%ls\"",
         L"Release to attach the subtitle to the selected episode",
-        L"Release to import"
+        L"Release to import",
+        L"Chapters"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -7983,6 +7987,39 @@ static int SubFollowsEpisode(const wchar_t *url)
     return url && wcscmp(g_playUrl, url) == 0;
 }
 
+/* 按当前简介区 tab 模式为选中剧集加载字幕/章节：
+ * tab=0(简介)不动；tab=1 字幕走 SubOv 状态机；tab=2 章节。
+ * 仅 SubFollowsEpisode 成立时才真正加载，避免浏览时打断正在播放的集。 */
+static void LoadSubForCurTab(void)
+{
+    Podcast *p; Episode *e;
+    if (g_curPod < 0 || g_curEp < 0) return;
+    p = (g_curPod == g_podCount) ? &g_cachePod : &g_pods[g_curPod];
+    if (g_curEp >= p->epCount) return;
+    e = &p->eps[g_curEp];
+    if (!SubFollowsEpisode(e->url)) return;
+
+    if (g_subInDesc == 2) {
+        if (e->chaptersUrl && e->chaptersUrl[0])
+            LoadChapters(e->url, p->title, e->title, e->chaptersUrl);
+        else
+            FreeSubCues();
+    } else if (g_subInDesc == 1) {
+        if (e->localFile) {
+            LoadTranscript(NULL, p->title, e->title, NULL);
+        } else {
+            char *u8 = WToU8(e->url);
+            const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
+            const char *tu; const wchar_t *eu;
+            if (ov && ov[0] == 0) { eu = NULL; tu = NULL; }
+            else if (ov && strcmp(ov, "local") == 0) { eu = e->url; tu = NULL; }
+            else { eu = e->url; tu = (ov && ov[0]) ? ov : e->transcriptUrl; }
+            LoadTranscript(eu, p->title, e->title, tu);
+            free(u8);
+        }
+    }
+}
+
 static void ShowEpisodeDetail(int podIdx, int epIdx)
 {
     static wchar_t buf[32768];
@@ -8011,36 +8048,9 @@ static void ShowEpisodeDetail(int podIdx, int epIdx)
                     e->localFile ? tr(TR_F_LOCALFILE) : tr(TR_F_LINK), e->url);
     SetWindowTextW(g_editDesc, buf);
 
-    /* 加载该集字幕/章节（异步，下载完回 UI 线程解析刷新）。
-     * 章节优先：e->chaptersUrl 存在时加载章节 JSON，否则走字幕 VTT/SRT 链路。
-     * SubOv 四种状态决定 LoadTranscript 参数（仅章节缺失时生效）：
-     *   NULL      → RSS 原始 transcriptUrl（默认）
-     *   ""        → 显式清除：完全不加载字幕
-     *   "local"   → 本地导入：让 CacheSubFind 命中本地文件；没命中也不联网
-     *   http…     → 网络 URL 覆盖：命中本地则用，没命中则联网下载
-     * 正在播别的一集时（只是浏览）不动字幕，桌面字幕继续跟播放内容 */
-    if (SubFollowsEpisode(e->url)) {
-        if (e->chaptersUrl && e->chaptersUrl[0]) {
-            LoadChapters(e->url, p->title, e->title, e->chaptersUrl);
-        } else if (e->localFile) {
-            LoadTranscript(NULL, p->title, e->title, NULL);
-        } else {
-            char *u8 = WToU8(e->url);
-            const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
-            const char *tu;
-            const wchar_t *eu;
-            if (ov && ov[0] == 0) {       /* 显式空：不管 RSS 原始还是本地缓存，都不加载 */
-                eu = NULL; tu = NULL;
-            } else if (ov && strcmp(ov, "local") == 0) {  /* 本地覆盖：走缓存查找，不联网 */
-                eu = e->url; tu = NULL;
-            } else {                                        /* NULL / http… */
-                eu = e->url; tu = (ov && ov[0]) ? ov : e->transcriptUrl;
-            }
-            LoadTranscript(eu, p->title, e->title, tu);
-            free(u8);
-        }
-        SubRefreshUI();
-    }
+    /* 按当前 tab 加载该集字幕/章节（异步，简介 tab 不加载） */
+    LoadSubForCurTab();
+    SubRefreshUI();
 }
 
 /* “已缓存”虚拟行被选中：扫描缓存目录，换成 播客/标题/时长 列 */
@@ -10435,6 +10445,7 @@ static void LayoutControls(HWND hwnd)
             ShowWindow(g_editDesc, SW_HIDE);
             ShowWindow(g_listSub, SW_HIDE);
             ShowWindow(g_btnSubView, SW_HIDE);
+            ShowWindow(g_btnSubChap, SW_HIDE);
             ShowWindow(g_btnSubTab, SW_HIDE);
             ShowWindow(g_btnSubOn, SW_HIDE);
             if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
@@ -10444,17 +10455,20 @@ static void LayoutControls(HWND hwnd)
             int contY = by + 30;
             int contH = bh - 32;
             int inner = w3 - 4;
-            int tabW = (inner - 4) / 3;      /* 「简介」「字幕」两个 tab 等宽，余下给开关 */
+            int subBtnW = 28;   /* 方形字幕开关（图案），宽≈高与 tab 同高 */
+            int tabW = (inner - subBtnW - 8) / 3;   /* 三个 tab 等宽，4 个 2px 间距 */
             /* 内容框顶边与另两列对齐（同为 by+28），按钮行放在工具栏基线 */
             g_rcPanel[2].left = x;           g_rcPanel[2].top = by + 28;
             g_rcPanel[2].right = x + w3;     g_rcPanel[2].bottom = by + bh;
-            MoveWindow(g_btnSubView, x + 2, by, tabW, 24, TRUE);
-            MoveWindow(g_btnSubTab,  x + 4 + tabW, by, tabW, 24, TRUE);
-            MoveWindow(g_btnSubOn,   x + 6 + tabW * 2, by, x + w3 - 2 - (x + 6 + tabW * 2), 24, TRUE);
+            MoveWindow(g_btnSubView, x + 2,            by, tabW, 24, TRUE);
+            MoveWindow(g_btnSubChap, x + 4 + tabW,     by, tabW, 24, TRUE);
+            MoveWindow(g_btnSubTab,  x + 6 + tabW * 2, by, tabW, 24, TRUE);
+            MoveWindow(g_btnSubOn,   x + 8 + tabW * 3, by, subBtnW, 24, TRUE);
             ShowWindow(g_btnSubView, SW_SHOWNA);
+            ShowWindow(g_btnSubChap, SW_SHOWNA);
             ShowWindow(g_btnSubTab, SW_SHOWNA);
             ShowWindow(g_btnSubOn, SW_SHOWNA);
-            if (g_subInDesc) {
+            if (g_subInDesc != 0) {   /* 1=字幕 2=章节：都用共用列表 */
                 /* 字幕列表模式：纵/横自绘条，原生横条已隐藏 */
                 ShowWindow(g_editDesc, SW_HIDE);
                 if (g_vsDesc) ShowWindow(g_vsDesc, SW_HIDE);
@@ -10580,6 +10594,10 @@ static void SubRefreshUI(void)
     if (g_btnSubTab) {
         SetWindowTextW(g_btnSubTab, tr(TR_SUB_VIEW_LIST));
         InvalidateRect(g_btnSubTab, NULL, TRUE);
+    }
+    if (g_btnSubChap) {
+        SetWindowTextW(g_btnSubChap, tr(TR_SUB_VIEW_CHAPTERS));
+        InvalidateRect(g_btnSubChap, NULL, TRUE);
     }
     if (g_btnSubOn) {
         SetWindowTextW(g_btnSubOn, tr(g_subEnabled ? TR_SUB_ON : TR_SUB_OFF));
@@ -11840,6 +11858,7 @@ static void ApplyLanguage(void)
     /* 简介/字幕 tab 与开关文案 */
     if (g_btnSubView) SetWindowTextW(g_btnSubView, tr(TR_SUB_VIEW_DESC));
     if (g_btnSubTab)  SetWindowTextW(g_btnSubTab,  tr(TR_SUB_VIEW_LIST));
+    if (g_btnSubChap) SetWindowTextW(g_btnSubChap, tr(TR_SUB_VIEW_CHAPTERS));
     if (g_btnSubOn)
         SetWindowTextW(g_btnSubOn, tr(g_subEnabled ? TR_SUB_ON : TR_SUB_OFF));
 
@@ -13755,10 +13774,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_EDIT_DESC, NULL, NULL);
 
-        /* 字幕：简介区顶部三按钮（简介 tab / 字幕 tab / 字幕开关）+ 字幕列表 */
+        /* 简介区顶部按钮：简介/章节/字幕 三个切换 tab + 方形字幕开关 + 共用列表 */
         g_btnSubView = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_VIEW_DESC),
             WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBVIEW, NULL, NULL);
+        g_btnSubChap = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_VIEW_CHAPTERS),
+            WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_CHAPTERS, NULL, NULL);
         g_btnSubTab = CreateWindowExW(0, L"BUTTON", tr(TR_SUB_VIEW_LIST),
             WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
             0,0,0,0, hwnd, (HMENU)IDC_BTN_SUBTAB, NULL, NULL);
@@ -13986,15 +14008,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (di->CtlType == ODT_BUTTON) {
-            /* 字幕三个按钮：「简介」「字幕」两个 tab + 字幕开关（自绘以适配暗色） */
+            /* 三个切换 tab：简介 / 章节 / 字幕（自绘以适配暗色） */
             if (di->CtlID == IDC_BTN_SUBVIEW || di->CtlID == IDC_BTN_SUBTAB ||
-                di->CtlID == IDC_BTN_SUBON) {
+                di->CtlID == IDC_BTN_CHAPTERS) {
                 RECT rc = di->rcItem;
                 wchar_t txt[32];
                 HFONT oldf;
                 int pressed = (di->itemState & ODS_SELECTED) != 0;
-                int on = (di->CtlID == IDC_BTN_SUBON) ? g_subEnabled
-                       : (di->CtlID == IDC_BTN_SUBTAB ? g_subInDesc : !g_subInDesc);
+                int on = (di->CtlID == IDC_BTN_SUBVIEW) ? (g_subInDesc == 0)
+                       : (di->CtlID == IDC_BTN_SUBTAB)  ? (g_subInDesc == 1)
+                       : (g_subInDesc == 2);
                 int active = pressed || on;   /* 鼠标按下 OR 逻辑激活 → sunken */
                 FillRectColor(di->hDC, &rc, active ? ThBtnPressed() : ThPanel());
                 DrawEdge(di->hDC, &rc, active ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
@@ -14004,6 +14027,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 oldf = (HFONT)SelectObject(di->hDC, g_font);
                 DrawTextW(di->hDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(di->hDC, oldf);
+                return TRUE;
+            }
+            /* 方形字幕开关：画一个字幕条图标，开=主色实心，关=灰边+斜线 */
+            if (di->CtlID == IDC_BTN_SUBON) {
+                RECT rc = di->rcItem;
+                int pressed = (di->itemState & ODS_SELECTED) != 0;
+                int on = g_subEnabled;
+                int active = pressed || on;
+                int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
+                RECT ir = { cx - 8, cy - 4, cx + 8, cy + 4 };
+                HPEN pen, oldPen;
+                HBRUSH br, oldBr;
+                FillRectColor(di->hDC, &rc, active ? ThBtnPressed() : ThPanel());
+                DrawEdge(di->hDC, &rc, active ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+                if (on) {
+                    br = CreateSolidBrush(ThAccent());
+                    oldBr = SelectObject(di->hDC, br);
+                    oldPen = SelectObject(di->hDC, GetStockObject(NULL_PEN));
+                    Rectangle(di->hDC, ir.left, ir.top, ir.right, ir.bottom);
+                    SelectObject(di->hDC, oldPen);
+                    SelectObject(di->hDC, oldBr);
+                    DeleteObject(br);
+                } else {
+                    pen = CreatePen(PS_SOLID, 1, ThDim());
+                    oldPen = SelectObject(di->hDC, pen);
+                    oldBr = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+                    Rectangle(di->hDC, ir.left, ir.top, ir.right, ir.bottom);
+                    MoveToEx(di->hDC, ir.left, ir.top, NULL);
+                    LineTo(di->hDC, ir.right, ir.bottom);
+                    SelectObject(di->hDC, oldBr);
+                    SelectObject(di->hDC, oldPen);
+                    DeleteObject(pen);
+                }
                 return TRUE;
             }
             /* 倍速按钮：文字按钮，显示 "1.0x" 等 */
@@ -14918,12 +14974,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 FillEpisodeList();
                 SyncScrollBar(g_vsEp);
             }
-            else if (id == IDC_BTN_SUBVIEW || id == IDC_BTN_SUBTAB) {
-                /* 「简介」「字幕」两个 tab */
-                int want = (id == IDC_BTN_SUBTAB);
+            else if (id == IDC_BTN_SUBVIEW || id == IDC_BTN_SUBTAB ||
+                     id == IDC_BTN_CHAPTERS) {
+                /* 简介 / 章节 / 字幕 三个 tab 切换 */
+                int want = (id == IDC_BTN_SUBVIEW) ? 0 : (id == IDC_BTN_SUBTAB ? 1 : 2);
                 if (g_subInDesc != want) {
                     g_subInDesc = want;
                     LayoutControls(g_hwnd);
+                    LoadSubForCurTab();   /* 切到字幕/章节 tab 时加载该集数据 */
                     SubRefreshUI();
                 }
             }
