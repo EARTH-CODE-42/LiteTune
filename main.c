@@ -340,6 +340,7 @@ static int     g_subCueCount = 0;
 static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标，-1=无 */
 static int     g_subShownIdx = -1;   /* 外挂窗最后显示过的字幕下标（间隙时沿用） */
 static char   *g_subTransUrl = NULL; /* 当前加载内容的 URL（去重用）：字幕时是 transcriptUrl，章节时是 chaptersUrl */
+static int     g_subKind = 0;        /* g_subCues 的内容类型：0=空 1=字幕 2=章节 */
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
 static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕 2=章节 */
 static HWND    g_listSub = NULL;     /* 简介区字幕/章节共用列表 */
@@ -523,6 +524,8 @@ enum {
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_DROP_HINT_FMT, TR_DROP_HINT_SEL, TR_DROP_HINT_IMPORT,
     TR_SUB_VIEW_CHAPTERS,
+    TR_M_CLEAN_ORPHAN, TR_ORPHAN_DONE_FMT, TR_ORPHAN_NONE,
+    TR_PH_CHAPTERS, TR_PH_SUBS,
     TR_N
 };
 
@@ -532,7 +535,7 @@ static const wchar_t *tr(int id)
         L"就绪",
         L"LiteTune ｜ %d:%02d 后关机",
         L"标题", L"日期", L"时长", L"播客",
-        L"(无标题)",
+        L"(Untitled)",
         L"已缓存", L"本地缓存音频，断网也可播放", L"未知播客", L"已缓存 (%d)",
         L"离线播放本地音频",
         L"音频", L"单声", L"立体", L"多声",
@@ -646,7 +649,9 @@ static const wchar_t *tr(int id)
         L"松开鼠标即把字幕挂到「%ls」",
         L"松开鼠标即把字幕挂到当前选中的剧集",
         L"松开鼠标即导入",
-        L"章节"
+        L"章节",
+        L"立即清理无用缓存", L"已删除 %d 个无用缓存文件", L"没有发现无用缓存",
+        L"（本集没有章节信息）", L"（本集没有字幕）"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -787,7 +792,9 @@ static const wchar_t *tr(int id)
         L"Release to attach the subtitle to \"%ls\"",
         L"Release to attach the subtitle to the selected episode",
         L"Release to import",
-        L"Chapters"
+        L"Chapters",
+        L"Clean unused cache now", L"Removed %d unused cache file(s)", L"No unused cache found",
+        L"(No chapters for this episode)", L"(No subtitles for this episode)"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -3865,8 +3872,84 @@ static unsigned int LastEpHash(const char *url)
     return h;
 }
 
-static LastEp* LastEpFind(unsigned int hash)
+/* 8 位十六进制 → unsigned int；不是合法 8 位十六进制返回 0 */
+static int Hex8ToUInt(const wchar_t *s, unsigned int *out)
 {
+    unsigned int v = 0;
+    int k;
+    for (k = 0; k < 8; k++) {
+        wchar_t c = s[k];
+        v <<= 4;
+        if (c >= L'0' && c <= L'9') v |= (unsigned int)(c - L'0');
+        else if (c >= L'a' && c <= L'f') v |= (unsigned int)(c - L'a' + 10);
+        else if (c >= L'A' && c <= L'F') v |= (unsigned int)(c - L'A' + 10);
+        else return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+/* 立即清理：删除缓存目录里不属于任何现有播客/剧集的孤儿文件。
+ * 只认本程序的命名规则（文件名末尾带 8 位十六进制哈希），其它文件一律不碰。
+ * 返回删除的文件数。 */
+static int CleanOrphanCache(void)
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    unsigned int *keep = NULL;
+    int nkeep = 0, cap = 0, i, j, deleted = 0;
+
+    for (i = 0; i <= g_podCount; i++) {
+        Podcast *p = (i == g_podCount) ? &g_cachePod : &g_pods[i];
+        cap += p->epCount + 1;
+    }
+    if (cap <= 0) return 0;
+    keep = (unsigned int*)malloc(sizeof(unsigned int) * cap);
+    if (!keep) return 0;
+    for (i = 0; i <= g_podCount; i++) {
+        Podcast *p = (i == g_podCount) ? &g_cachePod : &g_pods[i];
+        if (p->feedUrl) keep[nkeep++] = LastEpHash(p->feedUrl);
+        for (j = 0; j < p->epCount; j++)
+            if (p->eps[j].url) keep[nkeep++] = CacheUrlHash(p->eps[j].url);
+    }
+
+    CacheDir(dir, MAX_PATH);
+    swprintf(pat, MAX_PATH, L"%ls*.*", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) { free(keep); return 0; }
+    do {
+        wchar_t name[MAX_PATH], *dot;
+        unsigned int hv;
+        int iskeep = 0;
+        size_t nl;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wcscpy_s(name, MAX_PATH, fd.cFileName);
+        nl = wcslen(name);
+        if (nl > 14 && _wcsicmp(name + nl - 14, L".chapters.json") == 0) {
+            name[nl - 14] = 0;
+        } else {
+            dot = wcsrchr(name, L'.');
+            if (dot) *dot = 0;
+        }
+        nl = wcslen(name);
+        if (nl < 8) continue;
+        if (!Hex8ToUInt(name + nl - 8, &hv)) continue;
+        if (nl > 8 && name[nl - 9] != L'_' && name[nl - 9] != L'-') continue;
+        for (j = 0; j < nkeep; j++)
+            if (keep[j] == hv) { iskeep = 1; break; }
+        if (!iskeep) {
+            wchar_t fp[MAX_PATH];
+            swprintf(fp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
+            if (DeleteFileW(fp)) deleted++;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    free(keep);
+    return deleted;
+}
+
+static LastEp* LastEpFind(unsigned int hash){
     int i;
     for (i = 0; i < g_lastEpCount; i++)
         if (g_lastEps[i].hash == hash) return &g_lastEps[i];
@@ -5487,6 +5570,7 @@ static void FreeSubCues(void)
     free(g_subCues);
     g_subCues = NULL;
     g_subCueCount = 0;
+    g_subKind = 0;
     g_subCurIdx = -1;
     g_subShownIdx = -1;
 }
@@ -5593,6 +5677,7 @@ static void ParseTranscript(const char *data, int len)
         /* start<0 时的非时间码行（SRT 序号、VTT NOTE/STYLE）直接忽略 */
     }
     if (start >= 0) AddSubCue(start, endT, textBuf);
+    g_subKind = 1;   /* 字幕 */
 }
 
 /* 解析 Podcasting 2.0 chapters JSON 到 g_subCues。
@@ -5643,6 +5728,7 @@ static void ParseChaptersJson(const char *data, int len)
         p = objEnd;
     }
     g_subCueCount = nchap;
+    g_subKind = 2;   /* 章节 */
 
     if (nchap >= 2) {
         /* 简单插入排序（章节数一般 <200） */
@@ -7979,32 +8065,85 @@ static void ShowPodcastDetail(int idx)
     SetWindowTextW(g_editDesc, buf);
 }
 
-/* 浏览别的剧集时不要换掉正在播放那一集的字幕：桌面字幕和外挂窗只跟播放内容走，
- * 字幕列表也不该自动滚到别集；真正播到这一集时（播放前已设 g_playUrl）才加载 */
+/* 浏览别的剧集时不要换掉正在播放那一集的字幕：桌面字幕和外挂窗只跟播放内容走。
+ * 注意用 g_playPod/g_playUrl 判断，而不是 g_playState——先下后播时
+ * 下载阶段状态还是 0，但目标剧集已经确定，此时若跟着鼠标走会把章节/字幕清空 */
 static int SubFollowsEpisode(const wchar_t *url)
 {
-    if (g_playState == 0 || !g_playUrl) return 1;
+    if (g_playPod < 0 || !g_playUrl) return 1;
     return url && wcscmp(g_playUrl, url) == 0;
 }
 
-/* 按当前简介区 tab 模式为选中剧集加载字幕/章节：
- * tab=0(简介)不动；tab=1 字幕走 SubOv 状态机；tab=2 章节。
- * 仅 SubFollowsEpisode 成立时才真正加载，避免浏览时打断正在播放的集。 */
+/* 正在播放（或待播）的剧集；没有则返回 NULL */
+static Episode* PlayingEpisode(Podcast **outPod)
+{
+    int i;
+    if (g_playPod >= 0 && g_playPod <= g_podCount && g_playUrl) {
+        Podcast *pp = (g_playPod == g_podCount) ? &g_cachePod : &g_pods[g_playPod];
+        if (g_playEp >= 0 && g_playEp < pp->epCount) {
+            Episode *e = &pp->eps[g_playEp];
+            if (e->url && wcscmp(e->url, g_playUrl) == 0) {
+                if (outPod) *outPod = pp;
+                return e;
+            }
+        }
+        /* 列表顺序变了：按 URL 兜底找 */
+        for (i = 0; i <= g_podCount; i++) {
+            Podcast *q = (i == g_podCount) ? &g_cachePod : &g_pods[i];
+            int j;
+            for (j = 0; j < q->epCount; j++) {
+                if (q->eps[j].url && wcscmp(q->eps[j].url, g_playUrl) == 0) {
+                    if (outPod) *outPod = q;
+                    return &q->eps[j];
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* 按当前简介区 tab 加载字幕/章节。
+ * tab=1 字幕、tab=2 章节只显示“正在播放的剧集”（没在播放则跟随当前选中）；
+ * tab=0 简介虽然不显示列表，但仍要为播放中的剧集准备数据（章节优先，
+ * 与旧行为一致），否则桌面字幕条会因为没有加载而空白。 */
 static void LoadSubForCurTab(void)
 {
-    Podcast *p; Episode *e;
-    if (g_curPod < 0 || g_curEp < 0) return;
-    p = (g_curPod == g_podCount) ? &g_cachePod : &g_pods[g_curPod];
-    if (g_curEp >= p->epCount) return;
-    e = &p->eps[g_curEp];
-    if (!SubFollowsEpisode(e->url)) return;
+    Podcast *p = NULL;
+    Episode *e;
+    int want;
 
-    if (g_subInDesc == 2) {
-        if (e->chaptersUrl && e->chaptersUrl[0])
+    e = PlayingEpisode(&p);
+    if (g_subInDesc == 0) {
+        if (!e) return;                      /* 只是浏览：不需要为桌面字幕预载 */
+        want = (e->chaptersUrl && e->chaptersUrl[0]) ? 2 : 1;
+    } else {
+        want = (g_subInDesc == 2) ? 2 : 1;
+        if (!e) {
+            /* 没在播放 → 跟随鼠标选中的剧集 */
+            if (g_curPod < 0 || g_curEp < 0) return;
+            p = (g_curPod == g_podCount) ? &g_cachePod : &g_pods[g_curPod];
+            if (g_curEp >= p->epCount) return;
+            e = &p->eps[g_curEp];
+        }
+    }
+
+    /* 切换了内容类型（字幕 ↔ 章节）：清掉旧数据与去重键，强制重新加载，
+     * 否则字幕 tab 会显示上一轮加载的章节内容 */
+    if (g_subKind != want) {
+        FreeSubCues();
+        free(g_subTransUrl);
+        g_subTransUrl = NULL;
+    }
+
+    if (want == 2) {
+        if (e->chaptersUrl && e->chaptersUrl[0]) {
             LoadChapters(e->url, p->title, e->title, e->chaptersUrl);
-        else
+        } else {
             FreeSubCues();
-    } else if (g_subInDesc == 1) {
+            free(g_subTransUrl);
+            g_subTransUrl = NULL;
+        }
+    } else {
         if (e->localFile) {
             LoadTranscript(NULL, p->title, e->title, NULL);
         } else {
@@ -10455,7 +10594,7 @@ static void LayoutControls(HWND hwnd)
             int contY = by + 30;
             int contH = bh - 32;
             int inner = w3 - 4;
-            int subBtnW = 28;   /* 方形字幕开关（图案），宽≈高与 tab 同高 */
+            int subBtnW = 24;   /* 方形字幕开关（图案），与 tab 同高，确保正方便于区分于切换 tab */
             int tabW = (inner - subBtnW - 8) / 3;   /* 三个 tab 等宽，4 个 2px 间距 */
             /* 内容框顶边与另两列对齐（同为 by+28），按钮行放在工具栏基线 */
             g_rcPanel[2].left = x;           g_rcPanel[2].top = by + 28;
@@ -10555,6 +10694,10 @@ static void SubRefreshUI(void)
                 maxW = sz.cx;
             free(flat);
         }
+        /* 字幕/章节 tab 下没有数据时给一行占位提示，避免看起来像坏了 */
+        if (g_subCueCount == 0 && g_subInDesc != 0)
+            SendMessageW(g_listSub, LB_ADDSTRING, 0,
+                (LPARAM)tr(g_subInDesc == 2 ? TR_PH_CHAPTERS : TR_PH_SUBS));
         if (dc) {
             if (oldf) SelectObject(dc, oldf);
             ReleaseDC(g_listSub, dc);
@@ -12479,6 +12622,8 @@ static void OnSettingsButton(void)
             swprintf(t, 32, tr(TR_CC_DAYS_FMT), days[di]);
             MenuAdd(cl, g_cacheDays == days[di] ? MF_CHECKED : 0, 31 + di, t);
         }
+        MenuAddSep(cl);
+        MenuAdd(cl, 0, 34, tr(TR_M_CLEAN_ORPHAN));
         MenuAddPopup(menu, cl, tr(TR_M_CACHE_CLEAN), 0);
     }
     {
@@ -12492,10 +12637,11 @@ static void OnSettingsButton(void)
             swprintf(t, 32, tr(TR_AR_MIN_FMT), arms[ai]);
             MenuAdd(ar, g_autoRefreshMin == arms[ai] ? MF_CHECKED : 0, 41 + ai, t);
         }
+        MenuAddSep(ar);
+        MenuAdd(ar, 0, 46, tr(TR_M_REFRESH_NOW));
         MenuAddPopup(menu, ar, tr(TR_M_AUTOREFRESH), 0);
     }
     MenuAdd(menu, g_traySound ? MF_CHECKED : 0, 45, tr(TR_M_TRAY_SOUND));
-    MenuAdd(menu, 0, 46, tr(TR_M_REFRESH_NOW));   /* 原工具栏刷新按钮移到这里 */
     MenuAddSep(menu);
     MenuAdd(menu, 0, 22, tr(TR_M_IMPORT));
     MenuAdd(exp, 0, 23, tr(TR_M_EXP_OPML));
@@ -12540,6 +12686,19 @@ static void OnSettingsButton(void)
     /* 外观/语言/定时类命令先处理，不涉及缓存目录 */
     if (cmd == 22) { DoImport(); return; }
     if (cmd == 46) { ReloadFeeds(1); return; }   /* 立即刷新全部订阅 */
+    if (cmd == 34) {                             /* 立即清理孤儿缓存 */
+        wchar_t t[64];
+        int n = CleanOrphanCache();
+        if (n > 0) {
+            swprintf(t, 64, tr(TR_ORPHAN_DONE_FMT), n);
+            RefreshCachedEntry();
+            if (g_viewCached) SelectPodcast(g_podCount);
+        } else {
+            wcscpy_s(t, 64, tr(TR_ORPHAN_NONE));
+        }
+        SetStatusTemp(t);
+        return;
+    }
     if (cmd == 23) { DoExportOpml(); return; }
     if (cmd == 24) { DoExportIni(); return; }
     if (cmd == 25) { CfgSwitchMode(0); return; }
