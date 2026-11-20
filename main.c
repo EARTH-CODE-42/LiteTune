@@ -2453,7 +2453,7 @@ static int HttpDownloadFile(const wchar_t *url, const wchar_t *path,
 
         hSes = WinHttpOpenUser();
         if (!hSes) goto done;
-        WinHttpSetTimeouts(hSes, 30000, 30000, 60000, 60000);
+        WinHttpSetTimeouts(hSes, 20000, 20000, 20000, 20000);
         hCon = WinHttpConnect(hSes, host,
             uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
                                                 : INTERNET_DEFAULT_HTTP_PORT, 0);
@@ -2522,10 +2522,16 @@ static int HttpDownloadFile(const wchar_t *url, const wchar_t *path,
             if (got == 0) { ok = 1; break; }
             if (fwrite(buf, 1, got, f) != got) { diskErr = 1; break; }
             written += got;
-            if (progressMsg && contentLen > 0 && total > 0)
+            /* 进度消息：只有服务器给了 Content-Length 才能算真实百分比。
+             * 没有 Content-Length（chunked）就不发——UI 靠 0% 占位提示"正在下载"。
+             * 用户看到"无百分比 + 蓝色"就知道服务器没给长度，不是程序卡了 */
+            if (progressMsg && total > 0) {
+                int pct = (int)((offset + written) * 100 / total);
+                if (pct > 100) pct = 100;
                 PostMessageW(g_hwnd, progressMsg,
-                    (WPARAM)((offset + written) * 100 / total),
+                    (WPARAM)pct,
                     (LPARAM)(pProgGen ? *pProgGen : 0));
+            }
         }
         if (f) {
             if (fflush(f) != 0) diskErr = 1;
@@ -4954,6 +4960,7 @@ static void ParseConfigLine(char *line)
         else if (strcmp(s, "font") == 0) g_fontLevel = atoi(val);
         else if (strcmp(s, "dark") == 0) g_darkMode = (atoi(val) != 0);
         else if (strcmp(s, "lang") == 0) g_lang = (strcmp(val, "en") == 0) ? 1 : 0;
+        else if (strcmp(s, "subon") == 0) g_subEnabled = (atoi(val) != 0);
         else if (strcmp(s, "speed") == 0) { g_speed = atoi(val); if (g_speed < 50) g_speed = 100; if (g_speed > 300) g_speed = 100; }
         else if (strcmp(s, "resume") == 0) { g_resumeSec = atoll(val); if (g_resumeSec < 0) g_resumeSec = 0; }
         else if (strcmp(s, "resumeurl") == 0) { free(g_resumeUrl); g_resumeUrl = U8ToW(val); }
@@ -5341,6 +5348,7 @@ static char *BuildConfigText(DWORD *lenOut)
     SbAddf(&sb, "font=%d\n", g_fontLevel);
     SbAddf(&sb, "dark=%d\n", g_darkMode);
     SbAddf(&sb, "lang=%s\n", g_lang ? "en" : "zh");
+    SbAddf(&sb, "subon=%d\n", g_subEnabled);
     SbAddf(&sb, "speed=%d\n", g_speed);
     SbAddf(&sb, "winw=%d\n", g_winW);
     SbAddf(&sb, "winh=%d\n", g_winH);
@@ -6466,6 +6474,20 @@ static DWORD WINAPI BatchDlThread(LPVOID param)
         if (bc->pct && bc->cur < bc->count) bc->pct[bc->cur] = 0;
         LeaveCriticalSection(&bc->cs);
 
+        /* 立即发一条 0% 信号：让 UI 把这一行从"队列待处理"（无百分比）
+         * 变成"正在下载"（显示 0%）——哪怕后面握手/服务器响应还要几秒 */
+        {
+            wchar_t st[128];
+            int headNow, cntNow;
+            EnterCriticalSection(&bc->cs);
+            headNow = bc->head; cntNow = bc->count;
+            LeaveCriticalSection(&bc->cs);
+            swprintf(st, 128, tr(TR_BATCH_PROGRESS_FMT), headNow, cntNow);
+            wcscat_s(st, 128, L" 0%");
+            SetBatchProgress(st);
+            InvalidateRect(g_listEp, NULL, FALSE);
+        }
+
         if (url && url[0]) {
             CachePathFor(url, cache, MAX_PATH);
             EnsureCacheDir();
@@ -6715,11 +6737,11 @@ static void StartBatchCache(void)
 }
 
 /* 该集是否在批量下载队列中（尚未完成的保持蓝色；已完成的 cached=1 由黄色优先）。
- * 按 URL 匹配：批量期间列表可能被刷新/重排，URL 不受影响。遍历在队列 CS 内，
- * 与 UI 线程的 realloc 追加互斥。 */
+ * 正在处理（cur>=0）或待处理（j>=head 且 cur=-1）都算 queued。
+ * 已处理完的（成功 or 失败）不再算 queued —— 下载行成功转黄、失败去掉蓝色。 */
 static int EpisodeBatchQueued(int ep)
 {
-    int j, found = 0;
+    int j, found = 0, start;
     Podcast *p;
     BatchCache *bc = g_batch;
     if (!bc || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
@@ -6727,7 +6749,8 @@ static int EpisodeBatchQueued(int ep)
     p = &g_pods[g_curPod];
     if (ep < 0 || ep >= p->epCount || !p->eps[ep].url) return 0;
     EnterCriticalSection(&bc->cs);
-    for (j = 0; j < bc->count; j++) {
+    start = (bc->cur >= 0) ? bc->cur : bc->head;
+    for (j = start; j < bc->count; j++) {
         if (bc->urls[j] && bc->urls[j][0] &&
             wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
             found = 1;
@@ -6738,10 +6761,11 @@ static int EpisodeBatchQueued(int ep)
     return found;
 }
 
-/* 该集当前下载百分比（0=不在下载中），列表行用它当时长列的临时标签 */
+/* 该集当前下载百分比（0=不在下载中 / 已完成），列表行用它当时长列的临时标签。
+ * 只有"还没处理完"的才返回百分比。 */
 static int EpisodeBatchPercent(int ep)
 {
-    int j, pct = 0;
+    int j, pct = 0, start;
     Podcast *p;
     BatchCache *bc = g_batch;
     if (!bc || !bc->pct || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
@@ -6749,7 +6773,8 @@ static int EpisodeBatchPercent(int ep)
     p = &g_pods[g_curPod];
     if (ep < 0 || ep >= p->epCount || !p->eps[ep].url) return 0;
     EnterCriticalSection(&bc->cs);
-    for (j = 0; j < bc->count; j++) {
+    start = (bc->cur >= 0) ? bc->cur : bc->head;
+    for (j = start; j < bc->count; j++) {
         if (bc->urls[j] && bc->urls[j][0] &&
             wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
             pct = bc->pct[j];
@@ -10610,9 +10635,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         old = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         LRESULT lr = CallWindowProcW(old, hwnd, msg, wp, lp);
         if (hwnd == g_listPod)       SyncScrollBar(g_vsPod);
-        else if (hwnd == g_listEp) { SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp);
-                                     /* 只在尺寸变化时对齐表头，滚动分支里绝不 SetWindowPos */
-                                     if (msg == WM_SIZE) FitListViewHeader(hwnd); }
+        else if (hwnd == g_listEp) {
+            HWND hdr;
+            SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp);
+            if (msg == WM_SIZE) {
+                FitListViewHeader(hwnd);
+            } else if (msg == WM_HSCROLL) {
+                /* HDF_OWNERDRAW 下系统水平滚动只刷背景，不给新位置重发
+                 * WM_DRAWITEM → 列文本像被橡皮擦擦掉。手动强制 header 重画各列 */
+                hdr = (HWND)SendMessageW(hwnd, LVM_GETHEADER, 0, 0);
+                if (hdr) InvalidateRect(hdr, NULL, TRUE);
+            }
+        }
         else if (hwnd == g_ibList) { if (g_ibSb) SyncScrollBar(g_ibSb);
                                      if (g_ibSbH) SyncScrollBar(g_ibSbH); }
         else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
@@ -15437,7 +15471,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     int pct = EpisodeBatchPercent(ep);
                     RECT r;
                     wchar_t s[16];
-                    if (pct <= 0 || pct >= 100) return CDRF_DODEFAULT;
+                    if (pct < 0 || pct >= 100) return CDRF_DODEFAULT;
                     r.left = LVIR_BOUNDS;
                     r.top  = 2;   /* LVM_GETSUBITEMRECT：top=子项下标（时长列） */
                     if (!SendMessageW(g_listEp, LVM_GETSUBITEMRECT,
@@ -16342,6 +16376,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     UpdateWindow(hwnd);
     SetStatus(tr(TR_READY));   /* 初始状态文本跟随语言（静态初值固定为中文） */
     ReloadFeeds(0);   /* 启动：订阅缓存优先，已下载过就无需重新联网 */
+    SubUpdateBar();   /* 字幕开关 ini 恢复为开时，立即创建/显示桌面字幕窗（可能暂时空着） */
     ArmAutoRefreshTimer();   /* 周期性自动刷新（0=关），播完空闲时才真正执行 */
     /* 离线启动时订阅可能加载很慢/失败：先立即挂上“已缓存”行，不等订阅 */
     RefreshCachedEntry();

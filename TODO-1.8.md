@@ -70,6 +70,20 @@
   - 升级为清理对话框：可选范围（失效播客 / 现有播客 / 全部）× 内容（音频/字幕/章节/封面/订阅信息），显示待删数量与体积
   - 已缓存列表右键「清空全部缓存」与本功能合并为同一个对话框
 - [x] 未知播客占位名改英文 `(Untitled)`，避免中文文件名/兼容性问题
+
+- [ ] **剧集列表 header 水平滚动后列文本被擦掉**（技术债，最后解决）
+  - 现象：拖水平滚动条时，ListView header 右侧被滚出来的新列区域**只有背景色，列文本像被橡皮擦擦掉**（日期、时长表头不显示）；内容区条目正常滚动
+  - 已尝试：
+    1. 主窗口 WndProc WM_HSCROLL 里 SetWindowPos(header, -x) → 无效（ListView 内置滚动发的 WM_HSCROLL lParam==NULL，进不了分支）
+    2. 撤回后在 PanelProc hwnd==g_listEp 的 WM_HSCROLL 里手动 `InvalidateRect(header, NULL, TRUE)` → 无效（可能 ScrollWindow 还没 commit，或 header 有内部 clip rect 不重发 WM_DRAWITEM）
+  - 根因方向：header 设了 `HDF_OWNERDRAW`（暗色模式自绘），ListView 水平滚动时只给 header 内部发 `HDM_SETOFFSET`（偏移显示位置），**不会对新暴露区域重发 `WM_DRAWITEM`**，于是只有 WM_ERASEBKGND 刷的背景色，列文本消失
+  - 待探索修法（按难度递增）：
+    - a) 子类化 header 窗口过程，拦截 `HDM_SETOFFSET` → 调 `InvalidateRect(NULL, TRUE)`
+    - b) 不用 HDF_OWNERDRAW，让 header 自己画（放弃暗色 header 自绘），代价是表头外观不随主题切换
+    - c) 拦截 `WM_NCPAINT` 或 `WM_PAINT` 时强制重绘所有列（SetWindowRgn 可能阻止）
+    - d) 每次水平滚动后用 `SendMessageW(header, HDM_SETIMAGELIST, ...)` 之类的手段触发重绘（暴力但可能有效）
+  - 定位 grep：`PanelProc`、`FitListViewHeader`、`HDF_OWNERDRAW`、`WM_DRAWITEM.*hdr`
+
 - [ ] **重构与死代码审计**
   - `MessageBoxTh` 仍是系统 MessageBoxW + WH_CBT 钩子做暗色，统一到已有的自绘弹窗，删掉钩子
   - 清理无引用辅助函数、未使用翻译条目
