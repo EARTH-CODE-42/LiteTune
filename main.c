@@ -526,6 +526,9 @@ enum {
     TR_SUB_VIEW_CHAPTERS,
     TR_M_CLEAN_ORPHAN, TR_ORPHAN_DONE_FMT, TR_ORPHAN_NONE,
     TR_PH_CHAPTERS, TR_PH_SUBS,
+    TR_CLN_TITLE, TR_CLN_SCOPE_ORPHAN, TR_CLN_SCOPE_CUR, TR_CLN_SCOPE_ALL,
+    TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META,
+    TR_CLN_STAT_FMT, TR_CLN_NONE,
     TR_N
 };
 
@@ -651,7 +654,10 @@ static const wchar_t *tr(int id)
         L"松开鼠标即导入",
         L"章节",
         L"立即清理无用缓存", L"已删除 %d 个无用缓存文件", L"没有发现无用缓存",
-        L"（本集没有章节信息）", L"（本集没有字幕）"
+        L"（本集没有章节信息）", L"（本集没有字幕）",
+        L"清理缓存", L"失效的播客（已删除订阅）", L"现有播客的缓存", L"全部缓存文件",
+        L"音频", L"字幕", L"章节", L"封面", L"订阅信息",
+        L"将删除 %d 个文件，共 %d.%d MB", L"没有可清理的文件"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -794,7 +800,10 @@ static const wchar_t *tr(int id)
         L"Release to import",
         L"Chapters",
         L"Clean unused cache now", L"Removed %d unused cache file(s)", L"No unused cache found",
-        L"(No chapters for this episode)", L"(No subtitles for this episode)"
+        L"(No chapters for this episode)", L"(No subtitles for this episode)",
+        L"Clean cache", L"Invalid podcasts (unsubscribed)", L"Cache of current podcasts", L"All cache files",
+        L"Audio", L"Subtitles", L"Chapters", L"Covers", L"Feed info",
+        L"Will remove %d file(s), %d.%d MB", L"Nothing to clean"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -3872,81 +3881,99 @@ static unsigned int LastEpHash(const char *url)
     return h;
 }
 
-/* 8 位十六进制 → unsigned int；不是合法 8 位十六进制返回 0 */
-static int Hex8ToUInt(const wchar_t *s, unsigned int *out)
+/* ---- 缓存清理：按范围 + 内容类型枚举/删除 ---- */
+#define CL_AUDIO 1
+#define CL_SUB   2
+#define CL_CHAP  4
+#define CL_COVER 8
+#define CL_META  16
+#define CL_ALL   31
+
+typedef struct { const wchar_t *ext; int type; } ClExt;
+static const ClExt kClExts[] = {
+    { L"mp3", CL_AUDIO }, { L"mp3.part", CL_AUDIO },
+    { L"vtt", CL_SUB }, { L"srt", CL_SUB },
+    { L"chapters.json", CL_CHAP },
+    { L"jpg", CL_COVER }, { L"jpeg", CL_COVER }, { L"png", CL_COVER },
+    { L"gif", CL_COVER }, { L"webp", CL_COVER }, { L"bmp", CL_COVER },
+    { L"img", CL_COVER },
+    { L"xml", CL_META }, { L"hdr", CL_META },
+};
+
+/* 收集“现有订阅播客”相关的哈希（剧集 URL、feedUrl、封面 URL）。
+ * 只算真实订阅，不算“已缓存”虚拟播客——它只是目录的映射。 */
+static unsigned int* KeepCacheHashes(int *pn)
 {
-    unsigned int v = 0;
-    int k;
-    for (k = 0; k < 8; k++) {
-        wchar_t c = s[k];
-        v <<= 4;
-        if (c >= L'0' && c <= L'9') v |= (unsigned int)(c - L'0');
-        else if (c >= L'a' && c <= L'f') v |= (unsigned int)(c - L'a' + 10);
-        else if (c >= L'A' && c <= L'F') v |= (unsigned int)(c - L'A' + 10);
-        else return 0;
+    int i, j, n = 0, cap = 0;
+    unsigned int *keep;
+    *pn = 0;
+    for (i = 0; i < g_podCount; i++) cap += g_pods[i].epCount + 2;
+    keep = (unsigned int*)malloc(sizeof(unsigned int) * (cap > 0 ? cap : 1));
+    if (!keep) return NULL;
+    for (i = 0; i < g_podCount; i++) {
+        Podcast *p = &g_pods[i];
+        /* 订阅 XML/.hdr 用 feedUrl 哈希；封面用封面 URL 哈希（两者地址不同） */
+        if (p->feedUrl) keep[n++] = LastEpHash(p->feedUrl);
+        if (p->imageUrl) keep[n++] = LastEpHash(p->imageUrl);
+        for (j = 0; j < p->epCount; j++)
+            if (p->eps[j].url) keep[n++] = CacheUrlHash(p->eps[j].url);
     }
-    *out = v;
-    return 1;
+    *pn = n;
+    return keep;
 }
 
-/* 立即清理：删除缓存目录里不属于任何现有播客/剧集的孤儿文件。
- * 只认本程序的命名规则（文件名末尾带 8 位十六进制哈希），其它文件一律不碰。
- * 返回删除的文件数。 */
-static int CleanOrphanCache(void)
+/* 枚举缓存目录；scope: 0=失效(不在保留集) 1=现有播客 2=全部。
+ * doDelete=0 只统计。跳过正在播放的文件。 */
+static void CacheCleanRun(int scope, int types, int doDelete,
+                          int *pFiles, unsigned long long *pBytes)
 {
-    wchar_t dir[MAX_PATH], pat[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
-    unsigned int *keep = NULL;
-    int nkeep = 0, cap = 0, i, j, deleted = 0;
+    wchar_t dir[MAX_PATH];
+    unsigned int *keep;
+    int nkeep = 0, d, j;
+    int files = 0;
+    unsigned long long bytes = 0;
 
-    for (i = 0; i <= g_podCount; i++) {
-        Podcast *p = (i == g_podCount) ? &g_cachePod : &g_pods[i];
-        cap += p->epCount + 1;
-    }
-    if (cap <= 0) return 0;
-    keep = (unsigned int*)malloc(sizeof(unsigned int) * cap);
-    if (!keep) return 0;
-    for (i = 0; i <= g_podCount; i++) {
-        Podcast *p = (i == g_podCount) ? &g_cachePod : &g_pods[i];
-        if (p->feedUrl) keep[nkeep++] = LastEpHash(p->feedUrl);
-        for (j = 0; j < p->epCount; j++)
-            if (p->eps[j].url) keep[nkeep++] = CacheUrlHash(p->eps[j].url);
-    }
-
+    *pFiles = 0;
+    *pBytes = 0;
+    if (!types) return;
+    keep = KeepCacheHashes(&nkeep);
     CacheDir(dir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%ls*.*", dir);
-    h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) { free(keep); return 0; }
-    do {
-        wchar_t name[MAX_PATH], *dot;
-        unsigned int hv;
-        int iskeep = 0;
-        size_t nl;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        wcscpy_s(name, MAX_PATH, fd.cFileName);
-        nl = wcslen(name);
-        if (nl > 14 && _wcsicmp(name + nl - 14, L".chapters.json") == 0) {
-            name[nl - 14] = 0;
-        } else {
-            dot = wcsrchr(name, L'.');
-            if (dot) *dot = 0;
-        }
-        nl = wcslen(name);
-        if (nl < 8) continue;
-        if (!Hex8ToUInt(name + nl - 8, &hv)) continue;
-        if (nl > 8 && name[nl - 9] != L'_' && name[nl - 9] != L'-') continue;
-        for (j = 0; j < nkeep; j++)
-            if (keep[j] == hv) { iskeep = 1; break; }
-        if (!iskeep) {
+
+    for (d = 0; d < (int)(sizeof(kClExts) / sizeof(kClExts[0])); d++) {
+        wchar_t pat[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE h;
+        if (!(types & kClExts[d].type)) continue;
+        swprintf(pat, MAX_PATH, L"%ls*.%ls", dir, kClExts[d].ext);
+        h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
             wchar_t fp[MAX_PATH];
+            unsigned int hv;
+            int iscur = 0;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!CacheNameHash(fd.cFileName, kClExts[d].ext, &hv, NULL)) continue;
+            for (j = 0; j < nkeep; j++)
+                if (keep[j] == hv) { iscur = 1; break; }
+            if (scope == 0 && iscur) continue;
+            if (scope == 1 && !iscur) continue;
             swprintf(fp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
-            if (DeleteFileW(fp)) deleted++;
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+            if (g_playUrl && wcscmp(fp, g_playUrl) == 0) continue;  /* 正在播放 */
+            if (doDelete) {
+                if (DeleteFileW(fp)) {   /* 失败（被占用等）不计入 */
+                    files++;
+                    bytes += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                }
+            } else {
+                files++;
+                bytes += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
     free(keep);
-    return deleted;
+    *pFiles = files;
+    *pBytes = bytes;
 }
 
 static LastEp* LastEpFind(unsigned int hash){
@@ -8874,44 +8901,9 @@ static void OpenCacheFolder(void)
     ShellExecuteW(NULL, L"open", dir, NULL, NULL, SW_SHOWNORMAL);
 }
 
-/* 右键"已缓存"行 → 清空全部缓存（mp3 + 字幕 vtt） */
-static void DeleteAllCacheFiles(void)
+/* 清理后刷新缓存视图 */
+static void AfterCacheClean(void)
 {
-    wchar_t cdir[MAX_PATH], pat[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
-    CacheDir(cdir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%ls*.mp3", cdir);
-    h = FindFirstFileW(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            wchar_t full[MAX_PATH];
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
-            DeleteFileW(full);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    /* 字幕缓存一并清掉：只删符合命名规则的 *_<8hex>.vtt/.srt（新旧命名都覆盖），
-     * 不碰目录里其它 vtt/srt */
-    {
-        static const wchar_t *sExts[2] = { L"vtt", L"srt" };
-        int si;
-        for (si = 0; si < 2; si++) {
-            unsigned int fh;
-            swprintf(pat, MAX_PATH, L"%ls*.%ls", cdir, sExts[si]);
-            h = FindFirstFileW(pat, &fd);
-            if (h == INVALID_HANDLE_VALUE) continue;
-            do {
-                wchar_t full[MAX_PATH];
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                if (!CacheNameHash(fd.cFileName, sExts[si], &fh, NULL)) continue;
-                swprintf(full, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
-                DeleteFileW(full);
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    }
     if (g_playPod == g_podCount) PlayerStop();   /* 正在离线播放：停掉 */
     RefreshCachedEntry();                        /* 缓存清空会自动撤掉虚拟行 */
     if (g_viewCached) {
@@ -8931,6 +8923,226 @@ static void DeleteAllCacheFiles(void)
         }
     } else {
         InvalidateRect(g_listPod, NULL, TRUE);
+    }
+}
+
+/* ---- 清理缓存对话框 ---- */
+#define CL_RADIO_BASE 3400
+#define CL_CHK_BASE   3410
+
+static HWND g_clDlg = NULL;
+static int  g_clReg = 0, g_clScope = 0, g_clTypes = CL_ALL;
+static int  g_clFiles = 0;
+static int  g_clDone = 0;
+static wchar_t g_clStatText[96];
+
+static void ClRefreshStats(HWND hwnd)
+{
+    int files = 0;
+    unsigned long long bytes = 0;
+    int mb10;
+    CacheCleanRun(g_clScope, g_clTypes, 0, &files, &bytes);
+    mb10 = (int)((bytes * 10ULL + 524288ULL) / 1048576ULL);
+    swprintf(g_clStatText, 96, tr(TR_CLN_STAT_FMT), files, mb10 / 10, mb10 % 10);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void ClDrawItem(const DRAWITEMSTRUCT *di)
+{
+    RECT rc = di->rcItem;
+    wchar_t txt[64];
+    HFONT of;
+    GetWindowTextW(di->hwndItem, txt, 64);
+    if (di->CtlID == IDOK || di->CtlID == IDCANCEL) {
+        int pressed = (di->itemState & ODS_SELECTED) != 0;
+        FillRectColor(di->hDC, &rc, pressed ? ThBtnPressed() : ThPanel());
+        DrawEdge(di->hDC, &rc, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+        SetBkMode(di->hDC, TRANSPARENT);
+        SetTextColor(di->hDC, ThText());
+        of = (HFONT)SelectObject(di->hDC, g_font);
+        DrawTextW(di->hDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(di->hDC, of);
+        return;
+    }
+    if ((di->CtlID >= CL_RADIO_BASE && di->CtlID < CL_RADIO_BASE + 3) ||
+        (di->CtlID >= CL_CHK_BASE && di->CtlID < CL_CHK_BASE + 5)) {
+        int radio = (di->CtlID < CL_CHK_BASE);
+        int idx = radio ? (int)di->CtlID - CL_RADIO_BASE : (int)di->CtlID - CL_CHK_BASE;
+        static const int bt[5] = { CL_AUDIO, CL_SUB, CL_CHAP, CL_COVER, CL_META };
+        int on = radio ? (g_clScope == idx) : ((g_clTypes & bt[idx]) != 0);
+        HPEN pen, op;
+        HBRUSH br, ob;
+        int cx = rc.left + 10, cy = (rc.top + rc.bottom) / 2;
+        RECT trc = rc;
+        FillRectColor(di->hDC, &rc, ThPanel());
+        SetBkMode(di->hDC, TRANSPARENT);
+        SetTextColor(di->hDC, ThText());
+        trc.left = cx + 14;
+        of = (HFONT)SelectObject(di->hDC, g_font);
+        DrawTextW(di->hDC, txt, -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(di->hDC, of);
+        pen = CreatePen(PS_SOLID, 1, on ? ThAccent() : ThDim());
+        op = (HPEN)SelectObject(di->hDC, pen);
+        if (radio) {
+            br = CreateSolidBrush(on ? ThAccent() : ThPanel());
+            ob = (HBRUSH)SelectObject(di->hDC, br);
+            Ellipse(di->hDC, cx - 6, cy - 6, cx + 6, cy + 6);
+            SelectObject(di->hDC, ob);
+            DeleteObject(br);
+        } else {
+            br = CreateSolidBrush(ThPanel());
+            ob = (HBRUSH)SelectObject(di->hDC, br);
+            Rectangle(di->hDC, cx - 6, cy - 6, cx + 6, cy + 6);
+            SelectObject(di->hDC, ob);
+            DeleteObject(br);
+            if (on) {
+                HPEN p2 = CreatePen(PS_SOLID, 2, ThAccent());
+                HPEN o2 = (HPEN)SelectObject(di->hDC, p2);
+                MoveToEx(di->hDC, cx - 4, cy, NULL);
+                LineTo(di->hDC, cx - 1, cy + 3);
+                LineTo(di->hDC, cx + 4, cy - 3);
+                SelectObject(di->hDC, o2);
+                DeleteObject(p2);
+            }
+        }
+        SelectObject(di->hDC, op);
+        DeleteObject(pen);
+    }
+}
+
+static LRESULT CALLBACK CleanDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        static const int radios[3] = { TR_CLN_SCOPE_ORPHAN, TR_CLN_SCOPE_CUR, TR_CLN_SCOPE_ALL };
+        static const int chks[5] = { TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META };
+        int i;
+        for (i = 0; i < 3; i++)
+            CreateWindowExW(0, L"BUTTON", tr(radios[i]),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                18, 12 + i * 28, 344, 24, hwnd, (HMENU)(CL_RADIO_BASE + i), NULL, NULL);
+        for (i = 0; i < 5; i++) {
+            int x = (i % 2) ? 196 : 24;
+            int y = 104 + (i / 2) * 26;
+            CreateWindowExW(0, L"BUTTON", tr(chks[i]),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                x, y, (i == 4 ? 300 : 150), 22, hwnd, (HMENU)(CL_CHK_BASE + i), NULL, NULL);
+        }
+        CreateWindowExW(0, L"BUTTON", tr(TR_OK),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
+            190, 222, 80, 28, hwnd, (HMENU)IDOK, NULL, NULL);
+        CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            280, 222, 80, 28, hwnd, (HMENU)IDCANCEL, NULL, NULL);
+        {   /* 统一字体 */
+            HWND c = GetWindow(hwnd, GW_CHILD);
+            while (c) { SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); c = GetWindow(c, GW_HWNDNEXT); }
+        }
+        ClRefreshStats(hwnd);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id >= CL_RADIO_BASE && id < CL_RADIO_BASE + 3) {
+            g_clScope = id - CL_RADIO_BASE;
+            InvalidateRect(hwnd, NULL, TRUE);
+            ClRefreshStats(hwnd);
+        } else if (id >= CL_CHK_BASE && id < CL_CHK_BASE + 5) {
+            static const int bt[5] = { CL_AUDIO, CL_SUB, CL_CHAP, CL_COVER, CL_META };
+            g_clTypes ^= bt[id - CL_CHK_BASE];
+            InvalidateRect(hwnd, NULL, TRUE);
+            ClRefreshStats(hwnd);
+        } else if (id == IDOK) {
+            unsigned long long bytes = 0;
+            CacheCleanRun(g_clScope, g_clTypes, 1, &g_clFiles, &bytes);
+            g_clDone = 1;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_DRAWITEM:
+        ClDrawItem((const DRAWITEMSTRUCT*)lp);
+        return TRUE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        HFONT of;
+        GetClientRect(hwnd, &rc);
+        FillRectColor(dc, &rc, ThPanel());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, ThText());
+        of = (HFONT)SelectObject(dc, g_font);
+        TextOutW(dc, 20, 192, g_clStatText, (int)wcslen(g_clStatText));
+        SelectObject(dc, of);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        g_clDlg = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* scope: 0=失效播客 1=现有播客 2=全部；types 为 CL_* 组合 */
+static void ShowCleanCacheDialog(int scope, int types)
+{
+    WNDCLASSEXW wc;
+    RECT pr;
+    MSG msg;
+    int w = 380, h = 296;
+
+    if (g_clDlg && IsWindow(g_clDlg)) { SetForegroundWindow(g_clDlg); return; }
+    if (!g_clReg) {
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CleanDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.lpszClassName = L"LTCleanCache";
+        RegisterClassExW(&wc);
+        g_clReg = 1;
+    }
+    g_clScope = scope;
+    g_clTypes = types;
+    g_clDone = 0;
+    g_clFiles = 0;
+    g_clStatText[0] = 0;
+    GetWindowRect(g_hwnd, &pr);
+    g_clDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        L"LTCleanCache", tr(TR_CLN_TITLE),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        (pr.left + pr.right - w) / 2, (pr.top + pr.bottom - h) / 2,
+        w, h, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_clDlg) return;
+    EnableWindow(g_hwnd, FALSE);
+    ShowWindow(g_clDlg, SW_SHOW);
+    SetFocus(g_clDlg);
+    while (IsWindow(g_clDlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (!IsDialogMessageW(g_clDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(g_hwnd, TRUE);
+    SetForegroundWindow(g_hwnd);
+    if (g_clDone) {
+        wchar_t t[64];
+        if (g_clFiles > 0) {
+            swprintf(t, 64, tr(TR_ORPHAN_DONE_FMT), g_clFiles);
+            SetStatusTemp(t);
+            AfterCacheClean();
+        } else {
+            SetStatusTemp(tr(TR_CLN_NONE));
+        }
     }
 }
 
@@ -12686,17 +12898,8 @@ static void OnSettingsButton(void)
     /* 外观/语言/定时类命令先处理，不涉及缓存目录 */
     if (cmd == 22) { DoImport(); return; }
     if (cmd == 46) { ReloadFeeds(1); return; }   /* 立即刷新全部订阅 */
-    if (cmd == 34) {                             /* 立即清理孤儿缓存 */
-        wchar_t t[64];
-        int n = CleanOrphanCache();
-        if (n > 0) {
-            swprintf(t, 64, tr(TR_ORPHAN_DONE_FMT), n);
-            RefreshCachedEntry();
-            if (g_viewCached) SelectPodcast(g_podCount);
-        } else {
-            wcscpy_s(t, 64, tr(TR_ORPHAN_NONE));
-        }
-        SetStatusTemp(t);
+    if (cmd == 34) {                             /* 清理缓存（可选范围/类型） */
+        ShowCleanCacheDialog(0, CL_ALL);
         return;
     }
     if (cmd == 23) { DoExportOpml(); return; }
@@ -14868,7 +15071,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
             } else {
-                if (cmd == 4) DeleteAllCacheFiles();
+                if (cmd == 4) ShowCleanCacheDialog(2, CL_AUDIO | CL_SUB | CL_CHAP);
                 else if (cmd == 5) OpenCacheFolder();
             }
         } else if (src == g_listEp) {
