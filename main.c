@@ -1271,19 +1271,12 @@ static LRESULT CALLBACK HeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
      * 表头各列在 WM_DRAWITEM/WM_PAINT 里自己铺满 */
     if (g_darkMode && msg == WM_ERASEBKGND) return 1;
     LRESULT lr = CallWindowProcW(g_origHdrProc, hwnd, msg, wp, lp);
-    /* ListView 每次重算滚动条都会把表头缩窄 17px，右边露出一条 ListView 底色。
-     * 在表头自己的 WM_SIZE 里拉回等宽，避免在滚动路径里反复 SetWindowPos */
+    /* ListView 每次重算滚动条都会把表头缩窄，右边露出一条 ListView 底色；
+     * 水平滚动更是直接把表头窗口整体左移，露出的右侧根本不归表头画。
+     * 所以表头必须加宽到覆盖所有列总宽（见 FitListViewHeader） */
     if (msg == WM_SIZE) {
-        static int busy = 0;
         HWND par = GetParent(hwnd);
-        RECT hr, wr;
-        if (par && !busy && GetWindowRect(hwnd, &hr) && GetWindowRect(par, &wr)
-            && hr.right - hr.left != wr.right - wr.left) {
-            busy = 1;
-            SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, hr.bottom - hr.top,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            busy = 0;
-        }
+        if (par) FitListViewHeader(par);
     }
     if (g_darkMode && msg == WM_PAINT) {
         HDC hdc = GetDC(hwnd);
@@ -10712,17 +10705,25 @@ static int SplitterHitTest(HWND hwnd, int x, int y)
     return -1;
 }
 
-/* 表头宽度对齐 ListView 窗口宽：PanelProc 的 WM_NCCALCSIZE 把行绘制区
- * 并回了原生滚动条占位，但表头仍按“减去滚动条”的宽度布局，右边会空出一条 */
+/* 表头宽度 = max(ListView 窗口宽, 所有列总宽)。
+ * 系统实现水平滚动的方式是把表头窗口整体左移，表头若只有可视区那么宽，
+ * 移出去后右边会露出 ListView 底色（看起来像列文本被擦掉），而且那块
+ * 区域不属于表头，怎么重画表头都盖不住。加宽到列总宽即可彻底覆盖 */
 static void FitListViewHeader(HWND lv)
 {
     HWND hdr = (HWND)SendMessageW(lv, LVM_GETHEADER, 0, 0);
     RECT hr, wr;
+    int i, n, total = 0, target;
     if (!hdr) return;
+    n = (int)SendMessageW(hdr, HDM_GETITEMCOUNT, 0, 0);
+    for (i = 0; i < n; i++)
+        total += (int)SendMessageW(lv, LVM_GETCOLUMNWIDTH, i, 0);
     GetWindowRect(hdr, &hr);
     GetWindowRect(lv, &wr);
-    if (hr.right - hr.left == wr.right - wr.left) return;   /* 宽度没变就不折腾 */
-    SetWindowPos(hdr, NULL, 0, 0, wr.right - wr.left, hr.bottom - hr.top,
+    target = wr.right - wr.left;
+    if (total > target) target = total;
+    if (hr.right - hr.left == target) return;   /* 宽度没变就不折腾 */
+    SetWindowPos(hdr, NULL, 0, 0, target, hr.bottom - hr.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
