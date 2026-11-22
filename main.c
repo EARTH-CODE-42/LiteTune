@@ -12,7 +12,7 @@
  *
  * 编译（MinGW）:
  *   windres resource.rc -O coff -o resource.o
- *   gcc -O2 -s -mwindows -municode -o LiteTune.exe main.c resource.o \
+ *   gcc -Os -s -mwindows -municode -o LiteTune.exe main.c resource.o \
  *       -lcomctl32 -lwinhttp -lmf -lmfplat -lmfplay -lmfreadwrite -lole32 -lgdiplus -lws2_32 -liphlpapi -lshell32
  */
 #ifndef UNICODE
@@ -907,6 +907,7 @@ static COLORREF ThSelText(void)      { return g_darkMode ? RGB(236,242,250) : RG
 /* ---- 托盘浮窗 ---- */
 static COLORREF ThFlyBg(void)        { return g_darkMode ? RGB(40,40,46) : RGB(245,245,247); }
 static COLORREF ThFlyHover(void)     { return g_darkMode ? RGB(64,64,74) : RGB(228,235,245); }
+static COLORREF ThFlyIcon(void)      { return g_darkMode ? RGB(255,255,255) : RGB(52,52,58); }
 
 /* ---- 标题栏（自绘 WM_NCPAINT） ---- */
 static COLORREF ThCapBar(void)       { return g_darkMode ? RGB(30,30,34) : RGB(246,246,246); }
@@ -3479,31 +3480,37 @@ static void CacheNameFor(const wchar_t *dir, const wchar_t *podTitle,
     swprintf(out, outMax, L"%s.mp3", base);
 }
 
+/* 在缓存目录里找以 suffix 结尾的文件（大小写不敏感），命中写完整路径 */
+static int FindCacheSuffix(const wchar_t *dir, const wchar_t *suffix,
+                           wchar_t *out, int outMax)
+{
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    size_t sl = wcslen(suffix);
+    int hit = 0;
+
+    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        size_t nl = wcslen(fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    if (hit) swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
+    return hit;
+}
+
 /* 查找某哈希已有的缓存文件：先找可读名 *_<hash>.mp3，再找旧格式 <hash>.mp3 */
 static int CacheFindFor(unsigned int h, wchar_t *out, int outMax)
 {
     wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[16];
-    WIN32_FIND_DATAW fd;
-    HANDLE f;
 
     CacheDir(dir, MAX_PATH);
     swprintf(suffix, 16, L"_%08x.mp3", h);
-    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
-    f = FindFirstFileW(pat, &fd);
-    if (f != INVALID_HANDLE_VALUE) {
-        int hit = 0;
-        size_t sl = wcslen(suffix);
-        do {
-            size_t nl = wcslen(fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
-        } while (FindNextFileW(f, &fd));
-        FindClose(f);
-        if (hit) {
-            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
-            return 1;
-        }
-    }
+    if (FindCacheSuffix(dir, suffix, out, outMax)) return 1;
     swprintf(pat, MAX_PATH, L"%s%08x.mp3", dir, h);
     if (GetFileAttributesW(pat) != INVALID_FILE_ATTRIBUTES) {
         wcsncpy(out, pat, outMax - 1);
@@ -3536,32 +3543,13 @@ static void DeletePartFile(const wchar_t *path)
 static int CacheSubFind(unsigned int h, wchar_t *out, int outMax)
 {
     static const wchar_t *exts[2] = { L"vtt", L"srt" };
-    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[24];
+    wchar_t dir[MAX_PATH], suffix[24];
     int i;
 
     CacheDir(dir, MAX_PATH);
     for (i = 0; i < 2; i++) {
-        WIN32_FIND_DATAW fd;
-        HANDLE f;
-        size_t sl;
-        int hit = 0;
-
         swprintf(suffix, 24, L"_%08x.%s", h, exts[i]);
-        swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
-        sl = wcslen(suffix);
-        f = FindFirstFileW(pat, &fd);
-        if (f != INVALID_HANDLE_VALUE) {
-            do {
-                size_t nl = wcslen(fd.cFileName);
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
-            } while (FindNextFileW(f, &fd));
-            FindClose(f);
-        }
-        if (hit) {
-            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
-            return 1;
-        }
+        if (FindCacheSuffix(dir, suffix, out, outMax)) return 1;
         swprintf(out, outMax, L"%ssub_%08x.%s", dir, h, exts[i]);
         if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
     }
@@ -3578,29 +3566,11 @@ static void CacheSubDelete(unsigned int h)
 /* 章节缓存查找：播客_剧集_<hash>.chapters.json，或旧 chapters_<hash>.json */
 static int CacheChaptersFind(unsigned int h, wchar_t *out, int outMax)
 {
-    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[32];
-    WIN32_FIND_DATAW fd;
-    HANDLE f;
-    size_t sl;
-    int hit = 0;
+    wchar_t dir[MAX_PATH], suffix[32];
 
     CacheDir(dir, MAX_PATH);
     swprintf(suffix, 32, L"_%08x.chapters.json", h);
-    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
-    sl = wcslen(suffix);
-    f = FindFirstFileW(pat, &fd);
-    if (f != INVALID_HANDLE_VALUE) {
-        do {
-            size_t nl = wcslen(fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
-        } while (FindNextFileW(f, &fd));
-        FindClose(f);
-    }
-    if (hit) {
-        swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
-        return 1;
-    }
+    if (FindCacheSuffix(dir, suffix, out, outMax)) return 1;
     /* 兜底旧命名：chapters_<hash>.json */
     swprintf(out, outMax, L"%schapters_%08x.json", dir, h);
     return (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES);
@@ -4552,29 +4522,11 @@ static char *ReadWholeFile(const wchar_t *path, DWORD *outLen)
 static int UrlCacheFind(unsigned int h, const wchar_t *prefix,
                         const wchar_t *ext, wchar_t *out, int outMax)
 {
-    wchar_t dir[MAX_PATH], pat[MAX_PATH], suffix[24];
-    WIN32_FIND_DATAW fd;
-    HANDLE f;
-    size_t sl;
+    wchar_t dir[MAX_PATH], suffix[24];
 
     CacheDir(dir, MAX_PATH);
     swprintf(suffix, 24, L"_%08x.%s", h, ext);
-    sl = wcslen(suffix);
-    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
-    f = FindFirstFileW(pat, &fd);
-    if (f != INVALID_HANDLE_VALUE) {
-        int hit = 0;
-        do {
-            size_t nl = wcslen(fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (nl > sl && _wcsicmp(fd.cFileName + nl - sl, suffix) == 0) { hit = 1; break; }
-        } while (FindNextFileW(f, &fd));
-        FindClose(f);
-        if (hit) {
-            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
-            return 1;
-        }
-    }
+    if (FindCacheSuffix(dir, suffix, out, outMax)) return 1;
     swprintf(out, outMax, L"%s%s%08x.%s", dir, prefix, h, ext);
     return GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
 }
@@ -10338,6 +10290,43 @@ static LRESULT CALLBACK SliderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return CallWindowProcW(old, hwnd, msg, wp, lp);
 }
 
+/* 鼠标进入控件时统一注册悬停/离开跟踪 */
+static void TrackHover(HWND hwnd)
+{
+    TRACKMOUSEEVENT tme;
+    tme.cbSize = sizeof(tme);
+    tme.dwFlags = TME_HOVER | TME_LEAVE;
+    tme.hwndTrack = hwnd;
+    tme.dwHoverTime = HOVER_DEFAULT;
+    TrackMouseEvent(&tme);
+}
+
+/* 跟踪提示：pt 是控件客户区坐标，提示显示在指针右下方 */
+static void TrackTipShow(HWND tip, HWND hwnd, POINT pt, const wchar_t *text)
+{
+    TOOLINFOW ti;
+    POINT scr = pt;
+    ClientToScreen(hwnd, &scr);
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = hwnd;
+    ti.uId = (UINT_PTR)hwnd;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    SendMessageW(tip, TTM_TRACKPOSITION, 0, MAKELPARAM(scr.x + 12, scr.y + 18));
+    SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+}
+
+static void TrackTipHide(HWND tip, HWND hwnd)
+{
+    TOOLINFOW ti;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = sizeof(ti);
+    ti.hwnd = hwnd;
+    ti.uId = (UINT_PTR)hwnd;
+    SendMessageW(tip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+}
+
 /* 内容面板与按钮共用：Ctrl+滚轮调字号。
  * 滚动条暗色由 33ms 定时器统一兜底，这里不拦截任何消息。 */
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -10458,16 +10447,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     /* 播客列表悬停 → 显示封面+标题+作者提示 */
     if (hwnd == g_listPod) {
         if (msg == WM_MOUSEMOVE) {
-            TRACKMOUSEEVENT tme;
             if (g_podDragStarted) {          /* 拖拽中不弹提示 */
                 ShowWindow(g_hwndPodTip, SW_HIDE);
                 return 0;
             }
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_HOVER | TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            tme.dwHoverTime = HOVER_DEFAULT;
-            TrackMouseEvent(&tme);
+            TrackHover(hwnd);
         } else if (msg == WM_MOUSEHOVER) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             if (!g_podDragStarted)
@@ -10479,12 +10463,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     /* 剧集列表：tracking tooltip（不依赖标题截断，悬停即显示） */
     if (hwnd == g_listEp && g_hwndEpTip) {
         if (msg == WM_MOUSEMOVE) {
-            TRACKMOUSEEVENT tme;
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_HOVER | TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            tme.dwHoverTime = HOVER_DEFAULT;
-            TrackMouseEvent(&tme);
+            TrackHover(hwnd);
         } else if (msg == WM_MOUSEHOVER) {
             LVHITTESTINFO ht;
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -10492,39 +10471,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int idx = (int)SendMessageW(hwnd, LVM_HITTEST, 0, (LPARAM)&ht);
             if (idx >= 0) {
                 wchar_t tip[1024];
-                TOOLINFOW ti;
-                POINT scr = pt;
                 BuildEpisodeTipText(tip, 1024, idx);
-                ClientToScreen(hwnd, &scr);
-                ZeroMemory(&ti, sizeof(ti));
-                ti.cbSize = sizeof(ti);
-                ti.hwnd = hwnd;
-                ti.uId = (UINT_PTR)hwnd;
-                ti.lpszText = tip;
-                SendMessageW(g_hwndEpTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-                SendMessageW(g_hwndEpTip, TTM_TRACKPOSITION, 0,
-                    MAKELPARAM(scr.x + 12, scr.y + 18));
-                SendMessageW(g_hwndEpTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+                TrackTipShow(g_hwndEpTip, hwnd, pt, tip);
             }
             return 0;
         } else if (msg == WM_MOUSELEAVE) {
-            TOOLINFOW ti;
-            ZeroMemory(&ti, sizeof(ti));
-            ti.cbSize = sizeof(ti);
-            ti.hwnd = hwnd;
-            ti.uId = (UINT_PTR)hwnd;
-            SendMessageW(g_hwndEpTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+            TrackTipHide(g_hwndEpTip, hwnd);
         }
     }
     /* 搜索结果列表：悬停显示标题 / 作者 / 订阅地址 */
     if (hwnd == g_ibList && g_ibTip) {
         if (msg == WM_MOUSEMOVE) {
-            TRACKMOUSEEVENT tme;
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_HOVER | TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            tme.dwHoverTime = HOVER_DEFAULT;
-            TrackMouseEvent(&tme);
+            TrackHover(hwnd);
         } else if (msg == WM_MOUSEHOVER) {
             LVHITTESTINFO ht;
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -10535,8 +10493,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 wchar_t *url = NULL;
                 wchar_t tip[2048];
                 LVITEMW li;
-                TOOLINFOW ti;
-                POINT scr = pt;
                 ZeroMemory(&li, sizeof(li));
                 li.mask = LVIF_TEXT | LVIF_PARAM;
                 li.iItem = idx;
@@ -10552,36 +10508,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SendMessageW(hwnd, LVM_GETITEMW, 0, (LPARAM)&li);
                 swprintf(tip, 2048, L"%s\r\n%s\r\n%s",
                          title, author, url ? url : L"");
-                ClientToScreen(hwnd, &scr);
-                ZeroMemory(&ti, sizeof(ti));
-                ti.cbSize = sizeof(ti);
-                ti.hwnd = hwnd;
-                ti.uId = (UINT_PTR)hwnd;
-                ti.lpszText = tip;
-                SendMessageW(g_ibTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-                SendMessageW(g_ibTip, TTM_TRACKPOSITION, 0,
-                    MAKELPARAM(scr.x + 12, scr.y + 18));
-                SendMessageW(g_ibTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+                TrackTipShow(g_ibTip, hwnd, pt, tip);
             }
             return 0;
         } else if (msg == WM_MOUSELEAVE) {
-            TOOLINFOW ti;
-            ZeroMemory(&ti, sizeof(ti));
-            ti.cbSize = sizeof(ti);
-            ti.hwnd = hwnd;
-            ti.uId = (UINT_PTR)hwnd;
-            SendMessageW(g_ibTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+            TrackTipHide(g_ibTip, hwnd);
         }
     }
     /* 字幕列表：悬停显示该条字幕全文 */
     if (hwnd == g_listSub && g_hwndSubTip) {
         if (msg == WM_MOUSEMOVE) {
-            TRACKMOUSEEVENT tme;
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_HOVER | TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            tme.dwHoverTime = HOVER_DEFAULT;
-            TrackMouseEvent(&tme);
+            TrackHover(hwnd);
         } else if (msg == WM_MOUSEHOVER) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             DWORD r = (DWORD)SendMessageW(hwnd, LB_ITEMFROMPOINT, 0,
@@ -10590,20 +10527,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(r) == 0 && idx >= 0 && idx < g_subCueCount &&
                 g_subCues[idx].text) {
                 wchar_t tip[1024];
-                TOOLINFOW ti;
-                POINT scr = pt;
                 wcsncpy(tip, g_subCues[idx].text, 1023);
                 tip[1023] = 0;
-                ClientToScreen(hwnd, &scr);
-                ZeroMemory(&ti, sizeof(ti));
-                ti.cbSize = sizeof(ti);
-                ti.hwnd = hwnd;
-                ti.uId = (UINT_PTR)hwnd;
-                ti.lpszText = tip;
-                SendMessageW(g_hwndSubTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-                SendMessageW(g_hwndSubTip, TTM_TRACKPOSITION, 0,
-                    MAKELPARAM(scr.x + 12, scr.y + 18));
-                SendMessageW(g_hwndSubTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+                TrackTipShow(g_hwndSubTip, hwnd, pt, tip);
             }
             return 0;
         } else if (msg == WM_MOUSELEAVE) {
@@ -12753,6 +12679,19 @@ static HBRUSH ApplyMenuTheme(HMENU m)
     return bg;
 }
 
+/* 主题化弹出菜单：置前 + 主题 + 清理，返回选中命令（0=取消） */
+static int PopupMenu(HMENU m, HWND hwnd, POINT pt)
+{
+    HBRUSH bg = ApplyMenuTheme(m);
+    int cmd;
+    SetForegroundWindow(hwnd);
+    cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                         pt.x, pt.y, 0, hwnd, NULL);
+    ThemeMenuCleanup(m);
+    if (bg) DeleteObject(bg);
+    return cmd;
+}
+
 /* 自绘菜单项尺寸：行高与浅色系统菜单一致（更紧凑），列宽留足勾选/箭头 */
 static void MenuMeasureItem(HWND owner, MEASUREITEMSTRUCT *mi)
 {
@@ -13200,7 +13139,7 @@ static LRESULT CALLBACK FlyoutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                  : (i == 2) ? ICO_NEXT
                  : (i == 3) ? ICO_SHUFFLE : ICO_CROSS;
             DrawGlyph(hdc, &br, kind,
-                (i == 4) ? RGB(255, 120, 120) : RGB(255, 255, 255), 0, 0);
+                (i == 4) ? RGB(255, 120, 120) : ThFlyIcon(), 0, 0);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -13741,7 +13680,10 @@ static void PaintCaption(HWND hwnd)
                 FillRect(hdc, &br, hh);
                 DeleteObject(hh);
             }
-            curCol = (g_capHover == CAP_CLOSE) ? RGB(255,255,255) : cTxt;
+            /* 关闭按钮悬停时只有它自己用白图标，其余按钮保持原色
+             * （否则浅色模式下白图标落在浅色标题栏上会看不见） */
+            curCol = (i == CAP_CLOSE && g_capHover == CAP_CLOSE)
+                ? RGB(255,255,255) : cTxt;
             DrawGlyph(hdc, &br, CAP_MIN_IC + i, curCol, 0, IsZoomed(hwnd));
         }
     }
@@ -15067,15 +15009,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 /* 点在空白处：弹极简菜单 */
                 m = CreatePopupMenu();
                 MenuAdd(m, 0, 100, tr(TR_CTX_ADD_POD));
-                SetForegroundWindow(hwnd);
-                {
-                    HBRUSH bg = ApplyMenuTheme(m);
-                    cmd = TrackPopupMenu(m,
-                        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                        pt.x, pt.y, 0, hwnd, NULL);
-                    ThemeMenuCleanup(m);
-                    if (bg) DeleteObject(bg);
-                }
+                cmd = PopupMenu(m, hwnd, pt);
                 DestroyMenu(m);
                 if (cmd == 100) AskAddFeed();
                 break;
@@ -15111,15 +15045,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 MenuAdd(m, cacheN ? 0 : MF_GRAYED, 4, tr(TR_CTX_DEL_ALL_CACHE));
                 MenuAdd(m, 0, 5, tr(TR_CTX_OPEN_FOLDER));
             }
-            SetForegroundWindow(hwnd);
-            {
-                HBRUSH bg = ApplyMenuTheme(m);
-                cmd = TrackPopupMenu(m,
-                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, NULL);
-                ThemeMenuCleanup(m);
-                if (bg) DeleteObject(bg);
-            }
+            cmd = PopupMenu(m, hwnd, pt);
             DestroyMenu(m);
             if (item < g_podCount) {
                 if (cmd == 1) RefreshSinglePodcast(item);
@@ -15213,7 +15139,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             } else {
                 /* 单选：播放 | 收藏/复制 | 删除/下载/定位 */
-                MenuAdd(m, 0, 9, tr(TR_TB_PLAY));
+                MenuAdd(m, 0, 9,
+                    tr(EpisodeRowPlaying(ep) && g_playState == 1 ? TR_TB_PAUSE : TR_TB_PLAY));
                 MenuAddSep(m);
                 if (vp && vp->feedUrl && !g_viewCached)
                     MenuAdd(m, 0, 4, FavHas(fh, e->url) ? tr(TR_CTX_UNFAV) : tr(TR_CTX_FAV));
@@ -15224,17 +15151,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else        MenuAdd(m, 0, 1, tr(TR_CTX_DOWNLOAD));
                 if (cached) MenuAdd(m, 0, 5, tr(TR_CTX_REVEAL));
             }
-            SetForegroundWindow(hwnd);
-            {
-                HBRUSH bg = ApplyMenuTheme(m);
-                cmd = TrackPopupMenu(m,
-                    TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                    pt.x, pt.y, 0, hwnd, NULL);
-                ThemeMenuCleanup(m);
-                if (bg) DeleteObject(bg);
-            }
+            cmd = PopupMenu(m, hwnd, pt);
             DestroyMenu(m);
-            if (cmd == 9) PlayEpisodeFromList(row);
+            if (cmd == 9) {
+                if (EpisodeRowPlaying(ep) && g_playState) PauseResume();
+                else PlayEpisodeFromList(row);
+            }
             else if (cmd == 1) DownloadSingleEpisode(g_curPod, ep);
             else if (cmd == 2) DeleteEpisodeCache(g_curPod, ep);
             else if (cmd == 5) {
