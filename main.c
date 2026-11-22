@@ -23,6 +23,9 @@
 #endif
 #define WINVER       0x0601
 #define _WIN32_WINNT 0x0601
+/* MinGW 默认的 C99 printf（libmingwex）为了浮点/位置参数等特性会带进约 75KB 代码，
+ * 而本程序只需要 %d/%u/%x/%s/%hs 和零填充宽度，改用 msvcrt.dll 的实现 */
+#define __USE_MINGW_ANSI_STDIO 0
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -54,6 +57,40 @@
 #include <math.h>
 #include <share.h>
 #include <time.h>
+
+/* msvcrt 的 _snprintf/_snwprintf 截断时不补 '\0'，包一层保证字符串终止。
+ * 宽字符 printf 里 %s 就是宽字符串（%hs 才是窄字符串），与原来的 %ls 用法等价
+ * （所有宽格式串已统一为 %s）。 */
+static int LtVsnprintf(char *s, size_t n, const char *fmt, va_list ap)
+{
+    int r = _vsnprintf(s, n ? n - 1 : 0, fmt, ap);
+    if (n) s[n - 1] = 0;
+    return r;
+}
+static int LtSnprintf(char *s, size_t n, const char *fmt, ...)
+{
+    va_list ap; int r;
+    va_start(ap, fmt);
+    r = LtVsnprintf(s, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+static int LtVsnwprintf(wchar_t *s, size_t n, const wchar_t *fmt, va_list ap)
+{
+    int r = _vsnwprintf(s, n ? n - 1 : 0, fmt, ap);
+    if (n) s[n - 1] = 0;
+    return r;
+}
+static int LtSwprintf(wchar_t *s, size_t n, const wchar_t *fmt, ...)
+{
+    va_list ap; int r;
+    va_start(ap, fmt);
+    r = LtVsnwprintf(s, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+#define snprintf LtSnprintf
+#define swprintf LtSwprintf
 
 /* 只需 3 个音频属性键，手工定义以避免引入体积庞大的 propkey.h */
 static const PROPERTYKEY PKEY_Title_L =
@@ -543,7 +580,7 @@ static const wchar_t *tr(int id)
         L"离线播放本地音频",
         L"音频", L"单声", L"立体", L"多声",
         L"无法打开音频文件", L"正在加载订阅...", L"准备音频...", L"下载线程创建失败",
-        L"正在播放（离线）：%ls", L"正在播放：%ls",
+        L"正在播放（离线）：%s", L"正在播放：%s",
         L"已停止", L"播放完毕", L"播放出错",
         L"下载音频中... %d%%", L"音频已失效", L"音频下载失败",
         L"无法开始播放：未找到可用的音频输出设备",
@@ -551,7 +588,7 @@ static const wchar_t *tr(int id)
         L"还没有订阅，点左下角「+」按钮添加 RSS 播客",
         L"标题", L"描述", L"作者", L"语言", L"主页",
         L"版权", L"订阅地址", L"发布", L"本地文件", L"链接",
-        L"\r\n播客：%ls", L"\r\n发布：%ls", L"\r\n时长：%ls",
+        L"\r\n播客：%s", L"\r\n发布：%s", L"\r\n时长：%s",
         L"【已缓存】\r\n本地缓存音频共 %d 个，无需联网即可播放。\r\n\r\n"
             L"缓存内容来自各播客已播放（自动下载）的音频；更改缓存目录请用右上角设置按钮。",
         L"添加播客订阅",
@@ -560,7 +597,7 @@ static const wchar_t *tr(int id)
         L"地址无效，请输入以 http:// 或 https:// 开头的链接",
         L"该订阅地址已存在", L"订阅数量已达上限",
         L"打开缓存目录", L"更改缓存目录...", L"恢复默认目录",
-        L"自动清理缓存", L"关", L"%d 天", L"自动清理缓存：%ls",
+        L"自动清理缓存", L"关", L"%d 天", L"自动清理缓存：%s",
         L"输入关键词搜索 iTunes（或直接粘 RSS 地址）：", L"搜索", L"搜索中…",
         L"没找到相关播客", L"搜索失败（网络问题？）",
         L"夜间模式", L"语言", L"简体中文", L"English",
@@ -569,7 +606,7 @@ static const wchar_t *tr(int id)
         L"输入多少分钟后关机（1-600）：",
         L"请输入 1 到 600 之间的整数分钟",
         L"正在关机…（15 秒内可运行 shutdown /a 取消）",
-        L"切换字号（当前：%ls）", L"小", L"中", L"大",
+        L"切换字号（当前：%s）", L"小", L"中", L"大",
         L"关于 LiteTune",
         L"LiteTune  版本 1.7.0\r\n\r\n"
             L"轻量级播客播放器：订阅 RSS、自动缓存、离线收听。\r\n\r\n"
@@ -631,7 +668,7 @@ static const wchar_t *tr(int id)
         L"复制剧集链接", L"复制 Feed URL",
         L"添加订阅...",
         L"已复制到剪贴板", L"复制失败",
-        L"自动刷新", L"%d 分钟", L"自动刷新：%ls",
+        L"自动刷新", L"%d 分钟", L"自动刷新：%s",
         L"新剧集提示音", L"提示音已开启", L"提示音已关闭",
         L"发现 %d 集新剧集",
         L"按标题过滤剧集", L"只显示已收藏",
@@ -649,7 +686,7 @@ static const wchar_t *tr(int id)
         L"需填写 http:// 或 https:// 开头的地址，或选择一个存在的字幕文件",
         L"请把字幕拖到某一集上",
         L"简介", L"字幕", L"字幕开", L"字幕关",
-        L"松开鼠标即把字幕挂到「%ls」",
+        L"松开鼠标即把字幕挂到「%s」",
         L"松开鼠标即把字幕挂到当前选中的剧集",
         L"松开鼠标即导入",
         L"章节",
@@ -670,7 +707,7 @@ static const wchar_t *tr(int id)
         L"Audio", L"Mono", L"Stereo", L"Multi",
         L"Cannot open audio file", L"Loading feeds...", L"Preparing audio...",
         L"Failed to start download thread",
-        L"Playing (offline): %ls", L"Playing: %ls",
+        L"Playing (offline): %s", L"Playing: %s",
         L"Stopped", L"Playback finished", L"Playback error",
         L"Downloading audio... %d%%", L"Audio is no longer available",
         L"Audio download failed",
@@ -679,7 +716,7 @@ static const wchar_t *tr(int id)
         L"No subscriptions yet. Click the \"+\" button at bottom-left to add an RSS feed",
         L"Title", L"Description", L"Author", L"Language", L"Homepage",
         L"Copyright", L"Feed URL", L"Published", L"Local file", L"URL",
-        L"\r\nPodcast: %ls", L"\r\nPublished: %ls", L"\r\nDuration: %ls",
+        L"\r\nPodcast: %s", L"\r\nPublished: %s", L"\r\nDuration: %s",
         L"[Cached]\r\n%d local audio file(s), playable without a network.\r\n\r\n"
             L"Audio is cached automatically when played. Use the Settings button "
             L"at the top-right to change the cache folder.",
@@ -689,7 +726,7 @@ static const wchar_t *tr(int id)
         L"Invalid URL. Please enter a link starting with http:// or https://",
         L"This feed already exists", L"Maximum number of feeds reached",
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
-        L"Auto-Clean Cache", L"Off", L"%d days", L"Auto-clean cache: %ls",
+        L"Auto-Clean Cache", L"Off", L"%d days", L"Auto-clean cache: %s",
         L"Enter keyword to search iTunes (or paste an RSS URL):", L"Search", L"Searching...",
         L"No podcasts found", L"Search failed (network issue?)",
         L"Night Mode", L"Language", L"简体中文", L"English",
@@ -698,7 +735,7 @@ static const wchar_t *tr(int id)
         L"Shut down in how many minutes (1-600)?",
         L"Please enter a whole number between 1 and 600",
         L"Shutting down... (run \"shutdown /a\" within 15s to cancel)",
-        L"Font Size (Current: %ls)", L"Small", L"Medium", L"Large",
+        L"Font Size (Current: %s)", L"Small", L"Medium", L"Large",
         L"About LiteTune",
         L"LiteTune  version 1.7.0\r\n\r\n"
             L"A lightweight podcast player: subscribe to RSS feeds,\r\n"
@@ -774,7 +811,7 @@ static const wchar_t *tr(int id)
         L"Copy episode URL", L"Copy feed URL",
         L"Add subscription...",
         L"Copied to clipboard", L"Copy failed",
-        L"Auto-Refresh", L"%d min", L"Auto-refresh: %ls",
+        L"Auto-Refresh", L"%d min", L"Auto-refresh: %s",
         L"New episode sound", L"Notification sound on",
         L"Notification sound off",
         L"Found %d new episode(s)",
@@ -795,7 +832,7 @@ static const wchar_t *tr(int id)
         L"Enter a URL starting with http:// or https://, or pick an existing subtitle file",
         L"Drop the subtitle onto an episode row",
         L"Notes", L"Subs", L"Subs on", L"Subs off",
-        L"Release to attach the subtitle to \"%ls\"",
+        L"Release to attach the subtitle to \"%s\"",
         L"Release to attach the subtitle to the selected episode",
         L"Release to import",
         L"Chapters",
@@ -1143,7 +1180,7 @@ static void UpdateWindowTitle(void)
         if (left < 0) left = 0;
         swprintf(t, 160, tr(TR_SHUTDOWN_TITLE), left / 60, left % 60);
     } else if (g_playState != 0 && g_nowTitle[0]) {
-        swprintf(t, 160, L"LiteTune - %ls", g_nowTitle);
+        swprintf(t, 160, L"LiteTune - %s", g_nowTitle);
     } else {
         wcscpy_s(t, 160, L"LiteTune");
     }
@@ -2095,7 +2132,7 @@ static void ShowTimeLabel(int posSec, int durSec)
     FmtTime(posSec, a, 16);
     if (durSec > 0) FmtTime(durSec, b, 16);
     else wcscpy_s(b, 16, L"--:--");
-    swprintf(buf, 64, L"%ls / %ls", a, b);
+    swprintf(buf, 64, L"%s / %s", a, b);
     SetWindowTextW(g_stTime, buf);
 }
 
@@ -2421,7 +2458,7 @@ static int HttpDownloadFile(const wchar_t *url, const wchar_t *path,
     int attempt;
 
     if (pDiskError) *pDiskError = 0;
-    swprintf(part, MAX_PATH + 8, L"%ls.part", path);
+    swprintf(part, MAX_PATH + 8, L"%s.part", path);
     buf = (char*)malloc(DL_BUF_SIZE);
     if (!buf) return 0;
 
@@ -2466,7 +2503,7 @@ static int HttpDownloadFile(const wchar_t *url, const wchar_t *path,
             if (offset > 0) {
                 wchar_t num[24];
                 U64ToW(offset, num);
-                swprintf(rng, 96, L"Range: bytes=%ls-\r\n", num);
+                swprintf(rng, 96, L"Range: bytes=%s-\r\n", num);
                 hdr = rng;
                 hdrLen = (DWORD)-1L;
             }
@@ -3330,7 +3367,7 @@ static void DefaultCacheDir(wchar_t *out, int outMax)
 {
     wchar_t tmp[MAX_PATH];
     if (GetTempPathW(MAX_PATH, tmp) > 0) {
-        swprintf(out, outMax, L"%lsLiteTune", tmp);
+        swprintf(out, outMax, L"%sLiteTune", tmp);
     } else {
         ExeDir(out, outMax);
         wcscat_s(out, outMax, L"cache");
@@ -3429,7 +3466,7 @@ static void CacheNameBase(const wchar_t *dir, const wchar_t *podTitle,
         else if (ne > 8) ep[--ne] = 0;
         else break;
     }
-    swprintf(out, outMax, L"%ls%ls_%ls_%08x", dir, pod, ep, h);
+    swprintf(out, outMax, L"%s%s_%s_%08x", dir, pod, ep, h);
 }
 
 /* 音频缓存全路径：主名 + .mp3（与字幕同名，仅扩展名不同） */
@@ -3439,7 +3476,7 @@ static void CacheNameFor(const wchar_t *dir, const wchar_t *podTitle,
 {
     wchar_t base[MAX_PATH];
     CacheNameBase(dir, podTitle, epTitle, h, base, MAX_PATH);
-    swprintf(out, outMax, L"%ls.mp3", base);
+    swprintf(out, outMax, L"%s.mp3", base);
 }
 
 /* 查找某哈希已有的缓存文件：先找可读名 *_<hash>.mp3，再找旧格式 <hash>.mp3 */
@@ -3451,7 +3488,7 @@ static int CacheFindFor(unsigned int h, wchar_t *out, int outMax)
 
     CacheDir(dir, MAX_PATH);
     swprintf(suffix, 16, L"_%08x.mp3", h);
-    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
         int hit = 0;
@@ -3463,11 +3500,11 @@ static int CacheFindFor(unsigned int h, wchar_t *out, int outMax)
         } while (FindNextFileW(f, &fd));
         FindClose(f);
         if (hit) {
-            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
             return 1;
         }
     }
-    swprintf(pat, MAX_PATH, L"%ls%08x.mp3", dir, h);
+    swprintf(pat, MAX_PATH, L"%s%08x.mp3", dir, h);
     if (GetFileAttributesW(pat) != INVALID_FILE_ATTRIBUTES) {
         wcsncpy(out, pat, outMax - 1);
         out[outMax - 1] = 0;
@@ -3483,14 +3520,14 @@ static void CachePathFor(const wchar_t *url, wchar_t *out, int outMax)
     wchar_t dir[MAX_PATH];
     if (CacheFindFor(h, out, outMax)) return;
     CacheDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%ls%08x.mp3", dir, h);
+    swprintf(out, outMax, L"%s%08x.mp3", dir, h);
 }
 
 /* 顺手删掉断点续传中间文件 <path>.part（删缓存/清空时用） */
 static void DeletePartFile(const wchar_t *path)
 {
     wchar_t part[MAX_PATH + 8];
-    swprintf(part, MAX_PATH + 8, L"%ls.part", path);
+    swprintf(part, MAX_PATH + 8, L"%s.part", path);
     DeleteFileW(part);
 }
 
@@ -3509,8 +3546,8 @@ static int CacheSubFind(unsigned int h, wchar_t *out, int outMax)
         size_t sl;
         int hit = 0;
 
-        swprintf(suffix, 24, L"_%08x.%ls", h, exts[i]);
-        swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+        swprintf(suffix, 24, L"_%08x.%s", h, exts[i]);
+        swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
         sl = wcslen(suffix);
         f = FindFirstFileW(pat, &fd);
         if (f != INVALID_HANDLE_VALUE) {
@@ -3522,10 +3559,10 @@ static int CacheSubFind(unsigned int h, wchar_t *out, int outMax)
             FindClose(f);
         }
         if (hit) {
-            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
             return 1;
         }
-        swprintf(out, outMax, L"%lssub_%08x.%ls", dir, h, exts[i]);
+        swprintf(out, outMax, L"%ssub_%08x.%s", dir, h, exts[i]);
         if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
     }
     return 0;
@@ -3549,7 +3586,7 @@ static int CacheChaptersFind(unsigned int h, wchar_t *out, int outMax)
 
     CacheDir(dir, MAX_PATH);
     swprintf(suffix, 32, L"_%08x.chapters.json", h);
-    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
     sl = wcslen(suffix);
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
@@ -3561,11 +3598,11 @@ static int CacheChaptersFind(unsigned int h, wchar_t *out, int outMax)
         FindClose(f);
     }
     if (hit) {
-        swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+        swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
         return 1;
     }
     /* 兜底旧命名：chapters_<hash>.json */
-    swprintf(out, outMax, L"%lschapters_%08x.json", dir, h);
+    swprintf(out, outMax, L"%schapters_%08x.json", dir, h);
     return (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES);
 }
 
@@ -3609,7 +3646,7 @@ static void CacheRenameKnownAll(void)
 
     if (g_podCount <= 0) return;
     CacheDir(dir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
+    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
@@ -3629,7 +3666,7 @@ static void CacheRenameKnownAll(void)
             }
         }
         if (!found) continue;
-        swprintf(src, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
+        swprintf(src, MAX_PATH, L"%s%s", dir, fd.cFileName);
         if (g_nowPath[0] && _wcsicmp(src, g_nowPath) == 0) continue;   /* 正在播：别动 */
         if (_wcsicmp(src, dst) != 0 &&
             MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING)) {
@@ -3671,7 +3708,7 @@ static int EnsureCacheDirWritable(void)
 
     if (EnsureCacheDir()) {
         CacheDir(dir, MAX_PATH);
-        swprintf(tmpPath, MAX_PATH, L"%ls_litetune_write_test.tmp", dir);
+        swprintf(tmpPath, MAX_PATH, L"%s_litetune_write_test.tmp", dir);
         f = _wfopen(tmpPath, L"wb");
         if (f) {
             fclose(f);
@@ -3711,7 +3748,7 @@ static void CacheAutoClean(void)
     ullNow.HighPart = ftNow.dwHighDateTime;
     ullNow.QuadPart -= (ULONGLONG)g_cacheDays * 24 * 3600 * 10000000ULL;
     for (k = 0; k < (int)(sizeof(exts) / sizeof(exts[0])); k++) {
-        swprintf(pat, MAX_PATH, L"%ls*.%ls", cdir, exts[k]);
+        swprintf(pat, MAX_PATH, L"%s*.%s", cdir, exts[k]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
@@ -3721,7 +3758,7 @@ static void CacheAutoClean(void)
             ullFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
             ullFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
             if (ullFile.QuadPart < ullNow.QuadPart) {
-                swprintf(fp, MAX_PATH, L"%ls%ls", cdir, fd.cFileName);
+                swprintf(fp, MAX_PATH, L"%s%s", cdir, fd.cFileName);
                 DeleteFileW(fp);
             }
         } while (FindNextFileW(h, &fd));
@@ -3762,7 +3799,7 @@ static void LoadCachePodcast(void)
     g_cachePod.author = _wcsdup(tr(TR_CACHE_SUBTITLE));
 
     CacheDir(dir, MAX_PATH);
-    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
+    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
     hFind = FindFirstFileW(pat, &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
@@ -3784,7 +3821,7 @@ static void LoadCachePodcast(void)
         e->localFile = 1;
         e->origIdx = g_cachePod.epCount;
 
-        swprintf(mp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
+        swprintf(mp, MAX_PATH, L"%s%s", dir, fd.cFileName);
         e->url = _wcsdup(mp);
 
         /* 默认标题：去掉扩展名；可读名再去掉 _<哈希> 尾巴，最后用
@@ -3943,7 +3980,7 @@ static void CacheCleanRun(int scope, int types, int doDelete,
         WIN32_FIND_DATAW fd;
         HANDLE h;
         if (!(types & kClExts[d].type)) continue;
-        swprintf(pat, MAX_PATH, L"%ls*.%ls", dir, kClExts[d].ext);
+        swprintf(pat, MAX_PATH, L"%s*.%s", dir, kClExts[d].ext);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
@@ -3956,7 +3993,7 @@ static void CacheCleanRun(int scope, int types, int doDelete,
                 if (keep[j] == hv) { iscur = 1; break; }
             if (scope == 0 && iscur) continue;
             if (scope == 1 && !iscur) continue;
-            swprintf(fp, MAX_PATH, L"%ls%ls", dir, fd.cFileName);
+            swprintf(fp, MAX_PATH, L"%s%s", dir, fd.cFileName);
             if (g_playUrl && wcscmp(fp, g_playUrl) == 0) continue;  /* 正在播放 */
             if (doDelete) {
                 if (DeleteFileW(fp)) {   /* 失败（被占用等）不计入 */
@@ -4521,9 +4558,9 @@ static int UrlCacheFind(unsigned int h, const wchar_t *prefix,
     size_t sl;
 
     CacheDir(dir, MAX_PATH);
-    swprintf(suffix, 24, L"_%08x.%ls", h, ext);
+    swprintf(suffix, 24, L"_%08x.%s", h, ext);
     sl = wcslen(suffix);
-    swprintf(pat, MAX_PATH, L"%ls*%ls", dir, suffix);
+    swprintf(pat, MAX_PATH, L"%s*%s", dir, suffix);
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
         int hit = 0;
@@ -4534,11 +4571,11 @@ static int UrlCacheFind(unsigned int h, const wchar_t *prefix,
         } while (FindNextFileW(f, &fd));
         FindClose(f);
         if (hit) {
-            swprintf(out, outMax, L"%ls%ls", dir, fd.cFileName);
+            swprintf(out, outMax, L"%s%s", dir, fd.cFileName);
             return 1;
         }
     }
-    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, h, ext);
+    swprintf(out, outMax, L"%s%s%08x.%s", dir, prefix, h, ext);
     return GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -4550,7 +4587,7 @@ static void UrlCachePath(const char *url, const wchar_t *prefix,
     wchar_t dir[MAX_PATH];
     if (UrlCacheFind(h, prefix, ext, out, outMax)) return;
     CacheDir(dir, MAX_PATH);
-    swprintf(out, outMax, L"%ls%ls%08x.%ls", dir, prefix, h, ext);
+    swprintf(out, outMax, L"%s%s%08x.%s", dir, prefix, h, ext);
 }
 
 /* 可读元数据缓存名：<dir><标题>_<8hex>.<ext>，标题非法字符已过滤 */
@@ -4563,7 +4600,7 @@ static void MetaCachePath(const wchar_t *dir, const char *url, const wchar_t *ti
     if (!seg[0]) wcscpy(seg, L"Podcast");
     if (budget < 12) budget = 12;
     if ((int)wcslen(seg) > budget) seg[budget] = 0;
-    swprintf(out, outMax, L"%ls%ls_%08x.%ls", dir, seg, LastEpHash(url), ext);
+    swprintf(out, outMax, L"%s%s_%08x.%s", dir, seg, LastEpHash(url), ext);
 }
 
 /* 写元数据缓存：落盘成可读名，成功后删掉同哈希的旧文件（旧命名或旧标题） */
@@ -5876,7 +5913,7 @@ static void LoadTranscript(const wchar_t *epUrlW, const wchar_t *podTitle,
             CacheNameBase(dir, podTitle, epTitle, sp->hash, base, MAX_PATH);
             bl = wcslen(base);
             sp->subPath = (wchar_t*)malloc((bl + 5) * sizeof(wchar_t));
-            if (sp->subPath) swprintf(sp->subPath, (int)bl + 5, L"%ls.vtt", base);
+            if (sp->subPath) swprintf(sp->subPath, (int)bl + 5, L"%s.vtt", base);
         }
         {
             HANDLE th = CreateThread(NULL, 0, TranscriptLoaderThread, sp, 0, NULL);
@@ -5964,7 +6001,7 @@ static void LoadChapters(const wchar_t *epUrlW, const wchar_t *podTitle,
             CacheNameBase(dir, podTitle, epTitle, cp->hash, base, MAX_PATH);
             bl = wcslen(base);
             cp->chapPath = (wchar_t*)malloc((bl + 16) * sizeof(wchar_t));
-            if (cp->chapPath) swprintf(cp->chapPath, (int)bl + 16, L"%ls.chapters.json", base);
+            if (cp->chapPath) swprintf(cp->chapPath, (int)bl + 16, L"%s.chapters.json", base);
         }
         {
             HANDLE th = CreateThread(NULL, 0, ChaptersLoaderThread, cp, 0, NULL);
@@ -6802,9 +6839,9 @@ static void FormatInfoText(wchar_t *out, int max)
         const wchar_t *chName = g_fmtCh == 1 ? tr(TR_MONO)
                              : (g_fmtCh == 2 ? tr(TR_STEREO) : tr(TR_MULTICH));
         if (g_fmtKbps > 0)
-            swprintf(out, max, L"%ls|%dkbps|%uHz|%ls", nm, g_fmtKbps, g_fmtRate, chName);
+            swprintf(out, max, L"%s|%dkbps|%uHz|%s", nm, g_fmtKbps, g_fmtRate, chName);
         else
-            swprintf(out, max, L"%ls|%uHz|%ls", nm, g_fmtRate, chName);
+            swprintf(out, max, L"%s|%uHz|%s", nm, g_fmtRate, chName);
     } else {
         wcscpy_s(out, max, nm);
     }
@@ -7032,11 +7069,11 @@ static void SpeedText(wchar_t *out, int outMax)
     int whole = g_speed / 100;
     int frac  = g_speed % 100;
     if (frac == 0)
-        _snwprintf(out, outMax, L"%d.0x", whole);
+        swprintf(out, outMax, L"%d.0x", whole);
     else if (frac % 10 == 0)
-        _snwprintf(out, outMax, L"%d.%dx", whole, frac / 10);
+        swprintf(out, outMax, L"%d.%dx", whole, frac / 10);
     else
-        _snwprintf(out, outMax, L"%d.%02dx", whole, frac);
+        swprintf(out, outMax, L"%d.%02dx", whole, frac);
 }
 
 /* 循环切换倍速：1.0 → 1.25 → 1.5 → 2.0 → 0.75 → 1.0 */
@@ -7073,7 +7110,7 @@ static void HttpRespond(SOCKET s, const char *status, const char *ctype,
                         const char *body, int blen)
 {
     char hdr[512];
-    int n = _snprintf(hdr, sizeof(hdr),
+    int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
         status, ctype, blen);
@@ -7181,7 +7218,7 @@ static int EnumLocalIPv4(char ips[][24], char names[][64], int maxN)
                 if (sa->sin_family != AF_INET) continue;
                 if (b[0] == 127) continue;
                 if (b[0] == 169 && b[1] == 254) continue;
-                _snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+                snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
                 for (j = 0; j < n; j++) if (strcmp(ips[j], tmp) == 0) dup = 1;
                 if (dup) continue;
                 snprintf(ips[n], 24, "%s", tmp);
@@ -7482,7 +7519,7 @@ static void HttpServeStatus(SOCKET s)
         if (shutLeft < 0) shutLeft = 0;
     }
     JsonEscapeU8(title, t8, sizeof(t8));
-    n = _snprintf(body, sizeof(body),
+    n = snprintf(body, sizeof(body),
         "{\"title\":\"%s\",\"playing\":%s,\"has\":%s,\"shut\":%d,"
         "\"pos\":%d,\"dur\":%d,\"vol\":%d,\"pod\":%d,\"ep\":%d,"
         "\"mode\":%d,\"speed\":%d}",
@@ -7499,11 +7536,11 @@ static void HttpServePods(SOCKET s)
     int cap = 1024 + g_podCount * 768, pos = 0, i;
     char *body = (char*)malloc(cap);
     if (!body) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); return; }
-    pos += _snprintf(body + pos, cap - pos, "[");
+    pos += snprintf(body + pos, cap - pos, "[");
     for (i = 0; i < g_podCount; i++) {
         char t8[640];
         JsonEscapeU8(g_pods[i].title ? g_pods[i].title : L"", t8, sizeof(t8));
-        pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
+        pos += snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
             i ? "," : "", i, t8);
     }
     if (g_cacheFileCount > 0) {
@@ -7513,10 +7550,10 @@ static void HttpServePods(SOCKET s)
         swprintf(row, 64, tr(TR_CACHED_FMT), g_cacheFileCount);
         JsonEscapeU8(g_cachePod.epCount > 0 && g_cachePod.title
                      ? g_cachePod.title : row, t8, sizeof(t8));
-        pos += _snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
+        pos += snprintf(body + pos, cap - pos, "%s{\"i\":%d,\"t\":\"%s\"}",
             g_podCount ? "," : "", g_podCount, t8);
     }
-    _snprintf(body + pos, cap - pos, "]");
+    snprintf(body + pos, cap - pos, "]");
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, (int)strlen(body));
     free(body);
 }
@@ -7542,15 +7579,15 @@ static void HttpServeEps(SOCKET s, const char *pathq)
     cap = 4096 + pod->epCount * 768;
     body = (char*)malloc(cap);
     if (!body) { HttpRespond(s, "500 Server Error", "text/plain", "err", 3); return; }
-    pos = _snprintf(body, cap, "{\"pod\":%d,\"eps\":[", p);
+    pos = snprintf(body, cap, "{\"pod\":%d,\"eps\":[", p);
     for (j = 0; j < pod->epCount && pos < cap - 800; j++) {
         char t8[640];
         JsonEscapeU8(pod->eps[j].title ? pod->eps[j].title : L"", t8, sizeof(t8));
-        pos += _snprintf(body + pos, cap - pos, "%s{\"t\":\"%s\",\"d\":%d,\"cur\":%s}",
+        pos += snprintf(body + pos, cap - pos, "%s{\"t\":\"%s\",\"d\":%d,\"cur\":%s}",
             j ? "," : "", t8, pod->eps[j].durationSec,
             (g_playPod == p && g_playEp == j) ? "1" : "0");
     }
-    _snprintf(body + pos, cap - pos, "]}");
+    snprintf(body + pos, cap - pos, "]}");
     HttpRespond(s, "200 OK", "application/json; charset=utf-8", body, (int)strlen(body));
     free(body);
 }
@@ -7603,7 +7640,7 @@ static void HttpServeAudio(SOCKET s, const char *req)
                     if (a >= fsize.QuadPart) {
                         /* 起点超出文件：416，浏览器会自行重新请求 */
                         char h[200];
-                        int m = _snprintf(h, sizeof(h),
+                        int m = snprintf(h, sizeof(h),
                             "HTTP/1.1 416 Range Not Satisfiable\r\n"
                             "Content-Range: bytes */%d\r\nContent-Length: 0\r\n"
                             "Connection: close\r\n\r\n", (int)fsize.QuadPart);
@@ -7623,13 +7660,13 @@ static void HttpServeAudio(SOCKET s, const char *req)
         long long remain = end.QuadPart - start.QuadPart + 1;
         int n;
         if (partial)
-            n = _snprintf(hdr, sizeof(hdr),
+            n = snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\n"
                 "Accept-Ranges: bytes\r\nContent-Range: bytes %d-%d/%d\r\n"
                 "Content-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
                 (int)start.QuadPart, (int)end.QuadPart, (int)fsize.QuadPart, (int)remain);
         else
-            n = _snprintf(hdr, sizeof(hdr),
+            n = snprintf(hdr, sizeof(hdr),
                 "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
                 "Accept-Ranges: bytes\r\nContent-Length: %d\r\n"
                 "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -7823,10 +7860,10 @@ static int FirewallRuleEnsure(void)
     SHELLEXECUTEINFOW sei;
     if (FirewallRuleExists()) return 1;
     GetModuleFileNameW(NULL, exe, MAX_PATH);
-    _snwprintf(params, 900,
+    swprintf(params, 900,
         L"/c netsh advfirewall firewall delete rule name=\"LiteTune Phone\" >nul 2>&1 & "
         L"netsh advfirewall firewall add rule name=\"LiteTune Phone\" "
-        L"dir=in action=allow program=\"%ls\" enable=yes profile=any", exe);
+        L"dir=in action=allow program=\"%s\" enable=yes profile=any", exe);
     ZeroMemory(&sei, sizeof(sei));
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -7977,7 +8014,7 @@ static const wchar_t* EpListTitle(const Podcast *p, int ep)
     const wchar_t *t = (e->title && *e->title) ? e->title : L"";
     if (g_viewCached || !p->feedUrl) return t;
     if (!FavHas(LastEpHash(p->feedUrl), e->url)) return t;
-    swprintf(buf, 2048, L"★ %ls", t);
+    swprintf(buf, 2048, L"★ %s", t);
     return buf;
 }
 
@@ -8057,7 +8094,7 @@ static void BuildEpisodeTipText(wchar_t *buf, int bufMax, int i)
     if (!p || i < 0 || i >= p->epCount) return;
     e = &p->eps[i];
     if (e->title && *e->title)
-        pos += swprintf(buf + pos, bufMax - pos, L"%ls", e->title);
+        pos += swprintf(buf + pos, bufMax - pos, L"%s", e->title);
     if (g_viewCached) {
         if (e->author && *e->author)
             pos += swprintf(buf + pos, bufMax - pos,
@@ -8082,7 +8119,7 @@ static void ShowDetailField(wchar_t *buf, size_t bufSize, size_t *pos,
 {
     if (!value || !*value) return;
     *pos += swprintf(buf + *pos, bufSize - *pos,
-        L"【%ls】\r\n%ls\r\n\r\n", label, value);
+        L"【%s】\r\n%s\r\n\r\n", label, value);
 }
 
 static void ShowPodcastDetail(int idx)
@@ -9397,7 +9434,7 @@ static DWORD WINAPI ItunesSearchThread(LPVOID param)
     enc = U8ToW(UrlEncode(sp->kw));
     free(sp);
     if (!enc) { PostMessageW(dst, WM_APP_SEARCH_DONE, 0, 0); return 1; }
-    swprintf(url, 2048, L"https://itunes.apple.com/search?term=%ls&media=podcast&limit=20", enc);
+    swprintf(url, 2048, L"https://itunes.apple.com/search?term=%s&media=podcast&limit=20", enc);
     free(enc);
 
     json = HttpFetch(url, &len, 0, NULL, NULL);
@@ -10062,7 +10099,7 @@ static int SaveLocalSub(const Podcast *p, const Episode *e, const wchar_t *srcPa
 
     CacheDir(dir, MAX_PATH);
     CacheNameBase(dir, p->title, e->title, h, base, MAX_PATH);
-    swprintf(dstPath, MAX_PATH, L"%ls%ls", base, ext);
+    swprintf(dstPath, MAX_PATH, L"%s%s", base, ext);
     EnsureCacheDir();
     CacheSubDelete(h);   /* 换扩展名时先清旧文件，避免查找先命中旧 .vtt */
     f = _wfopen(dstPath, L"wb");
@@ -10513,7 +10550,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 li.pszText = author;
                 li.cchTextMax = 512;
                 SendMessageW(hwnd, LVM_GETITEMW, 0, (LPARAM)&li);
-                swprintf(tip, 2048, L"%ls\r\n%ls\r\n%ls",
+                swprintf(tip, 2048, L"%s\r\n%s\r\n%s",
                          title, author, url ? url : L"");
                 ClientToScreen(hwnd, &scr);
                 ZeroMemory(&ti, sizeof(ti));
@@ -12026,7 +12063,7 @@ static int CountMp3InDir(const wchar_t *dir)
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int n = 0;
-    swprintf(pat, MAX_PATH, L"%ls*.mp3", dir);
+    swprintf(pat, MAX_PATH, L"%s*.mp3", dir);
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
@@ -12045,7 +12082,7 @@ static int CountCacheFiles(const wchar_t *dir)
     HANDLE h;
     int i, n = 0;
     for (i = 0; i < 5; i++) {
-        swprintf(pat, MAX_PATH, L"%ls*.%ls", dir, exts[i]);
+        swprintf(pat, MAX_PATH, L"%s*.%s", dir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++; }
@@ -12066,12 +12103,12 @@ static int CacheDirHasConflict(const wchar_t *oldDir, const wchar_t *newDir)
     HANDLE h;
     int i;
     for (i = 0; i < 5; i++) {
-        swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
+        swprintf(pat, MAX_PATH, L"%s*.%s", oldDir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
+            swprintf(dst, MAX_PATH, L"%s%s", newDir, fd.cFileName);
             if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
                 FindClose(h);
                 return 1;
@@ -12103,13 +12140,13 @@ static void MoveCacheFiles(const wchar_t *oldDir, const wchar_t *newDir)
     HANDLE h;
     int i;
     for (i = 0; i < 5; i++) {
-        swprintf(pat, MAX_PATH, L"%ls*.%ls", oldDir, exts[i]);
+        swprintf(pat, MAX_PATH, L"%s*.%s", oldDir, exts[i]);
         h = FindFirstFileW(pat, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            swprintf(src, MAX_PATH, L"%ls%ls", oldDir, fd.cFileName);
-            swprintf(dst, MAX_PATH, L"%ls%ls", newDir, fd.cFileName);
+            swprintf(src, MAX_PATH, L"%s%s", oldDir, fd.cFileName);
+            swprintf(dst, MAX_PATH, L"%s%s", newDir, fd.cFileName);
             MoveFileW(src, dst);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -13012,7 +13049,7 @@ static void OnSettingsButton(void)
         if (pidl && SHGetPathFromIDListW(pidl, newPath)) {
             int oldHasFiles = CountCacheFiles(curDir);   /* curDir 带反斜杠 */
             wchar_t newDir[MAX_PATH];
-            swprintf(newDir, MAX_PATH, L"%ls\\", newPath);
+            swprintf(newDir, MAX_PATH, L"%s\\", newPath);
             /* 先问要不要移动；用户确认移动后才检查同名冲突（有冲突则只切换不移动） */
             if (_wcsicmp(curDir, newDir) != 0 && oldHasFiles > 0) {
                 int activeDl = ActiveDownloadCount();
@@ -15931,7 +15968,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     wchar_t dir[MAX_PATH], msg[MAX_PATH + 128];
                     CacheDir(dir, MAX_PATH);
                     swprintf(msg, MAX_PATH + 128,
-                        L"缓存目录不可写，已自动回退到默认目录：\r\n%ls\r\n\r\n可在设置里重新选择缓存目录。", dir);
+                        L"缓存目录不可写，已自动回退到默认目录：\r\n%s\r\n\r\n可在设置里重新选择缓存目录。", dir);
                     SetStatus(L"缓存目录不可写，已回退默认");
                     MessageBoxTh(g_hwnd, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
                 } else {
@@ -15964,7 +16001,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         wchar_t dir[MAX_PATH], msg[MAX_PATH + 128];
         CacheDir(dir, MAX_PATH);
         swprintf(msg, MAX_PATH + 128,
-            L"缓存目录不可写：\r\n%ls\r\n\r\n已自动回退到默认目录。\r\n可在设置里重新选择缓存目录。", dir);
+            L"缓存目录不可写：\r\n%s\r\n\r\n已自动回退到默认目录。\r\n可在设置里重新选择缓存目录。", dir);
         SetStatus(L"缓存目录不可写，已回退默认");
         MessageBoxTh(g_hwnd, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
         return 0;
@@ -16274,10 +16311,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
         if (g_lang)
             swprintf(msg, MAX_PATH + 160,
                 L"The cache folder is missing or not writable. It has been reset to "
-                L"the default folder:\r\n%ls\r\n\r\nYou can pick another folder in Settings.", dir);
+                L"the default folder:\r\n%s\r\n\r\nYou can pick another folder in Settings.", dir);
         else
             swprintf(msg, MAX_PATH + 160,
-                L"缓存目录不存在或不可写，已恢复为默认目录：\r\n%ls\r\n\r\n"
+                L"缓存目录不存在或不可写，已恢复为默认目录：\r\n%s\r\n\r\n"
                 L"可在设置里重新选择缓存目录。", dir);
         MessageBoxW(NULL, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
     }

@@ -11,7 +11,7 @@
 - **导入配置**：不再导入 `cachedir`，从根上解决"配置搬到新机器后下载 99% 失败"
 - **本地字幕**：`sub_<剧集URL哈希>.vtt`，文件即状态，**不写 ini**
 - **下载**：边下边写，保留"先下后播"，**不做边下边播**（与 1.6 恢复的设计冲突）
-- **体积**：不追数字。实测 `-flto` 和 `-ffunction-sections --gc-sections` 都反而 +46%（318KB→465KB），现行编译参数已近最优，只做重构和死代码清理
+- **体积**：不追数字，但能换掉白带的库就换。实测 `-flto` 和 `-ffunction-sections --gc-sections` 都反而 +46%（318KB→465KB）；编译器参数已近最优，收益来自换实现（如 printf 改 msvcrt，-76KB）
 - **键盘 ←/→ 快进快退 15s 已有**（`VK_LEFT`/`VK_RIGHT`），不用重复做
 - **发布**：GitHub Release 用户自己发，SourceForge 用户手动跑 publish-sourceforge.ps1，AI 不代发
 
@@ -71,22 +71,21 @@
   - 已缓存列表右键「清空全部缓存」与本功能合并为同一个对话框
 - [x] 未知播客占位名改英文 `(Untitled)`，避免中文文件名/兼容性问题
 
-- [ ] **剧集列表 header 水平滚动后列文本被擦掉**（技术债，最后解决）
-  - 现象：拖水平滚动条时，ListView header 右侧被滚出来的新列区域**只有背景色，列文本像被橡皮擦擦掉**（日期、时长表头不显示）；内容区条目正常滚动
-  - 已尝试：
-    1. 主窗口 WndProc WM_HSCROLL 里 SetWindowPos(header, -x) → 无效（ListView 内置滚动发的 WM_HSCROLL lParam==NULL，进不了分支）
-    2. 撤回后在 PanelProc hwnd==g_listEp 的 WM_HSCROLL 里手动 `InvalidateRect(header, NULL, TRUE)` → 无效（可能 ScrollWindow 还没 commit，或 header 有内部 clip rect 不重发 WM_DRAWITEM）
-  - 根因方向：header 设了 `HDF_OWNERDRAW`（暗色模式自绘），ListView 水平滚动时只给 header 内部发 `HDM_SETOFFSET`（偏移显示位置），**不会对新暴露区域重发 `WM_DRAWITEM`**，于是只有 WM_ERASEBKGND 刷的背景色，列文本消失
-  - 待探索修法（按难度递增）：
-    - a) 子类化 header 窗口过程，拦截 `HDM_SETOFFSET` → 调 `InvalidateRect(NULL, TRUE)`
-    - b) 不用 HDF_OWNERDRAW，让 header 自己画（放弃暗色 header 自绘），代价是表头外观不随主题切换
-    - c) 拦截 `WM_NCPAINT` 或 `WM_PAINT` 时强制重绘所有列（SetWindowRgn 可能阻止）
-    - d) 每次水平滚动后用 `SendMessageW(header, HDM_SETIMAGELIST, ...)` 之类的手段触发重绘（暴力但可能有效）
-  - 定位 grep：`PanelProc`、`FitListViewHeader`、`HDF_OWNERDRAW`、`WM_DRAWITEM.*hdr`
+- [x] **剧集列表 header 水平滚动后列文本被擦掉**
+  - 真实根因：系统实现水平滚动不是给 header 设内部偏移，而是**把整个 header 窗口左移**；header 宽度只有列表可视区那么宽，移出去后右侧空出来的区域**已不属于 header**，所以怎么重画 header/怎么 Invalidate 都盖不住，露出的是 ListView 底色（看起来像文本被擦）
+  - 修法：`FitListViewHeader` 把 header 宽改为 `max(ListView 窗口宽, 所有列总宽)`，左移后仍能盖满；`HeaderProc` 的 WM_SIZE 复用同一函数（原来那里会把宽度拉回列表宽，正好抵消）
+  - 试错记录（都已删除，别再走）：子类化拦 `HDM_SETOFFSET`、WM_HSCROLL 里 InvalidateRect、`HeaderPaintIfScrolled` 自绘整条表头——全是错误归因
+  - 结论：`HDF_OWNERDRAW` 本身没问题，不需要放弃暗色 header 自绘
 
 - [ ] **重构与死代码审计**
-  - `MessageBoxTh` 仍是系统 MessageBoxW + WH_CBT 钩子做暗色，统一到已有的自绘弹窗，删掉钩子
-  - 清理无引用辅助函数、未使用翻译条目
+  - [x] **printf 换成 msvcrt 实现**：源码里 `#define __USE_MINGW_ANSI_STDIO 0`，只用
+        `_vsnprintf/_vsnwprintf` 加一层截断补 `\0` 的包装。MinGW 的 C99 printf（浮点/
+        位置参数等）此前白带约 75KB，本程序一次浮点都没用。exe 346KB → 270KB
+        - 宽格式串的 `%ls` 全部改成 `%s`（msvcrt 宽 printf 里 `%s` 即宽字符串，`%hs` 是窄）
+        - `sscanf` 一并走 msvcrt；已验证 `%d:%d:%d%*[.,]%d`、`%d,%d,%d,%d` 行为一致
+  - ~~`MessageBoxTh` 改成自绘弹窗~~：已尝试并撤销——关于弹窗标题栏变白（DWM 暗色属性
+        对非系统消息框失效），体积还 +1KB。保留系统 MessageBoxW + WH_CBT 钩子，不再动
+  - [ ] 清理无引用辅助函数、未使用翻译条目
 
 ## 1.9 候选（本轮不做，已讨论过方向）
 
