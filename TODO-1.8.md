@@ -77,6 +77,26 @@
   - 试错记录（都已删除，别再走）：子类化拦 `HDM_SETOFFSET`、WM_HSCROLL 里 InvalidateRect、`HeaderPaintIfScrolled` 自绘整条表头——全是错误归因
   - 结论：`HDF_OWNERDRAW` 本身没问题，不需要放弃暗色 header 自绘
 
+- [x] **桌面字幕开启时点“章节”变空白**
+  - 根因：字幕/章节共用 `g_subCues`；切章节时清空字幕，没有 `chaptersUrl` 或下载失败就一直为空，
+    桌面字幕窗 `SubBarText()` 返回 NULL，什么都不画
+  - 修法（保留共用数组，不拆数据结构）：
+    - 新增 `g_subBarKind`（1=字幕 2=章节）记录桌面字幕内容偏好，只有点 subs/chapters tab
+      才切换；简介 tab 不改变桌面字幕（用户拍板）。数组内容类型永远 = `g_subBarKind`
+    - `LoadSubForCurTab`：播放中跟播放剧集，未播放跟选中剧集（新增 `SelectedEpisode` 复用）
+    - 桌面字幕窗无条目时：未播放且有数据 → 显示选中剧集标题；无数据 → 按 `g_subBarKind`
+      提示「（本集没有字幕）/（本集没有章节信息）」（复用现有翻译，不新增字符串）
+    - **tab 列表空白的真正 bug**：占位行早已加入列表，但 owner-draw 只画
+      `idx < g_subCueCount` 的条目，占位行被跳过 → 补上占位行绘制
+  - 后续三连修（用户冒烟发现）：
+    - 占位提示只显示一个字符：占位行宽度没计入 `g_subTextW`，自绘区域只有 10px →
+      `SubRefreshUI` 把占位文本宽度也计入 `maxW`
+    - 还没播到第一句字幕就误报"没字幕"：有数据但无当前条目时改为显示剧集标题，
+      只有完全没数据才提示"没有字幕/章节"
+    - 有章节剧集切到无章节剧集后残留旧章节：`want==2` 且该集无 `chaptersUrl` 时
+      立即 `FreeSubCues()`（字幕分支靠 `LoadTranscript`/`OnSubReady` 清空，所以没这问题）
+  - 代码净增约 30 行，exe 268,288 字节（+0.5KB）
+
 - [ ] **重构与死代码审计**
   - [x] **printf 换成 msvcrt 实现**：源码里 `#define __USE_MINGW_ANSI_STDIO 0`，只用
         `_vsnprintf/_vsnwprintf` 加一层截断补 `\0` 的包装。MinGW 的 C99 printf（浮点/
@@ -110,6 +130,7 @@
 - UI：左侧新增"电台"分类（与"已缓存"并列）；电台无剧集列表，点击即播；进度条显示"直播中"
 - ICY metadata（StreamTitle 当前曲目）：发 `Icy-MetaData:1` 头，按 metaint 间隔解析——体验关键但 MFPlay 不一定暴露，可能要自己解析流，是主要脏活
 - 风险：m3u8/HLS 流 Win7 不支持，第一版只保证 MP3/AAC 直连流；守住单文件、零依赖、体积底线
+- 可选：把正在听的曲目同步到last.fm
 
 ### 播放队列 / 连续播放
 ### 标记已播/未播（可与收藏共用图标位）

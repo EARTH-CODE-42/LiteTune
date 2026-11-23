@@ -378,6 +378,7 @@ static int     g_subCurIdx = -1;     /* 当前播放位置对应的字幕下标�
 static int     g_subShownIdx = -1;   /* 外挂窗最后显示过的字幕下标（间隙时沿用） */
 static char   *g_subTransUrl = NULL; /* 当前加载内容的 URL（去重用）：字幕时是 transcriptUrl，章节时是 chaptersUrl */
 static int     g_subKind = 0;        /* g_subCues 的内容类型：0=空 1=字幕 2=章节 */
+static int     g_subBarKind = 1;     /* 桌面字幕内容偏好：1=字幕 2=章节（跟随最近点击的 subs/chapters tab，简介 tab 不改变） */
 static int     g_subEnabled = 1;     /* 字幕总开关（按钮2） */
 static int     g_subInDesc = 0;      /* 简介区显示模式：0=简介 1=字幕 2=章节 */
 static HWND    g_listSub = NULL;     /* 简介区字幕/章节共用列表 */
@@ -8136,33 +8137,30 @@ static Episode* PlayingEpisode(Podcast **outPod)
     return NULL;
 }
 
-/* 按当前简介区 tab 加载字幕/章节。
- * tab=1 字幕、tab=2 章节只显示“正在播放的剧集”（没在播放则跟随当前选中）；
- * tab=0 简介虽然不显示列表，但仍要为播放中的剧集准备数据（章节优先，
- * 与旧行为一致），否则桌面字幕条会因为没有加载而空白。 */
+/* 当前列表选中的剧集；未播放时字幕/章节跟随它 */
+static Episode* SelectedEpisode(Podcast **outPod)
+{
+    Podcast *p;
+    if (g_curPod < 0 || g_curEp < 0) return NULL;
+    p = (g_curPod == g_podCount) ? &g_cachePod : &g_pods[g_curPod];
+    if (g_curEp >= p->epCount) return NULL;
+    if (outPod) *outPod = p;
+    return &p->eps[g_curEp];
+}
+
+/* 加载字幕/章节（共用 g_subCues，内容类型由 g_subBarKind 决定，与简介 tab 无关）：
+ * 播放中跟播放剧集，未播放跟选中剧集；面板列表与桌面字幕窗共用这份数据。 */
 static void LoadSubForCurTab(void)
 {
     Podcast *p = NULL;
-    Episode *e;
-    int want;
+    Episode *e = PlayingEpisode(&p);
+    int want = g_subBarKind;
 
-    e = PlayingEpisode(&p);
-    if (g_subInDesc == 0) {
-        if (!e) return;                      /* 只是浏览：不需要为桌面字幕预载 */
-        want = (e->chaptersUrl && e->chaptersUrl[0]) ? 2 : 1;
-    } else {
-        want = (g_subInDesc == 2) ? 2 : 1;
-        if (!e) {
-            /* 没在播放 → 跟随鼠标选中的剧集 */
-            if (g_curPod < 0 || g_curEp < 0) return;
-            p = (g_curPod == g_podCount) ? &g_cachePod : &g_pods[g_curPod];
-            if (g_curEp >= p->epCount) return;
-            e = &p->eps[g_curEp];
-        }
-    }
+    if (!e) e = SelectedEpisode(&p);
+    if (!e) return;
 
-    /* 切换了内容类型（字幕 ↔ 章节）：清掉旧数据与去重键，强制重新加载，
-     * 否则字幕 tab 会显示上一轮加载的章节内容 */
+    /* 切换内容类型时同步清空：列表和桌面字幕窗都会显示“没有字幕/章节”提示，
+     * 不会把上一种内容当成当前 tab 的数据 */
     if (g_subKind != want) {
         FreeSubCues();
         free(g_subTransUrl);
@@ -8173,23 +8171,25 @@ static void LoadSubForCurTab(void)
         if (e->chaptersUrl && e->chaptersUrl[0]) {
             LoadChapters(e->url, p->title, e->title, e->chaptersUrl);
         } else {
+            /* 该集没有章节：立即清掉上一集的章节，不要残留旧数据 */
             FreeSubCues();
             free(g_subTransUrl);
             g_subTransUrl = NULL;
         }
+        return;
+    }
+
+    if (e->localFile) {
+        LoadTranscript(NULL, p->title, e->title, NULL);
     } else {
-        if (e->localFile) {
-            LoadTranscript(NULL, p->title, e->title, NULL);
-        } else {
-            char *u8 = WToU8(e->url);
-            const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
-            const char *tu; const wchar_t *eu;
-            if (ov && ov[0] == 0) { eu = NULL; tu = NULL; }
-            else if (ov && strcmp(ov, "local") == 0) { eu = e->url; tu = NULL; }
-            else { eu = e->url; tu = (ov && ov[0]) ? ov : e->transcriptUrl; }
-            LoadTranscript(eu, p->title, e->title, tu);
-            free(u8);
-        }
+        char *u8 = WToU8(e->url);
+        const char *ov = u8 ? SubOvFind(LastEpHash(u8)) : NULL;
+        const char *tu; const wchar_t *eu;
+        if (ov && ov[0] == 0) { eu = NULL; tu = NULL; }
+        else if (ov && strcmp(ov, "local") == 0) { eu = e->url; tu = NULL; }
+        else { eu = e->url; tu = (ov && ov[0]) ? ov : e->transcriptUrl; }
+        LoadTranscript(eu, p->title, e->title, tu);
+        free(u8);
     }
 }
 
@@ -10905,9 +10905,14 @@ static void SubRefreshUI(void)
             free(flat);
         }
         /* 字幕/章节 tab 下没有数据时给一行占位提示，避免看起来像坏了 */
-        if (g_subCueCount == 0 && g_subInDesc != 0)
-            SendMessageW(g_listSub, LB_ADDSTRING, 0,
-                (LPARAM)tr(g_subInDesc == 2 ? TR_PH_CHAPTERS : TR_PH_SUBS));
+        if (g_subCueCount == 0 && g_subInDesc != 0) {
+            const wchar_t *ph = tr(g_subInDesc == 2 ? TR_PH_CHAPTERS : TR_PH_SUBS);
+            SIZE sz;
+            SendMessageW(g_listSub, LB_ADDSTRING, 0, (LPARAM)ph);
+            /* 占位行宽度也要计入 maxW，否则自绘按 g_subTextW=0 裁剪，提示只剩一个字符 */
+            if (dc && GetTextExtentPoint32W(dc, ph, lstrlenW(ph), &sz) && sz.cx > maxW)
+                maxW = sz.cx;
+        }
         if (dc) {
             if (oldf) SelectObject(dc, oldf);
             ReleaseDC(g_listSub, dc);
@@ -11111,6 +11116,17 @@ static LRESULT CALLBACK SubBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         const wchar_t *txt = SubBarText();
         GetClientRect(hwnd, &rc);
         SetBkMode(hdc, TRANSPARENT);
+        if (!txt || !txt[0]) {
+            /* 无当前条目：有数据只是还没播到第一句（或未播放），显示对应剧集标题；
+             * 完全没有数据才按最近查看的 tab 提示“没有字幕/章节” */
+            Episode *se = NULL;
+            if (g_subCueCount > 0) {
+                se = PlayingEpisode(NULL);
+                if (!se) se = SelectedEpisode(NULL);
+            }
+            txt = (se && se->title) ? se->title
+                  : tr(g_subBarKind == 2 ? TR_PH_CHAPTERS : TR_PH_SUBS);
+        }
         {
             HBRUSH br = CreateSolidBrush(ThPanel());
             FillRect(hdc, &rc, br);
@@ -14502,8 +14518,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         /* 字幕列表（owner-draw）：整行自绘，横向偏移由自绘条控制 */
         if (di->CtlID == IDC_LIST_SUB && di->itemID != (UINT)-1) {
             int idx = (int)di->itemID;
+            /* 无数据时列表里只有一行占位提示（idx==0 且不在条目范围内），也要画出来 */
             wchar_t *txt = (idx >= 0 && idx < g_subCueCount)
-                         ? SubFlatten(g_subCues[idx].text) : NULL;
+                         ? SubFlatten(g_subCues[idx].text)
+                         : (idx == 0) ? _wcsdup(tr(g_subInDesc == 2 ? TR_PH_CHAPTERS : TR_PH_SUBS))
+                                      : NULL;
             RECT rc = di->rcItem, tr;
             HGDIOBJ oldf;
             FillRectColor(di->hDC, &rc,
@@ -15334,6 +15353,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                      id == IDC_BTN_CHAPTERS) {
                 /* 简介 / 章节 / 字幕 三个 tab 切换 */
                 int want = (id == IDC_BTN_SUBVIEW) ? 0 : (id == IDC_BTN_SUBTAB ? 1 : 2);
+                if (want) g_subBarKind = want;   /* 桌面字幕跟随最近点击的 subs/chapters；简介 tab 不改变 */
                 if (g_subInDesc != want) {
                     g_subInDesc = want;
                     LayoutControls(g_hwnd);
