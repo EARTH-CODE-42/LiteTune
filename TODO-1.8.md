@@ -109,7 +109,16 @@
         `TrackTipShow` + `TrackTipHide`（4 处悬停跟踪、3 处提示显隐）、`PopupMenu`
         （3 处右键菜单主题化）。`-Os` 下 270KB → 268KB（`-Oz` 还能再省 3KB，但为看清纯代码
         优化效果暂时保持 `-Os`）
-  - [ ] 清理无引用辅助函数、未使用翻译条目（449 个 static 函数目前 0 个无引用）
+  - [x] **清理无引用辅助函数、未使用翻译条目**（449 个 static 函数 0 个无引用）
+        - 226 条翻译全部有代码引用，删掉 8 条早期搜索 UI 的残留：`TR_INPUT_LABEL`、
+          `TR_BAD_URL`、`TR_SEARCH_BTN`、`TR_SEARCHING`、`TR_SEARCH_NONE`、
+          `TR_SEARCH_FAIL`、`TR_TIP_SORT`、`TR_ORPHAN_NONE`（中英两表同步删）
+        - 另删未用宏 `SUB_BTN_H`、`ID_IB_SEARCH`
+  - [x] **继续合并重复块**：表头暗色补绘抽 `PaintHeaderGap`、表头自绘格式切换抽
+        `HeaderSetOwnerDraw`、批量队列按 URL 查找抽 `BatchQueuedIndex`、删单集缓存抽
+        `DeleteEpCacheFiles`、输入框确定/取消按钮抽 `IbOkCancelButtons`
+        - exe 268,288 → 266,752 字节（-1.5KB），零警告
+        - 注：后三处抽取后 GCC 的 `-Os` 交叉跳转已能合并，体积不再变，属于纯代码整洁化
 
 ## 1.9 候选（本轮不做，已讨论过方向）
 

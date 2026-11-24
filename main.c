@@ -503,12 +503,11 @@ enum {
     TR_F_COPYRIGHT, TR_F_FEEDURL, TR_F_PUBDATE, TR_F_LOCALFILE, TR_F_LINK,
     TR_TIP_PODCAST_FMT, TR_TIP_PUBDATE_FMT, TR_TIP_DUR_FMT,
     TR_CACHE_VIEW_DESC,
-    TR_INPUT_TITLE, TR_INPUT_LABEL, TR_OK, TR_CANCEL, TR_IB_OPML,
-    TR_BAD_URL, TR_DUP_FEED, TR_MAX_FEEDS,
+    TR_INPUT_TITLE, TR_OK, TR_CANCEL, TR_IB_OPML,
+    TR_DUP_FEED, TR_MAX_FEEDS,
     TR_M_OPEN_CACHE, TR_M_CHANGE_CACHE, TR_M_DEFAULT_CACHE,
     TR_M_CACHE_CLEAN, TR_CC_OFF, TR_CC_DAYS_FMT, TR_CC_SET_FMT,
-    TR_SEARCH_HINT, TR_SEARCH_BTN, TR_SEARCHING, TR_SEARCH_NONE,
-    TR_SEARCH_FAIL,
+    TR_SEARCH_HINT,
     TR_M_NIGHT, TR_M_LANGUAGE, TR_LANG_ZH, TR_LANG_EN,
     TR_M_SHUTDOWN, TR_M_SHUT_CANCEL, TR_SHUT_IN_MINS_FMT,
     TR_M_CUSTOM, TR_CUSTOM_TITLE, TR_CUSTOM_LABEL, TR_CUSTOM_BAD,
@@ -522,7 +521,7 @@ enum {
     TR_MOVE_Q_NEW_DL_FMT, TR_DIR_CONFLICT,
     TR_TB_PREV, TR_TB_PLAY, TR_TB_PAUSE, TR_TB_NEXT, TR_TB_SHUFFLE,
     TR_TIP_PREV, TR_TIP_PLAYPAUSE, TR_TIP_NEXT, TR_TIP_STOP, TR_TIP_MUTE,
-    TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SORT, TR_TIP_SETTINGS,
+    TR_TIP_ADD, TR_TIP_DEL, TR_TIP_SETTINGS,
     TR_TIP_SPEED,
     TR_PM_ORDER, TR_PM_SHUFFLE, TR_PM_REPEAT, TR_PM_ONCE,
     TR_PHONE_TITLE, TR_PHONE_FAIL,
@@ -562,7 +561,7 @@ enum {
     TR_SUB_VIEW_DESC, TR_SUB_VIEW_LIST, TR_SUB_ON, TR_SUB_OFF,
     TR_DROP_HINT_FMT, TR_DROP_HINT_SEL, TR_DROP_HINT_IMPORT,
     TR_SUB_VIEW_CHAPTERS,
-    TR_M_CLEAN_ORPHAN, TR_ORPHAN_DONE_FMT, TR_ORPHAN_NONE,
+    TR_M_CLEAN_ORPHAN, TR_ORPHAN_DONE_FMT,
     TR_PH_CHAPTERS, TR_PH_SUBS,
     TR_CLN_TITLE, TR_CLN_SCOPE_ORPHAN, TR_CLN_SCOPE_CUR, TR_CLN_SCOPE_ALL,
     TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META,
@@ -593,14 +592,11 @@ static const wchar_t *tr(int id)
         L"【已缓存】\r\n本地缓存音频共 %d 个，无需联网即可播放。\r\n\r\n"
             L"缓存内容来自各播客已播放（自动下载）的音频；更改缓存目录请用右上角设置按钮。",
         L"添加播客订阅",
-        L"输入 RSS 订阅地址（http:// 或 https://）：",
         L"确定", L"取消", L"从 OPML 文件导入...",
-        L"地址无效，请输入以 http:// 或 https:// 开头的链接",
         L"该订阅地址已存在", L"订阅数量已达上限",
         L"打开缓存目录", L"更改缓存目录...", L"恢复默认目录",
         L"自动清理缓存", L"关", L"%d 天", L"自动清理缓存：%s",
-        L"输入关键词搜索 iTunes（或直接粘 RSS 地址）：", L"搜索", L"搜索中…",
-        L"没找到相关播客", L"搜索失败（网络问题？）",
+        L"输入关键词搜索 iTunes（或直接粘 RSS 地址）：",
         L"夜间模式", L"语言", L"简体中文", L"English",
         L"定时关机", L"取消定时关机", L"%d 分钟后关机",
         L"自定义分钟数...", L"自定义定时关机",
@@ -625,7 +621,7 @@ static const wchar_t *tr(int id)
             L"目录已切换，新下载会直接存到新文件夹；旧缓存仍在原位置，可手动移走。",
         L"上一曲", L"播放", L"暂停", L"下一曲", L"随机下一曲",
         L"上一首", L"播放 / 暂停", L"下一首", L"停止", L"静音",
-        L"添加播客", L"删除播客", L"调整顺序", L"设置", L"倍速",
+        L"添加播客", L"删除播客", L"设置", L"倍速",
         L"顺序播放", L"随机播放", L"单曲循环", L"一次性播放",
         L"手机播放/遥控",
         L"手机服务启动失败（端口被占用？）",
@@ -691,7 +687,7 @@ static const wchar_t *tr(int id)
         L"松开鼠标即把字幕挂到当前选中的剧集",
         L"松开鼠标即导入",
         L"章节",
-        L"立即清理无用缓存", L"已删除 %d 个无用缓存文件", L"没有发现无用缓存",
+        L"立即清理无用缓存", L"已删除 %d 个无用缓存文件",
         L"（本集没有章节信息）", L"（本集没有字幕）",
         L"清理缓存", L"失效的播客（已删除订阅）", L"现有播客的缓存", L"全部缓存文件",
         L"音频", L"字幕", L"章节", L"封面", L"订阅信息",
@@ -722,14 +718,11 @@ static const wchar_t *tr(int id)
             L"Audio is cached automatically when played. Use the Settings button "
             L"at the top-right to change the cache folder.",
         L"Add Podcast Feed",
-        L"Enter an RSS feed URL (http:// or https://):",
         L"OK", L"Cancel", L"Import from OPML file...",
-        L"Invalid URL. Please enter a link starting with http:// or https://",
         L"This feed already exists", L"Maximum number of feeds reached",
         L"Open Cache Folder", L"Change Cache Folder...", L"Restore Default Folder",
         L"Auto-Clean Cache", L"Off", L"%d days", L"Auto-clean cache: %s",
-        L"Enter keyword to search iTunes (or paste an RSS URL):", L"Search", L"Searching...",
-        L"No podcasts found", L"Search failed (network issue?)",
+        L"Enter keyword to search iTunes (or paste an RSS URL):",
         L"Night Mode", L"Language", L"简体中文", L"English",
         L"Sleep Timer", L"Cancel Sleep Timer", L"Shut down in %d min",
         L"Custom minutes...", L"Custom Sleep Timer",
@@ -758,7 +751,7 @@ static const wchar_t *tr(int id)
             L"The old cache remains in the old folder and can be moved manually.",
         L"Previous", L"Play", L"Pause", L"Next", L"Random next",
         L"Previous", L"Play / Pause", L"Next", L"Stop", L"Mute",
-        L"Add podcast", L"Delete podcast", L"Reorder", L"Settings", L"Speed",
+        L"Add podcast", L"Delete podcast", L"Settings", L"Speed",
         L"Sequential", L"Shuffle", L"Repeat one", L"Play once",
         L"Phone Speaker/Remote",
         L"Failed to start phone service (port in use?)",
@@ -837,7 +830,7 @@ static const wchar_t *tr(int id)
         L"Release to attach the subtitle to the selected episode",
         L"Release to import",
         L"Chapters",
-        L"Clean unused cache now", L"Removed %d unused cache file(s)", L"No unused cache found",
+        L"Clean unused cache now", L"Removed %d unused cache file(s)",
         L"(No chapters for this episode)", L"(No subtitles for this episode)",
         L"Clean cache", L"Invalid podcasts (unsubscribed)", L"Cache of current podcasts", L"All cache files",
         L"Audio", L"Subtitles", L"Chapters", L"Covers", L"Feed info",
@@ -1280,15 +1273,11 @@ static void HideSubTip(void)
 
 /* 给剧集表头的 3 列设置/取消自绘格式（选中播客会重建列，必须重新应用） */
 static void SubclassHeader(void);
-static void ApplyHeaderTheme(void)
+/* 暗色下表头各列改用自绘（HDF_OWNERDRAW），亮色恢复系统绘制 */
+static void HeaderSetOwnerDraw(HWND hdr, int cols)
 {
-    HWND hdr;
     int ci;
-    if (!g_listEp) return;
-    hdr = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
-    if (!hdr) return;
-    SubclassHeader();
-    for (ci = 0; ci < 3; ci++) {
+    for (ci = 0; ci < cols; ci++) {
         HDITEMW hi;
         ZeroMemory(&hi, sizeof(hi));
         hi.mask = HDI_FORMAT;
@@ -1298,6 +1287,42 @@ static void ApplyHeaderTheme(void)
             SendMessageW(hdr, HDM_SETITEMW, ci, (LPARAM)&hi);
         }
     }
+}
+
+/* 暗色表头：补绘最后一列右侧的空白区（默认是白色）与底部 1px 分隔线 */
+static void PaintHeaderGap(HWND hdr)
+{
+    HDC hdc = GetDC(hdr);
+    RECT rc, last;
+    int cols = (int)SendMessageW(hdr, HDM_GETITEMCOUNT, 0, 0);
+    GetClientRect(hdr, &rc);
+    if (hdc && cols > 0 &&
+        SendMessageW(hdr, HDM_GETITEMRECT, cols - 1, (LPARAM)&last) &&
+        last.right < rc.right) {
+        RECT gap = { last.right, rc.top, rc.right, rc.bottom };
+        HBRUSH b = CreateSolidBrush(ThHeaderBg());
+        HPEN pn = CreatePen(PS_SOLID, 1, ThHeaderSep());
+        HGDIOBJ ob1 = SelectObject(hdc, b);
+        HGDIOBJ ob2 = SelectObject(hdc, pn);
+        FillRect(hdc, &gap, b);
+        MoveToEx(hdc, rc.left, rc.bottom - 1, NULL);
+        LineTo(hdc, rc.right, rc.bottom - 1);
+        SelectObject(hdc, ob1);
+        SelectObject(hdc, ob2);
+        DeleteObject(b);
+        DeleteObject(pn);
+    }
+    if (hdc) ReleaseDC(hdr, hdc);
+}
+
+static void ApplyHeaderTheme(void)
+{
+    HWND hdr;
+    if (!g_listEp) return;
+    hdr = (HWND)SendMessageW(g_listEp, LVM_GETHEADER, 0, 0);
+    if (!hdr) return;
+    SubclassHeader();
+    HeaderSetOwnerDraw(hdr, 3);
     InvalidateRect(hdr, NULL, TRUE);
 }
 
@@ -1317,27 +1342,7 @@ static LRESULT CALLBACK HeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND par = GetParent(hwnd);
         if (par) FitListViewHeader(par);
     }
-    if (g_darkMode && msg == WM_PAINT) {
-        HDC hdc = GetDC(hwnd);
-        RECT rc, last;
-        GetClientRect(hwnd, &rc);
-        if (hdc && SendMessageW(hwnd, HDM_GETITEMRECT, 2, (LPARAM)&last)
-            && last.right < rc.right) {
-            RECT gap = { last.right, rc.top, rc.right, rc.bottom };
-            HBRUSH b = CreateSolidBrush(ThHeaderBg());
-            HPEN pn = CreatePen(PS_SOLID, 1, ThHeaderSep());
-            HGDIOBJ ob1 = SelectObject(hdc, b);
-            HGDIOBJ ob2 = SelectObject(hdc, pn);
-            FillRect(hdc, &gap, b);
-            MoveToEx(hdc, rc.left, rc.bottom - 1, NULL);
-            LineTo(hdc, rc.right, rc.bottom - 1);
-            SelectObject(hdc, ob1);
-            SelectObject(hdc, ob2);
-            DeleteObject(b);
-            DeleteObject(pn);
-        }
-        if (hdc) ReleaseDC(hwnd, hdc);
-    }
+    if (g_darkMode && msg == WM_PAINT) PaintHeaderGap(hwnd);
     return lr;
 }
 
@@ -6719,12 +6724,11 @@ static void StartBatchCache(void)
     InvalidateRect(g_listEp, NULL, TRUE);   /* 新增队列剧集立即标蓝 */
 }
 
-/* 该集是否在批量下载队列中（尚未完成的保持蓝色；已完成的 cached=1 由黄色优先）。
- * 正在处理（cur>=0）或待处理（j>=head 且 cur=-1）都算 queued。
- * 已处理完的（成功 or 失败）不再算 queued —— 下载行成功转黄、失败去掉蓝色。 */
-static int EpisodeBatchQueued(int ep)
+/* 在批量队列里按 URL 找当前剧集（只扫"还没处理完"的部分：从 cur 或 head 开始）。
+ * 找到返回 1；pct 非空时回填该集百分比（队列没有进度数组则置 0） */
+static int BatchQueuedIndex(int ep, int *pct)
 {
-    int j, found = 0, start;
+    int j, start, found = 0;
     Podcast *p;
     BatchCache *bc = g_batch;
     if (!bc || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
@@ -6737,6 +6741,7 @@ static int EpisodeBatchQueued(int ep)
         if (bc->urls[j] && bc->urls[j][0] &&
             wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
             found = 1;
+            if (pct) *pct = bc->pct ? bc->pct[j] : 0;
             break;
         }
     }
@@ -6744,27 +6749,20 @@ static int EpisodeBatchQueued(int ep)
     return found;
 }
 
+/* 该集是否在批量下载队列中（尚未完成的保持蓝色；已完成的 cached=1 由黄色优先）。
+ * 正在处理（cur>=0）或待处理（j>=head 且 cur=-1）都算 queued。
+ * 已处理完的（成功 or 失败）不再算 queued —— 下载行成功转黄、失败去掉蓝色。 */
+static int EpisodeBatchQueued(int ep)
+{
+    return BatchQueuedIndex(ep, NULL);
+}
+
 /* 该集当前下载百分比（0=不在下载中 / 已完成），列表行用它当时长列的临时标签。
  * 只有"还没处理完"的才返回百分比。 */
 static int EpisodeBatchPercent(int ep)
 {
-    int j, pct = 0, start;
-    Podcast *p;
-    BatchCache *bc = g_batch;
-    if (!bc || !bc->pct || g_viewCached || g_curPod < 0 || g_curPod >= g_podCount)
-        return 0;
-    p = &g_pods[g_curPod];
-    if (ep < 0 || ep >= p->epCount || !p->eps[ep].url) return 0;
-    EnterCriticalSection(&bc->cs);
-    start = (bc->cur >= 0) ? bc->cur : bc->head;
-    for (j = start; j < bc->count; j++) {
-        if (bc->urls[j] && bc->urls[j][0] &&
-            wcscmp(p->eps[ep].url, bc->urls[j]) == 0) {
-            pct = bc->pct[j];
-            break;
-        }
-    }
-    LeaveCriticalSection(&bc->cs);
+    int pct = 0;
+    BatchQueuedIndex(ep, &pct);
     return pct;
 }
 
@@ -8851,6 +8849,16 @@ static void MetaCacheRenameAll(void)
     }
 }
 
+/* 删除某集的缓存音频与字幕/章节缓存（url 须为网络地址） */
+static void DeleteEpCacheFiles(Episode *e)
+{
+    wchar_t path[MAX_PATH];
+    CachePathFor(e->url, path, MAX_PATH);
+    DeleteFileW(path);
+    DeletePartFile(path);
+    DropEpTranscript(e);
+}
+
 /* 删除某播客全部已缓存的音频文件 */
 static void DeletePodcastCache(int i)
 {
@@ -8858,13 +8866,7 @@ static void DeletePodcastCache(int i)
     if (i < 0 || i >= g_podCount) return;
     for (j = 0; j < g_pods[i].epCount; j++) {
         Episode *e = &g_pods[i].eps[j];
-        if (e && e->url) {
-            wchar_t path[MAX_PATH];
-            CachePathFor(e->url, path, MAX_PATH);
-            DeleteFileW(path);
-            DeletePartFile(path);
-            DropEpTranscript(e);
-        }
+        if (e && e->url) DeleteEpCacheFiles(e);
     }
     RefreshCachedEntry();
     InvalidateRect(g_listEp, NULL, TRUE);
@@ -8887,11 +8889,7 @@ static void DeleteEpisodeCache(int pod, int ep)
         if (pod == g_podCount) {
             DeleteFileW(e->url);
         } else {
-            wchar_t path[MAX_PATH];
-            CachePathFor(e->url, path, MAX_PATH);
-            DeleteFileW(path);
-            DeletePartFile(path);
-            DropEpTranscript(e);
+            DeleteEpCacheFiles(e);
         }
     }
     RefreshCachedEntry();
@@ -9232,7 +9230,6 @@ static void MovePodcastTo(int i, int j)
 #define ID_IB_OK     9002
 #define ID_IB_CANCEL 9003
 #define ID_IB_OPML   9004
-#define ID_IB_SEARCH 9005
 #define ID_IB_LIST   9006
 #define ID_IB_SB     9007   /* ListView 纵向自绘滚动条 */
 #define ID_IB_SBH    9008   /* ListView 水平自绘滚动条 */
@@ -9462,34 +9459,23 @@ static LRESULT CALLBACK IbHeaderProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
     }
-    if (g_darkMode && msg == WM_PAINT) {
-        HDC hdc = GetDC(hwnd);
-        RECT rc, last;
-        int cols;
-        GetClientRect(hwnd, &rc);
-        cols = (int)SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0);
-        if (hdc && cols > 0 && SendMessageW(hwnd, HDM_GETITEMRECT, cols - 1, (LPARAM)&last)
-            && last.right < rc.right) {
-            RECT gap = { last.right, rc.top, rc.right, rc.bottom };
-            HBRUSH b = CreateSolidBrush(ThHeaderBg());
-            HPEN pn = CreatePen(PS_SOLID, 1, ThHeaderSep());
-            HGDIOBJ ob1 = SelectObject(hdc, b);
-            HGDIOBJ ob2 = SelectObject(hdc, pn);
-            FillRect(hdc, &gap, b);
-            MoveToEx(hdc, rc.left, rc.bottom - 1, NULL);
-            LineTo(hdc, rc.right, rc.bottom - 1);
-            SelectObject(hdc, ob1);
-            SelectObject(hdc, ob2);
-            DeleteObject(b);
-            DeleteObject(pn);
-        }
-        if (hdc) ReleaseDC(hwnd, hdc);
-    }
+    if (g_darkMode && msg == WM_PAINT) PaintHeaderGap(hwnd);
     return lr;
 }
 
 /* 前向声明 —— 定义在主窗口 PanelProc 附近 */
 static void SubclassForFontWheel(HWND w);
+
+/* 输入框底部的确定/取消按钮对（模式 0 与 2 布局相同） */
+static void IbOkCancelButtons(HWND h, UINT btnStyle)
+{
+    CreateWindowExW(0, L"BUTTON", tr(TR_OK),
+        btnStyle | BS_DEFPUSHBUTTON,
+        236, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
+    CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
+        btnStyle | BS_PUSHBUTTON,
+        332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+}
 
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -9549,24 +9535,14 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 btnStyle | BS_PUSHBUTTON,
                 384, 36, 36, 24, h, (HMENU)(INT_PTR)ID_IB_BROWSE, NULL, NULL);
             /* 手动填字幕地址：只有确定/取消 */
-            CreateWindowExW(0, L"BUTTON", tr(TR_OK),
-                btnStyle | BS_DEFPUSHBUTTON,
-                236, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
-            CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
-                btnStyle | BS_PUSHBUTTON,
-                332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+            IbOkCancelButtons(h, btnStyle);
         } else if (g_ibMode == 0) {
             /* 客户区 432px，margin 12px 两边 → 可用 408px
              * OPML 160 靠左，确定/取消靠右成对：OK 88 + gap 8 + Cancel 88 */
             CreateWindowExW(0, L"BUTTON", tr(TR_IB_OPML),
                 btnStyle | BS_PUSHBUTTON,
                 12, 70, 160, 24, h, (HMENU)(INT_PTR)ID_IB_OPML, NULL, NULL);
-            CreateWindowExW(0, L"BUTTON", tr(TR_OK),
-                btnStyle | BS_DEFPUSHBUTTON,
-                236, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_OK, NULL, NULL);
-            CreateWindowExW(0, L"BUTTON", tr(TR_CANCEL),
-                btnStyle | BS_PUSHBUTTON,
-                332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
+            IbOkCancelButtons(h, btnStyle);
             /* ListView：两列标题+作者；初始隐藏，仅在真正搜索后显示；
              * 原生滚动条由 PanelProc 的 WM_NCCALCSIZE 并回客户区，
              * 自绘 DSB 覆盖（与主界面 g_listEp 同一套） */
@@ -9605,17 +9581,7 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                  * 经 LVCFMT 透传在部分 comctl32 版本上不可靠） */
                 hdr = (HWND)SendMessageW(lv, LVM_GETHEADER, 0, 0);
                 if (hdr) {
-                    int ci;
-                    for (ci = 0; ci < 2; ci++) {
-                        HDITEMW hi;
-                        ZeroMemory(&hi, sizeof(hi));
-                        hi.mask = HDI_FORMAT;
-                        if (SendMessageW(hdr, HDM_GETITEMW, ci, (LPARAM)&hi)) {
-                            if (g_darkMode) hi.fmt |= HDF_OWNERDRAW;
-                            else            hi.fmt &= ~HDF_OWNERDRAW;
-                            SendMessageW(hdr, HDM_SETITEMW, ci, (LPARAM)&hi);
-                        }
-                    }
+                    HeaderSetOwnerDraw(hdr, 2);
                     if (!g_ibOrigHdrProc)
                         g_ibOrigHdrProc = (WNDPROC)SetWindowLongPtrW(hdr, GWLP_WNDPROC, (LONG_PTR)IbHeaderProc);
                     SendMessageW(hdr, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -10624,7 +10590,6 @@ static void SubclassForFontWheel(HWND w)
 #define SPLIT_MINPX  90    /* 每列最小像素宽 */
 #define DESC_TAB_W   14    /* 简介折叠按钮宽（跨在面板边界上，一半在缝里） */
 #define DESC_TAB_H   40    /* 简介折叠按钮高 */
-#define SUB_BTN_H    24    /* 简介区顶部字幕按钮行高 */
 #ifndef LBS_SHOWSELALWAYS
 #define LBS_SHOWSELALWAYS 0x80
 #endif
