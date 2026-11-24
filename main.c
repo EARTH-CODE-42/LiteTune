@@ -3517,7 +3517,7 @@ static int CacheNameHash(const wchar_t *name, const wchar_t *ext,
     }
     wcsncpy(hex, name + n - el - 9, 8);
     hex[8] = 0;
-    *ph = (unsigned int)wcstoul(hex, NULL, 16);
+    if (ph) *ph = (unsigned int)wcstoul(hex, NULL, 16);
     if (legacy) *legacy = (n == el + 9);
     return 1;
 }

@@ -28,6 +28,14 @@
   - 查找优先级：`sub_` 本地 → `trans_` 网络缓存 → 才下载
   - 不写 ini；删缓存时现有 `IsCacheFileName` 前缀规则自动覆盖
   - 入口：剧集右键菜单「导入字幕…」（GetOpenFileName，comdlg32 已链接）
+- [x] **启动即闪退（1.8 回归，发布前发现）**
+  - 根因：`CacheAutoClean` 调 `CacheNameHash(fd.cFileName, ext, NULL, NULL)`，
+    而 `CacheNameHash` 无条件写 `*ph` → 空指针写，WER 报 c0000005、偏移 0x7d43
+    （反汇编确认就是 `mov %eax,(%edi)`）；缓存目录里只要有本程序命名的文件
+    （首启默认 `%TEMP%\LiteTune` 常残留旧版缓存），启动约 4 秒内必崩
+  - 首启弹窗点完语言/存储方式后才崩，是因为 `CacheAutoClean` 在 `LoadConfig` 之后
+  - 修法：`if (ph) *ph = (unsigned int)wcstoul(...)`；用「ini + 一个缓存文件」复现，
+    旧版 0xC0000005、修复版正常，并模拟真实首启自动点按钮验证能进主窗口
 
 ## P1（体验提升）
 
