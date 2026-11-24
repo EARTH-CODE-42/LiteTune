@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 **Minimalist, portable RSS podcast player** — pure C + native Win32 API, a single 32-bit executable (~300 KB), works on Windows 7–11 (32/64-bit). No installation, no third-party DLLs, no registry writes — delete the exe and it's fully uninstalled.
 
-![version](https://img.shields.io/badge/Version-1.7.0-blue)
+![version](https://img.shields.io/badge/Version-1.8.0-blue)
 ![size](https://img.shields.io/badge/Size-300%20KB-brightgreen)
 ![deps](https://img.shields.io/badge/Deps-none-success)
 ![registry](https://img.shields.io/badge/Registry-untouched-lightgrey)
@@ -44,7 +44,9 @@ https://github.com/user-attachments/assets/e0595a50-6e5e-40c9-91ec-232fd2d9ec43
 - Episode list (title, date, duration; sortable by column headers); the cached view adds a sortable Podcast column
 - **Collapsible description pane**: a slim floating handle appears at the middle of the pane's left edge only on hover — click it to hide the description on the right and let the episode list fill the space; once hidden, the handle moves to the episode list's right edge (its arrow flips to `‹`) to bring it back. The collapsed state is remembered in the config, with matching handles in both light and dark themes
 - **Transcript subtitles**: automatically reads `podcast:transcript` from the feed (VTT / SRT), or set a custom URL per episode via the right-click menu; the description pane switches to a "Subtitles" view with one click (state remembered), the list highlights and follows playback, click any line to jump to that sentence, hover shows the full text, and a custom horizontal bar handles long lines
-- **Desktop subtitle window**: an always-on-top overlay shows the current sentence (keeps the previous one during gaps, no flicker); drag anywhere to move, resize from the edges; the font size follows window height ("exactly two lines" baseline) and long sentences shrink instead of being cut off; left-click replays from the current sentence, wheel switches sentences, right-click pauses/resumes; a close × appears on hover to dismiss it; unaffected when the main window is minimized
+- **Chapters (Podcasting 2.0)**: the description pane offers Notes / Chapters / Subtitles tabs; chapters come from the feed's `podcast:chapters` JSON — click any chapter to jump, and a friendly placeholder shows when an episode has none
+- **Local subtitles**: right-click an episode → "Import subtitles…" (or drop a `.vtt` / `.srt` file onto its row) to bind your own subtitle file; it is copied into the cache and picked up automatically
+- **Desktop subtitle window**: an always-on-top overlay shows the current sentence (keeps the previous one during gaps, no flicker); drag anywhere to move, resize from the edges; position and size are remembered across restarts; hover reveals play-pause / ±15 s / close buttons; the font size follows window height ("exactly two lines" baseline) and long sentences shrink instead of being cut off; left-click replays from the current sentence, wheel switches sentences, right-click pauses/resumes; a close × appears on hover to dismiss it; unaffected when the main window is minimized
 - Online playback and local caching: audio auto-downloads to the cache folder, listen offline without network
 - **Local cache view**: the last row of the podcast list, “Cached (N)”, opens a browsable list of every downloaded episode — no network involved, ideal offline
 - **Feed cache**: RSS and cover art cached locally — instant startup from cache (no network needed), browse feeds offline; manual refresh fetches the latest and falls back to cache on failure (list is never cleared)
@@ -54,6 +56,7 @@ https://github.com/user-attachments/assets/e0595a50-6e5e-40c9-91ec-232fd2d9ec43
 - **New-episode badges**: after a refresh, podcasts with new episodes show a red unread count on the right (99+ when higher); opening the podcast clears it, and unopened badges survive a restart
 - **Scheduled auto-refresh**: choose Off / 30 / 60 / 120 / 360 minutes in Settings to update all feeds automatically while idle (skipped during playback, downloads and batch caching so listening is never interrupted)
 - **Batch caching**: drag or Ctrl+click to multi-select episodes, hit the download button to cache them all (already-cached ones are skipped, playback is never interrupted)
+- **Streaming downloads with resume**: audio is written to disk as it arrives instead of being buffered in memory, interrupted downloads continue with an HTTP `Range` request, and the duration column shows live percentage while downloading
 - Resume memory: remembers the episode and position on exit, resumes automatically next launch; if it was paused at exit, it reopens paused at the saved position (nothing is written after a manual stop)
 - Per-podcast "last heard" marker: each feed remembers its latest played episode (orange highlight); double-click to resume right where you left off
 - **Double-click a podcast** to play its orange ("last heard") episode and resume from the saved position; falls back to the first episode when there's no record
@@ -63,6 +66,7 @@ https://github.com/user-attachments/assets/e0595a50-6e5e-40c9-91ec-232fd2d9ec43
 - **New-episode sound**: a chime plays when a refresh finds new episodes, and the tray icon gets a numeric badge; can be turned off in the Settings menu
 - **Per-feed refresh interval**: a podcast's right-click menu can override the global auto-refresh interval (follow global / off / 30–360 min)
 - Right-click copies the episode audio URL / feed URL to the clipboard
+- **Drag & drop**: drop an `.opml` / `.ini` onto the window to import subscriptions or a full config (the config takes effect after a restart); drop a subtitle file onto an episode row to bind it
 - Import / export: export the subscription list as OPML (interoperates with other podcast apps); import / export the full config (.ini) for backup and migration
 - **Podcast search**: type a keyword (plain text, no `://`) in the "Add Subscription" box and press Enter or hit OK — results from iTunes appear below. A single click fills the RSS URL back into the edit box (press Enter again to add); a double-click adds it immediately
 - Playback controls: previous / play-pause / next / stop / mute / volume
@@ -79,6 +83,8 @@ https://github.com/user-attachments/assets/e0595a50-6e5e-40c9-91ec-232fd2d9ec43
 - Bilingual UI, English & Chinese (chosen on first run, switchable in the Settings menu, remembered)
 - Sleep timer (presets 15–120 min or custom 1–600 min, countdown in the title bar; force shutdown at the end, Windows gives a 15-second cancel window)
 - Auto-clean old cache at startup: 30 days by default, adjustable in the settings menu (Off / 7 / 30 / 90 days; only files generated by the app itself are removed, so custom folders are equally safe)
+- **Readable cache names**: files are named `Podcast_Episode_<hash>.mp3` (subtitles, chapter data, feed and artwork cache likewise), easy to recognise in Explorer; legacy hash-only names still work
+- **Cache cleanup dialog**: shows how many stale / orphaned files exist and their total size, lets you pick the scope (failed feeds / current feeds / everything) and what to delete (audio / subtitles / chapters / artwork / feed data)
 - Three UI font sizes (Ctrl + mouse wheel)
 - Custom cache folder (open / change / move existing cache); the switch is refused when the target folder holds same-named files so your data is never overwritten, and audio finished during a switch lands in the new folder
 - **Dual-mode config storage**: embed it in the exe (single-file portable — copying the exe takes it along) or keep it as an external `feeds.ini` next to the exe (easy upgrades / backups / manual editing); chosen on first run, switchable anytime in the Settings menu (see "Config storage")
@@ -104,7 +110,7 @@ https://github.com/user-attachments/assets/e0595a50-6e5e-40c9-91ec-232fd2d9ec43
 | `LiteTune.exe` | Main program (portable single file; the config is either embedded in the exe tail or kept as an external `feeds.ini` next to it — see "Config storage") |
 | `main.c` | All source code |
 | `feeds.ini` | (optional) External config file, same format as the legacy one. Present only in "external" mode (or when chosen on first run); absent in embedded mode |
-| Cache folder | Downloaded audio (filename = URL hash), feed & cover cache (`feed_*.xml` / `cover_*.img`). Defaults to `%TEMP%\LiteTune\`, auto-cleaned by Windows; stored in the ini if you pick a custom folder. Deleting a feed cleans its RSS/cover cache (audio is kept) |
+| Cache folder | Downloaded audio (`Podcast_Episode_<hash>.mp3`), subtitles and chapters (`…_<hash>.vtt/.srt/.json`), feed and cover cache (`Podcast_<hash>.xml`, cover as `.jpg/.png/…`). Defaults to `%TEMP%\LiteTune\`; stored in the ini if you pick a custom folder. Deleting a feed cleans its feed/cover cache (audio is kept) |
 | `resource.rc` / `app.manifest` / `app.ico` | Build resources (DPI-aware manifest, icon) |
 | `screenshot.png` | Screenshot for the README (desktop + phone web) |
 | `litetune-demo.mp4` | Demo video (portable / phone remote / offline cache) |

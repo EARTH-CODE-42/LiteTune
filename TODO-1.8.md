@@ -97,7 +97,7 @@
       立即 `FreeSubCues()`（字幕分支靠 `LoadTranscript`/`OnSubReady` 清空，所以没这问题）
   - 代码净增约 30 行，exe 268,288 字节（+0.5KB）
 
-- [ ] **重构与死代码审计**
+- [x] **重构与死代码审计**
   - [x] **printf 换成 msvcrt 实现**：源码里 `#define __USE_MINGW_ANSI_STDIO 0`，只用
         `_vsnprintf/_vsnwprintf` 加一层截断补 `\0` 的包装。MinGW 的 C99 printf（浮点/
         位置参数等）此前白带约 75KB，本程序一次浮点都没用。exe 346KB → 270KB
@@ -141,6 +141,16 @@
         `IbFillFromSelected`（输入框选中/激活两处填 URL）
         - exe 265,216 → 265,728 字节（+0.5KB）；-Os 早已把这几段相同代码交叉跳转合并，
           手工抽取只剩可读性收益，属已知现象
+
+## 1.8 发布准备（已就绪）
+
+- [x] 版本号 1.8.0 全量同步：main.c 关于弹窗中英两处、WinHTTP User-Agent 两处、
+      resource.rc FILEVERSION/PRODUCTVERSION + 两语系各两处字符串
+- [x] README.md / README.zh-CN.md 版本徽章 → 1.8.0，补上 1.8 新功能（章节、拖放、
+      本地字幕、流式下载/断点续传、可读缓存名、清理对话框、字幕窗记忆/控制条）
+- [x] 新增 `release-notes-1.8.md`（中英双语，链接 v1.8.0）
+- [x] 清理临时文件 `1feeds.ini`；最终 exe 265,728 字节、零警告、版本 1.8.0.0
+- [ ] 用户自行在 GitHub 发 Release，之后手动跑 `publish-sourceforge.ps1`
 
 ## 1.9 候选（本轮不做，已讨论过方向）
 
