@@ -224,6 +224,16 @@ enum {
     IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_BTN_CHAPTERS, IDC_LIST_SUB
 };
 
+/* 添加订阅输入框（自建模态弹窗）控件 ID；模态循环 RunModalDlg 也用到 OK/CANCEL/LIST */
+#define ID_IB_EDIT   9001
+#define ID_IB_OK     9002
+#define ID_IB_CANCEL 9003
+#define ID_IB_OPML   9004
+#define ID_IB_LIST   9006
+#define ID_IB_SB     9007   /* ListView 纵向自绘滚动条 */
+#define ID_IB_SBH    9008   /* ListView 水平自绘滚动条 */
+#define ID_IB_BROWSE 9009   /* mode 2：选择本地字幕文件 */
+
 /* ================= 全局状态 ================= */
 static Podcast  g_pods[MAX_PODCASTS];
 static int      g_podCount = 0;
@@ -1080,6 +1090,88 @@ static int DarkDlgMsg(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res)
         return 0;
     }
     return 0;
+}
+
+/* 注册自绘弹窗窗口类（已注册则跳过） */
+static void RegDlgClass(const wchar_t *name, WNDPROC proc)
+{
+    WNDCLASSW wc;
+    if (GetClassInfoW(GetModuleHandleW(NULL), name, &wc)) return;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = name;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassW(&wc);
+}
+
+/* 注册一次性自绘窗口类（bg=NULL 表示 WM_PAINT 里自绘背景） */
+static void RegChildClass(const wchar_t *name, WNDPROC proc, HBRUSH bg)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = name;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = bg;
+    RegisterClassExW(&wc);
+}
+
+/* 弹窗居中到主窗口；主窗口还不存在（首启弹窗）时居中到屏幕工作区 */
+static void CenterDlg(HWND dlg)
+{
+    RECT rb = { 0, 0, 0, 0 }, rc;
+    if (g_hwnd) GetWindowRect(g_hwnd, &rb);
+    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &rb, 0);
+    GetWindowRect(dlg, &rc);
+    SetWindowPos(dlg, NULL,
+        rb.left + ((rb.right - rb.left) - (rc.right - rc.left)) / 2,
+        rb.top  + ((rb.bottom - rb.top)  - (rc.bottom - rc.top)) / 2,
+        0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+
+/* 统一模态弹窗循环：dlg 被销毁后返回。focus 非空则在显示后设置焦点。
+ * ibKeys=1 时在消息层拦截回车/ESC——IsDialogMessageW 对 BS_OWNERDRAW
+ * 的默认按钮识别不可靠，输入框自己处理（列表上回车=选中项） */
+static void RunModalDlg(HWND dlg, HWND focus, int ibKeys)
+{
+    MSG m;
+    if (g_hwnd) EnableWindow(g_hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+    if (focus) SetFocus(focus);
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (ibKeys && m.message == WM_KEYDOWN &&
+            (m.wParam == VK_RETURN || m.wParam == VK_ESCAPE)) {
+            HWND f = GetFocus();
+            if (f == dlg || IsChild(dlg, f)) {
+                if (m.wParam == VK_ESCAPE) {
+                    SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(ID_IB_CANCEL, BN_CLICKED), 0);
+                } else if (f == GetDlgItem(dlg, ID_IB_LIST)) {
+                    /* 焦点在结果列表上：回车 = LVN_ITEMACTIVATE */
+                    NMHDR nm;
+                    nm.code = LVN_ITEMACTIVATE;
+                    nm.idFrom = ID_IB_LIST;
+                    nm.hwndFrom = f;
+                    SendMessageW(dlg, WM_NOTIFY, 0, (LPARAM)&nm);
+                } else {
+                    SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
+                }
+                continue;
+            }
+        }
+        if (!IsDialogMessageW(dlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    if (g_hwnd) {
+        EnableWindow(g_hwnd, TRUE);
+        SetForegroundWindow(g_hwnd);
+    }
 }
 
 /* MessageBox 暗色：WH_CBT 挂钩在激活时用 SetWindowSubclass 挂上暗色处理，
@@ -5143,21 +5235,9 @@ static LRESULT CALLBACK FirstRunProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 static int AskFirstRunMode(void)
 {
     static const wchar_t *FR_CLASS = L"LpFirstRun";
-    WNDCLASSW wc;
     HWND d;
-    RECT scr, rc;
-    MSG m;
 
-    if (!GetClassInfoW(GetModuleHandleW(NULL), FR_CLASS, &wc)) {
-        ZeroMemory(&wc, sizeof(wc));
-        wc.lpfnWndProc = FirstRunProc;
-        wc.hInstance = GetModuleHandleW(NULL);
-        wc.lpszClassName = FR_CLASS;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        RegisterClassW(&wc);
-    }
-
+    RegDlgClass(FR_CLASS, FirstRunProc);
     g_frResult = 0;
     {
         RECT wr = { 0, 0, 460, 232 };
@@ -5170,22 +5250,9 @@ static int AskFirstRunMode(void)
     }
     if (!d) return 0;
 
-    /* 此刻主窗口还没建：居中到屏幕工作区 */
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &scr, 0);
-    GetWindowRect(d, &rc);
-    SetWindowPos(d, NULL,
-        scr.left + ((scr.right - scr.left) - (rc.right - rc.left)) / 2,
-        scr.top  + ((scr.bottom - scr.top)  - (rc.bottom - rc.top)) / 2,
-        0, 0, SWP_NOSIZE | SWP_NOZORDER);
-
-    ShowWindow(d, SW_SHOW);
-    UpdateWindow(d);
-    while (IsWindow(d) && GetMessageW(&m, NULL, 0, 0) > 0) {
-        if (!IsDialogMessageW(d, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
+    /* 此刻主窗口还没建：CenterDlg 回退到屏幕工作区居中 */
+    CenterDlg(d);
+    RunModalDlg(d, NULL, 0);
     return g_frResult;
 }
 
@@ -8936,7 +9003,7 @@ static void AfterCacheClean(void)
 #define CL_CHK_BASE   3410
 
 static HWND g_clDlg = NULL;
-static int  g_clReg = 0, g_clScope = 0, g_clTypes = CL_ALL;
+static int  g_clScope = 0, g_clTypes = CL_ALL;
 static int  g_clFiles = 0;
 static int  g_clDone = 0;
 static wchar_t g_clStatText[96];
@@ -9100,45 +9167,22 @@ static LRESULT CALLBACK CleanDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 /* scope: 0=失效播客 1=现有播客 2=全部；types 为 CL_* 组合 */
 static void ShowCleanCacheDialog(int scope, int types)
 {
-    WNDCLASSEXW wc;
-    RECT pr;
-    MSG msg;
     int w = 380, h = 296;
 
     if (g_clDlg && IsWindow(g_clDlg)) { SetForegroundWindow(g_clDlg); return; }
-    if (!g_clReg) {
-        ZeroMemory(&wc, sizeof(wc));
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = CleanDlgProc;
-        wc.hInstance = GetModuleHandleW(NULL);
-        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-        wc.lpszClassName = L"LTCleanCache";
-        RegisterClassExW(&wc);
-        g_clReg = 1;
-    }
+    RegDlgClass(L"LTCleanCache", CleanDlgProc);
     g_clScope = scope;
     g_clTypes = types;
     g_clDone = 0;
     g_clFiles = 0;
     g_clStatText[0] = 0;
-    GetWindowRect(g_hwnd, &pr);
     g_clDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
         L"LTCleanCache", tr(TR_CLN_TITLE),
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        (pr.left + pr.right - w) / 2, (pr.top + pr.bottom - h) / 2,
-        w, h, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+        0, 0, w, h, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
     if (!g_clDlg) return;
-    EnableWindow(g_hwnd, FALSE);
-    ShowWindow(g_clDlg, SW_SHOW);
-    SetFocus(g_clDlg);
-    while (IsWindow(g_clDlg) && GetMessageW(&msg, NULL, 0, 0)) {
-        if (!IsDialogMessageW(g_clDlg, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    EnableWindow(g_hwnd, TRUE);
-    SetForegroundWindow(g_hwnd);
+    CenterDlg(g_clDlg);
+    RunModalDlg(g_clDlg, g_clDlg, 0);
     if (g_clDone) {
         wchar_t t[64];
         if (g_clFiles > 0) {
@@ -9226,15 +9270,6 @@ static void MovePodcastTo(int i, int j)
 
 
 /* ================= 添加订阅输入框（自建模态弹窗） ================= */
-#define ID_IB_EDIT   9001
-#define ID_IB_OK     9002
-#define ID_IB_CANCEL 9003
-#define ID_IB_OPML   9004
-#define ID_IB_LIST   9006
-#define ID_IB_SB     9007   /* ListView 纵向自绘滚动条 */
-#define ID_IB_SBH    9008   /* ListView 水平自绘滚动条 */
-#define ID_IB_BROWSE 9009   /* mode 2：选择本地字幕文件 */
-
 static HWND g_ibSb;
 static HWND g_ibSbH;
 static HWND g_ibList = NULL;   /* 搜索结果 ListView，供 PanelProc 识别（同 g_listEp 一套处理） */
@@ -9878,20 +9913,9 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 static int AskInputBox(const wchar_t *title, int mode)
 {
     static const wchar_t *IB_CLASS = L"LpInputBox";
-    WNDCLASSW wc;
     HWND d;
-    RECT rp, rc;
-    MSG m;
 
-    if (!GetClassInfoW(GetModuleHandleW(NULL), IB_CLASS, &wc)) {
-        ZeroMemory(&wc, sizeof(wc));
-        wc.lpfnWndProc = InputBoxProc;
-        wc.hInstance = GetModuleHandleW(NULL);
-        wc.lpszClassName = IB_CLASS;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        RegisterClassW(&wc);
-    }
+    RegDlgClass(IB_CLASS, InputBoxProc);
 
     g_ibMode = mode;
     g_ibResult = 0;
@@ -9911,54 +9935,9 @@ static int AskInputBox(const wchar_t *title, int mode)
     }
     if (!d) return 0;
 
-    /* 居中到主窗口 */
-    GetWindowRect(g_hwnd, &rp);
-    GetWindowRect(d, &rc);
-    SetWindowPos(d, 0,
-        rp.left + ((rp.right - rp.left) - (rc.right - rc.left)) / 2,
-        rp.top  + ((rp.bottom - rp.top)  - (rc.bottom - rc.top)) / 2,
-        0, 0, SWP_NOSIZE | SWP_NOZORDER);
-
-    EnableWindow(g_hwnd, FALSE);
-    ShowWindow(d, SW_SHOW);
-    UpdateWindow(d);
-    while (IsWindow(d) && GetMessageW(&m, NULL, 0, 0) > 0) {
-        HWND focus;
-        /* 自己拦截 VK_RETURN：IsDialogMessageW 对 BS_OWNERDRAW 的
-         * DefaultButton 识别不可靠，直接在消息循环层面处理。
-         * 焦点在 ListView 上取选中项直接添加；其他情况一律转 OK。 */
-        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) {
-            focus = GetFocus();
-            if (focus == d || IsChild(d, focus)) {
-                if (focus == GetDlgItem(d, ID_IB_LIST)) {
-                    /* ListView 上按回车 = 等价 LVN_ITEMACTIVATE */
-                    NMHDR nm;
-                    nm.code = LVN_ITEMACTIVATE;
-                    nm.idFrom = ID_IB_LIST;
-                    nm.hwndFrom = focus;
-                    SendMessageW(d, WM_NOTIFY, 0, (LPARAM)&nm);
-                } else {
-                    SendMessageW(d, WM_COMMAND,
-                        MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
-                }
-                continue;
-            }
-        }
-        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
-            focus = GetFocus();
-            if (focus == d || IsChild(d, focus)) {
-                SendMessageW(d, WM_COMMAND,
-                    MAKEWPARAM(ID_IB_CANCEL, BN_CLICKED), 0);
-                continue;
-            }
-        }
-        if (!IsDialogMessageW(d, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-    EnableWindow(g_hwnd, TRUE);
-    SetForegroundWindow(g_hwnd);
+    /* 焦点由 WM_CREATE 里的 SetFocus(编辑框) 负责 */
+    CenterDlg(d);
+    RunModalDlg(d, NULL, 1);
     /* mode=2（字幕地址）允许空输入（留空 = 清除覆盖）；
      * 其他 mode 必须非空（订阅 URL、定时分钟数都不能空） */
     return g_ibResult && (g_ibMode == 2 || g_ibBuf[0]);
@@ -14316,14 +14295,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* 自定义播客提示窗（封面 + 标题 + 作者） */
         {
-            WNDCLASSEXW wc; ZeroMemory(&wc, sizeof(wc));
-            wc.cbSize = sizeof(wc);
-            wc.lpfnWndProc = PodTipProc;
-            wc.hInstance = GetModuleHandleW(NULL);
-            wc.lpszClassName = L"LpPodTip";
-            wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-            wc.hbrBackground = (HBRUSH)(COLOR_INFOBK + 1);
-            RegisterClassExW(&wc);
+            RegChildClass(L"LpPodTip", PodTipProc, (HBRUSH)(COLOR_INFOBK + 1));
             g_hwndPodTip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 L"LpPodTip", NULL, WS_POPUP, 0,0, 440, 160, hwnd, NULL, GetModuleHandleW(NULL), NULL);
         }
@@ -16248,54 +16220,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdS
     if (!RegisterClassExW(&wc)) return 1;
 
     /* 注册自绘滚动条窗口类 */
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = DarkScrollBarProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = DSB_CLASS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘背景 */
-    RegisterClassExW(&wc);
+    RegChildClass(DSB_CLASS, DarkScrollBarProc, NULL);
 
     /* 注册托盘迷你控制浮窗类 */
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = FlyoutProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = FLY_CLASS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(ThFlyBg());   /* 暗底与按钮一致 */
-    RegisterClassExW(&wc);
+    RegChildClass(FLY_CLASS, FlyoutProc, CreateSolidBrush(ThFlyBg()));   /* 暗底与按钮一致 */
 
     /* 注册简介折叠按钮窗口类 */
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = DescTabProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = DESC_TAB_CLASS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
-    RegisterClassExW(&wc);
+    RegChildClass(DESC_TAB_CLASS, DescTabProc, NULL);
 
     /* 注册“定位正在播放”按钮窗口类 */
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = LocBtnProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = LOC_BTN_CLASS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;   /* WM_PAINT 里自绘 */
-    RegisterClassExW(&wc);
+    RegChildClass(LOC_BTN_CLASS, LocBtnProc, NULL);
 
     /* 注册外挂字幕窗类（始终置顶、可拖动缩放，类似桌面歌词） */
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = SubBarProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = SUBBAR_CLASS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    RegisterClassExW(&wc);
+    RegChildClass(SUBBAR_CLASS, SubBarProc, NULL);
 
     /* 注册任务栏缩略图工具栏消息（Windows 7+） */
     g_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");

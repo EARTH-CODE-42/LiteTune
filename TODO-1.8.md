@@ -119,6 +119,14 @@
         `DeleteEpCacheFiles`、输入框确定/取消按钮抽 `IbOkCancelButtons`
         - exe 268,288 → 266,752 字节（-1.5KB），零警告
         - 注：后三处抽取后 GCC 的 `-Os` 交叉跳转已能合并，体积不再变，属于纯代码整洁化
+  - [x] **自绘弹窗公共脚手架**：`RegDlgClass`（自绘对话框类）、`RegChildClass`（一次性
+        子窗口类，bg 参数区分自绘/纯色）、`CenterDlg`（居中到主窗，首启回退屏幕工作区）、
+        `RunModalDlg`（统一模态消息循环，focus/ibKeys 参数覆盖首启、清理框、输入框三种差异）
+        - 替换：AskFirstRunMode / ShowCleanCacheDialog / AskInputBox 的注册+居中+模态循环；
+          另合并 DSB / FLY / DESC_TAB / LOC_BTN / SUBBAR / LpPodTip 六处类注册
+        - 删掉仅用于清理框的 `g_clReg` 标志；`ID_IB_*` 控件 ID 上移到控件 ID 区
+        - exe 266,752 → 265,216 字节（-1.5KB），零警告
+        - SubBar 是非模态窗，只合并了类注册，窗口过程本身不动
 
 ## 1.9 候选（本轮不做，已讨论过方向）
 
