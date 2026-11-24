@@ -3985,6 +3985,15 @@ static unsigned int LastEpHash(const char *url)
     return h;
 }
 
+/* 该哈希是否属于某个现有订阅（清理 ini 里的孤儿记录用） */
+static int HashBelongsToPod(unsigned int h)
+{
+    int j;
+    for (j = 0; j < g_podCount; j++)
+        if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) return 1;
+    return 0;
+}
+
 /* ---- 缓存清理：按范围 + 内容类型枚举/删除 ---- */
 #define CL_AUDIO 1
 #define CL_SUB   2
@@ -4133,10 +4142,7 @@ static void LastEpPurgeOrphans(void)
     int i, keep = 0;
     for (i = 0; i < g_lastEpCount; i++) {
         unsigned int h = g_lastEps[i].hash;
-        int j, found = 0;
-        for (j = 0; j < g_podCount && !found; j++)
-            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
-        if (found) g_lastEps[keep++] = g_lastEps[i];
+        if (HashBelongsToPod(h)) g_lastEps[keep++] = g_lastEps[i];
         else free(g_lastEps[i].epUrl);
     }
     g_lastEpCount = keep;
@@ -4197,10 +4203,7 @@ static void SeenPurgeOrphans(void)
     int i, keep = 0;
     for (i = 0; i < g_seenEpCount; i++) {
         unsigned int h = g_seenEps[i].hash;
-        int j, found = 0;
-        for (j = 0; j < g_podCount && !found; j++)
-            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
-        if (found) g_seenEps[keep++] = g_seenEps[i];
+        if (HashBelongsToPod(h)) g_seenEps[keep++] = g_seenEps[i];
     }
     g_seenEpCount = keep;
 }
@@ -4282,10 +4285,7 @@ static void FavPurgeOrphans(void)
     int i, keep = 0;
     for (i = 0; i < g_favCount; i++) {
         unsigned int h = g_favs[i].hash;
-        int j, found = 0;
-        for (j = 0; j < g_podCount && !found; j++)
-            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
-        if (found) g_favs[keep++] = g_favs[i];
+        if (HashBelongsToPod(h)) g_favs[keep++] = g_favs[i];
         else free(g_favs[i].epUrl);
     }
     g_favCount = keep;
@@ -4413,10 +4413,7 @@ static void PodRefreshPurgeOrphans(void)
     int i, keep = 0;
     for (i = 0; i < g_podRefCount; i++) {
         unsigned int h = g_podRefs[i].hash;
-        int j, found = 0;
-        for (j = 0; j < g_podCount && !found; j++)
-            if (g_pods[j].feedUrl && LastEpHash(g_pods[j].feedUrl) == h) found = 1;
-        if (found) g_podRefs[keep++] = g_podRefs[i];
+        if (HashBelongsToPod(h)) g_podRefs[keep++] = g_podRefs[i];
     }
     g_podRefCount = keep;
 }
@@ -6613,22 +6610,29 @@ static void CancelBatchCache(void)
     WakeAllConditionVariable(&bc->cv);
 }
 
+/* 释放队列结构及其内容（调用方保证线程已退出） */
+static void BatchFree(BatchCache *bc)
+{
+    int i;
+    if (!bc) return;
+    for (i = 0; bc->urls && i < bc->count; i++) free(bc->urls[i]);
+    free(bc->urls);
+    free(bc->pct);
+    DeleteCriticalSection(&bc->cs);
+    free(bc);
+}
+
 /* UI 线程回收：cancel 后工作线程很快退出，等它结束再释放全部资源。
  * FINISH 消息处理和程序退出（消息泵已停、FINISH 不会到达）共用。 */
 static void BatchReleaseAfterFinish(void)
 {
     BatchCache *bc = g_batch;
-    int bi;
     if (!bc) return;
     if (bc->thread) {
         WaitForSingleObject(bc->thread, 10000);
         CloseHandle(bc->thread);
     }
-    for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
-    free(bc->urls);
-    free(bc->pct);
-    DeleteCriticalSection(&bc->cs);
-    free(bc);
+    BatchFree(bc);
     g_batch = NULL;
 }
 
@@ -6680,10 +6684,7 @@ static void StartBatchCache(void)
         bc->urls = (wchar_t**)calloc((size_t)bc->cap, sizeof(wchar_t*));
         bc->pct = (int*)calloc((size_t)bc->cap, sizeof(int));
         if (!bc->urls || !bc->pct) {
-            free(bc->urls);
-            free(bc->pct);
-            DeleteCriticalSection(&bc->cs);
-            free(bc);
+            BatchFree(bc);
             return;
         }
         g_batch = bc;
@@ -6733,10 +6734,7 @@ static void StartBatchCache(void)
         /* 空队列是刚为本次创建的：回收；否则只是没有新东西可加 */
         if (!bc->thread && bc->count == 0) {
             g_batch = NULL;
-            free(bc->urls);
-            free(bc->pct);
-            DeleteCriticalSection(&bc->cs);
-            free(bc);
+            BatchFree(bc);
         } else {
             SetStatusTemp(tr(TR_BATCH_RUNNING));
         }
@@ -6763,12 +6761,7 @@ static void StartBatchCache(void)
     if (needStart) {
         bc->thread = CreateThread(NULL, 0, BatchDlThread, bc, 0, NULL);
         if (!bc->thread) {
-            int bi;
-            for (bi = 0; bi < bc->count; bi++) free(bc->urls[bi]);
-            free(bc->urls);
-            free(bc->pct);
-            DeleteCriticalSection(&bc->cs);
-            free(bc);
+            BatchFree(bc);
             g_batch = NULL;
             g_batchActive = 0;
             SetStatusTemp(tr(TR_DL_THREAD_FAIL));
@@ -9512,6 +9505,22 @@ static void IbOkCancelButtons(HWND h, UINT btnStyle)
         332, 70, 88, 24, h, (HMENU)(INT_PTR)ID_IB_CANCEL, NULL, NULL);
 }
 
+/* 把搜索列表选中项的 feedUrl 填进输入框 */
+static void IbFillFromSelected(HWND h)
+{
+    HWND lv = GetDlgItem(h, ID_IB_LIST);
+    int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    LVITEMW li;
+    if (sel < 0) return;
+    ZeroMemory(&li, sizeof(li));
+    li.mask = LVIF_PARAM;
+    li.iItem = sel;
+    if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&li)) {
+        wchar_t *url = (wchar_t *)li.lParam;
+        if (url && *url) SetDlgItemTextW(h, ID_IB_EDIT, url);
+    }
+}
+
 static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     LRESULT r;
@@ -9845,34 +9854,13 @@ static LRESULT CALLBACK InputBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_NOTIFY: {
         NMHDR *nm = (NMHDR *)lp;
         if (nm->idFrom == ID_IB_LIST) {
-            HWND lv = GetDlgItem(h, ID_IB_LIST);
             if (nm->code == LVN_ITEMCHANGED) {
                 /* 选中搜索结果：把 feedUrl 自动填进输入框 */
-                int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                if (sel >= 0) {
-                    LVITEMW li;
-                    ZeroMemory(&li, sizeof(li));
-                    li.mask = LVIF_PARAM;
-                    li.iItem = sel;
-                    if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&li)) {
-                        wchar_t *url = (wchar_t *)li.lParam;
-                        if (url && *url) SetDlgItemTextW(h, ID_IB_EDIT, url);
-                    }
-                }
+                IbFillFromSelected(h);
                 if (g_ibSb) SyncScrollBar(g_ibSb);
             } else if (nm->code == LVN_ITEMACTIVATE) {
                 /* 双击/回车：取 feedUrl 直接添加 */
-                int sel = (int)SendMessageW(lv, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                if (sel >= 0) {
-                    LVITEMW li;
-                    ZeroMemory(&li, sizeof(li));
-                    li.mask = LVIF_PARAM;
-                    li.iItem = sel;
-                    if (SendMessageW(lv, LVM_GETITEMW, 0, (LPARAM)&li)) {
-                        wchar_t *url = (wchar_t *)li.lParam;
-                        if (url && *url) SetDlgItemTextW(h, ID_IB_EDIT, url);
-                    }
-                }
+                IbFillFromSelected(h);
                 SendMessageW(h, WM_COMMAND, MAKEWPARAM(ID_IB_OK, BN_CLICKED), 0);
             }
         }
@@ -10512,6 +10500,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SyncScrollBar(g_vsDesc);
         return 0;
     }
+    /* ListView 的滚轮是 comctl32 靠原生滚动条实现的，而下面 WM_SIZE 把原生条
+     * 隐藏了（否则右下角闪白方块）→ 滚轮失效。这里自己按行滚动 */
+    if (msg == WM_MOUSEWHEEL && (hwnd == g_listEp || hwnd == g_ibList)) {
+        int d = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -3 : 3;
+        SendMessageW(hwnd, LVM_SCROLL, 0, (LPARAM)(d * DSB_RowH(hwnd)));
+        if (hwnd == g_listEp) {
+            SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp);
+        } else {
+            if (g_ibSb) SyncScrollBar(g_ibSb);
+            if (g_ibSbH) SyncScrollBar(g_ibSbH);
+        }
+        return 0;
+    }
     /* ListView 会自动显示自带滚动条：在 WM_NCCALCSIZE 里把条带并回
      * 客户区（永不显示白条，内容宽度也不抖动）。剧集列表与搜索结果列表通用 */
     if (msg == WM_NCCALCSIZE && wp &&
@@ -10540,6 +10541,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HWND hdr;
             SyncScrollBar(g_vsEp); SyncScrollBar(g_hsEp);
             if (msg == WM_SIZE) {
+                /* 原生滚动条不显示（自绘条是唯一滚动条）：留着它系统会在
+                 * 右下角补一块 COLOR_3DFACE 尺寸盒，暗色主题下闪白方块 */
+                ShowScrollBar(hwnd, SB_BOTH, FALSE);
                 FitListViewHeader(hwnd);
             } else if (msg == WM_HSCROLL) {
                 /* HDF_OWNERDRAW 下系统水平滚动只刷背景，不给新位置重发
@@ -10548,7 +10552,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (hdr) InvalidateRect(hdr, NULL, TRUE);
             }
         }
-        else if (hwnd == g_ibList) { if (g_ibSb) SyncScrollBar(g_ibSb);
+        else if (hwnd == g_ibList) { if (msg == WM_SIZE) ShowScrollBar(hwnd, SB_BOTH, FALSE);
+                                     if (g_ibSb) SyncScrollBar(g_ibSb);
                                      if (g_ibSbH) SyncScrollBar(g_ibSbH); }
         else if (hwnd == g_editDesc) SyncScrollBar(g_vsDesc);
         else if (hwnd == g_listSub) { SyncScrollBar(g_vsSub); SyncScrollBar(g_hsSub); }
@@ -13954,6 +13959,14 @@ static void DropTargetUninstall(void)
     }
 }
 
+/* 面板类控件（列表/只读简介/过滤框）统一底色与文字色，返回背景刷 */
+static LRESULT PanelTextColors(HDC hdc)
+{
+    SetBkColor(hdc, ThPanel());
+    SetTextColor(hdc, ThText());
+    return (LRESULT)g_whiteBrush;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     /* 任务栏缩略图工具栏：Explorer 广播此消息后初始化 */
@@ -14180,6 +14193,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SubclassForFontWheel(g_editFilter);
         SubclassForFontWheel(g_btnFavOnly);
         SubclassForFontWheel(g_btnSubView);
+        SubclassForFontWheel(g_btnSubChap);
         SubclassForFontWheel(g_btnSubTab);
         SubclassForFontWheel(g_btnSubOn);
         SubclassForFontWheel(g_listSub);
@@ -14868,30 +14882,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    /* 播客列表底色随主题 */
+    /* 列表/过滤框：面板底色 + 主题文字色 */
     case WM_CTLCOLORLISTBOX:
-        if ((HWND)lParam == g_listPod) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, ThPanel());
-            SetTextColor(hdc, ThText());
-            return (LRESULT)g_whiteBrush;
-        }
-        if ((HWND)lParam == g_listSub) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, ThPanel());
-            SetTextColor(hdc, ThText());
-            return (LRESULT)g_whiteBrush;
-        }
+    case WM_CTLCOLOREDIT:
+        if ((HWND)lParam == g_listPod || (HWND)lParam == g_listSub ||
+            (HWND)lParam == g_editFilter)
+            return PanelTextColors((HDC)wParam);
         break;
 
     case WM_CTLCOLORSTATIC:
         /* 只读简介框：面板底色 */
-        if ((HWND)lParam == g_editDesc) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, ThPanel());
-            SetTextColor(hdc, ThText());
-            return (LRESULT)g_whiteBrush;
-        }
+        if ((HWND)lParam == g_editDesc)
+            return PanelTextColors((HDC)wParam);
         /* 其它静态文字（时间/音量/格式串）：透明背景 + 主题文字色 */
         {
             HDC hdc = (HDC)wParam;
@@ -14900,16 +14902,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return (LRESULT)(g_bgBrush
                 ? g_bgBrush : GetSysColorBrush(COLOR_BTNFACE));
         }
-
-    /* 剧集过滤框：与面板同色，暗色主题下也可读 */
-    case WM_CTLCOLOREDIT:
-        if ((HWND)lParam == g_editFilter) {
-            HDC hdc = (HDC)wParam;
-            SetBkColor(hdc, ThPanel());
-            SetTextColor(hdc, ThText());
-            return (LRESULT)g_whiteBrush;
-        }
-        break;
 
     case WM_GETMINMAXINFO: {
         /* 客户区最小 480x360，外框 = 客户区 + 自绘标题栏 + 四周窄边框 */

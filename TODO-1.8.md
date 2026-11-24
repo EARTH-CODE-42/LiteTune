@@ -127,6 +127,20 @@
         - 删掉仅用于清理框的 `g_clReg` 标志；`ID_IB_*` 控件 ID 上移到控件 ID 区
         - exe 266,752 → 265,216 字节（-1.5KB），零警告
         - SubBar 是非模态窗，只合并了类注册，窗口过程本身不动
+  - [x] **拖动缩放时白方块闪烁**
+        - 章节 tab 是唯一没走 `SubclassForFontWheel` 的 owner-draw 按钮 → 擦背景用系统
+          COLOR_BTNFACE（240），补上 subclass 后 `PanelProc` 的 WM_ERASEBKGND 拦截生效
+        - 剧集/搜索列表右下角 17×17 白方块 = 原生滚动条尺寸盒：自绘条是唯一滚动条，
+          在 `PanelProc` 的 WM_SIZE 里 `ShowScrollBar(SB_BOTH, FALSE)` 隐藏原生条
+          （已验证 `GetScrollInfo` 在隐藏后仍返回范围/页/位置，自绘条同步不受影响）
+        - 副作用（用户冒烟发现）：ListView 的滚轮是 comctl32 靠原生滚动条实现的，
+          隐藏后滚轮失效，拖一下自绘条（走 `LVM_SCROLL`）才恢复 → 在 `PanelProc`
+          里给 `g_listEp` / `g_ibList` 补自己的 WM_MOUSEWHEEL 分支（3 行 × `DSB_RowH` 像素滚动）
+  - [x] **再合并小重复块**：`BatchFree`（批量队列 4 处释放）、`PanelTextColors`
+        （4 处 CTLCOLOR 同款配色）、`HashBelongsToPod`（4 处孤儿清理查找）、
+        `IbFillFromSelected`（输入框选中/激活两处填 URL）
+        - exe 265,216 → 265,728 字节（+0.5KB）；-Os 早已把这几段相同代码交叉跳转合并，
+          手工抽取只剩可读性收益，属已知现象
 
 ## 1.9 候选（本轮不做，已讨论过方向）
 
