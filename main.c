@@ -245,6 +245,12 @@ static Podcast  g_cachePod;
 static int      g_viewCached = 0;     /* 剧集列表当前是否为缓存视图 */
 static int      g_cacheRowHere = 0;   /* 列表框里是否已追加“已缓存”行 */
 
+/* Radio tab: virtual podcast + hardcoded public Icecast/SHOUTcast MP3 streams */
+static int      g_activeTab = 0;       /* 0 = Podcast, 1 = Radio */
+static Podcast  g_radioPod;
+static HWND     g_btnTabPod   = NULL;
+static HWND     g_btnTabRadio = NULL;
+
 static HWND     g_hwnd;   /* 主窗口句柄 */
 static HFONT    g_font;          /* 8pt+级别 常规 */
 static HFONT    g_fontBold;      /* 8pt+级别 加粗（播客标题） */
@@ -576,6 +582,7 @@ enum {
     TR_CLN_TITLE, TR_CLN_SCOPE_ORPHAN, TR_CLN_SCOPE_CUR, TR_CLN_SCOPE_ALL,
     TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META,
     TR_CLN_STAT_FMT, TR_CLN_NONE,
+    TR_RADIO, TR_RADIO_TAB, TR_PLAYING_LIVE_FMT,
     TR_N
 };
 
@@ -701,7 +708,8 @@ static const wchar_t *tr(int id)
         L"（本集没有章节信息）", L"（本集没有字幕）",
         L"清理缓存", L"失效的播客（已删除订阅）", L"现有播客的缓存", L"全部缓存文件",
         L"音频", L"字幕", L"章节", L"封面", L"订阅信息",
-        L"将删除 %d 个文件，共 %d.%d MB", L"没有可清理的文件"
+        L"将删除 %d 个文件，共 %d.%d MB", L"没有可清理的文件",
+        L"网络电台", L"电台", L"正在收听：%s"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -844,7 +852,8 @@ static const wchar_t *tr(int id)
         L"(No chapters for this episode)", L"(No subtitles for this episode)",
         L"Clean cache", L"Invalid podcasts (unsubscribed)", L"Cache of current podcasts", L"All cache files",
         L"Audio", L"Subtitles", L"Chapters", L"Covers", L"Feed info",
-        L"Will remove %d file(s), %d.%d MB", L"Nothing to clean"
+        L"Will remove %d file(s), %d.%d MB", L"Nothing to clean",
+        L"Radio", L"Radio", L"Listening: %s"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -3915,6 +3924,32 @@ static void LoadCachePodcast(void)
     FindClose(hFind);
 
     SortPodcast(&g_cachePod);
+}
+
+/* Hardcoded public Icecast/SHOUTcast MP3 direct streams for spike */
+static const struct { const wchar_t *name; const wchar_t *url; } kRadioStations[] = {
+    { L"SomaFM Groove Salad", L"https://ice1.somafm.com/groovesalad-128-mp3" },
+    { L"SomaFM DEF CON Radio", L"https://ice1.somafm.com/defcon-128-mp3" },
+    { L"OpenRadio Chinese",   L"https://stream.zeno.fm/0r0xa792kwzuv" },
+};
+#define RADIO_STATION_COUNT (int)(sizeof(kRadioStations)/sizeof(kRadioStations[0]))
+
+static void LoadRadioPodcast(void)
+{
+    int i;
+    g_radioPod.title  = _wcsdup(tr(TR_RADIO));
+    g_radioPod.author = _wcsdup(tr(TR_RADIO));
+    g_radioPod.epCount = 0;
+    g_radioPod.epCap = RADIO_STATION_COUNT;
+    g_radioPod.eps = (Episode*)calloc(RADIO_STATION_COUNT, sizeof(Episode));
+    if (!g_radioPod.eps) { g_radioPod.epCap = 0; return; }
+    for (i = 0; i < RADIO_STATION_COUNT; i++) {
+        Episode *e = &g_radioPod.eps[i];
+        e->title = _wcsdup(kRadioStations[i].name);
+        e->url   = _wcsdup(kRadioStations[i].url);
+        e->origIdx = i;
+        g_radioPod.epCount++;
+    }
 }
 
 /* 缓存目录里的 mp3 数量（供列表行右侧显示，避免每次绘制都扫盘） */
@@ -8299,6 +8334,77 @@ static void SelectCachedView(void)
     SetWindowTextW(g_editDesc, buf);
 }
 
+/* ---------- Radio tab ---------- */
+
+static void FillRadioList(void)
+{
+    int i;
+    SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
+    g_curPod = -1;
+    g_curEp = -1;
+    if (g_radioPod.epCount == 0) LoadRadioPodcast();
+    for (i = 0; i < g_radioPod.epCount; i++) {
+        const wchar_t *name = g_radioPod.eps[i].title;
+        SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)(name ? name : L"?"));
+    }
+    /* 清空右侧 */
+    SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
+    SetWindowTextW(g_editDesc, L"");
+}
+
+static void FillPodcastsFromMemory(void)
+{
+    int i;
+    SendMessageW(g_listPod, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < g_podCount; i++) {
+        const wchar_t *name = g_pods[i].title;
+        SendMessageW(g_listPod, LB_ADDSTRING, 0, (LPARAM)(name ? name : L"?"));
+    }
+    g_cacheRowHere = 0;
+    RefreshCachedEntry();
+}
+
+static void ShowRadioDetail(int idx)
+{
+    Episode *e;
+    if (idx < 0 || idx >= g_radioPod.epCount) return;
+    e = &g_radioPod.eps[idx];
+    SetWindowTextW(g_editDesc, e->title ? e->title : L"");
+}
+
+static void PlayRadioStation(int idx)
+{
+    Episode *e;
+    wchar_t msg[256];
+    if (idx < 0 || idx >= g_radioPod.epCount) return;
+    e = &g_radioPod.eps[idx];
+    if (g_downloading) AbortDownloadConnection();
+    PlayerStop();
+    swprintf(msg, 256, tr(TR_PLAYING_LIVE_FMT), e->title ? e->title : L"");
+    SetStatus(msg);
+    PlayerPlayFile(e->url, e->title);
+}
+
+static void SwitchTab(int tab)
+{
+    if (tab == g_activeTab) return;
+    g_activeTab = tab;
+    if (tab == 0) {
+        SendMessageW(g_btnTabPod,  WM_SETTEXT, 0, (LPARAM)L"Podcast");
+        SendMessageW(g_btnTabRadio, WM_SETTEXT, 0, (LPARAM)tr(TR_RADIO_TAB));
+        FillPodcastsFromMemory();
+        g_viewCached = 0;
+    } else {
+        SendMessageW(g_btnTabPod,  WM_SETTEXT, 0, (LPARAM)L"Podcast");
+        SendMessageW(g_btnTabRadio, WM_SETTEXT, 0, (LPARAM)tr(TR_RADIO_TAB));
+        g_cacheRowHere = 0;
+        g_viewCached = 0;
+        FillRadioList();
+    }
+    g_curPod = -1;
+    g_curEp = -1;
+}
+
 static void SelectPodcast(int idx)
 {
     if (idx == g_podCount) { SelectCachedView(); return; }
@@ -10696,22 +10802,30 @@ static void LayoutControls(HWND hwnd)
     totalW = W - 2*MARGIN - 2*GAP_W;
     PanelWidthsPx(totalW, &w1, &w2, &w3);
 
-    /* 播客列顶部工具栏（+/×/目录/手机），列表向下让出 28px */
+    /* 播客列顶部工具栏（+/×/目录/手机） */
     x = MARGIN;
     MoveWindow(g_btnAdd, x,      by, 24, 24, TRUE);
     MoveWindow(g_btnDel, x + 27, by, 24, 24, TRUE);
     MoveWindow(g_btnDir, x + 54, by, 24, 24, TRUE);
     if (g_btnPhone) MoveWindow(g_btnPhone, x + 81, by, 24, 24, TRUE);
+    /* Podcast / Radio tab row — 28px below toolbar, ListBox below tab row */
+    {
+        int tabY = by + 28;
+        int tabH = 26;
+        int tabW1 = 60, tabW2 = w1 - 4 - tabW1;
+        MoveWindow(g_btnTabPod,  x + 2,            tabY, tabW1, tabH, TRUE);
+        MoveWindow(g_btnTabRadio, x + 4 + tabW1,   tabY, tabW2, tabH, TRUE);
+    }
     /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
     {
         int sbw = DSB_W, sbh = DSB_W;
         /* 面板边框由父窗口 WM_PAINT 统一绘制，控件一律在面板内缩 2px，
          * 滚条带收进边框内（亮/暗主题同一套边框，不再依赖控件自身样式） */
-        g_rcPanel[0].left = x;           g_rcPanel[0].top = by + 28;
+        g_rcPanel[0].left = x;           g_rcPanel[0].top = by + 56;
         g_rcPanel[0].right = x + w1;     g_rcPanel[0].bottom = by + bh;
-        MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
-        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
+        MoveWindow(g_listPod, x + 2, by + 58, w1 - sbw - 4, bh - 60, TRUE);
+        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 58, sbw, bh - 60, TRUE);
         /* 剧集工具栏与播客工具栏同基线，放在面板边框之外：
          * 右侧是收藏/缓存开关，左侧过滤框自动填满剩余宽度 */
         {
@@ -14093,6 +14207,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_listPod = CreateWindowExW(0, L"LISTBOX", NULL,
             lbStyle | LBS_OWNERDRAWFIXED,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
+        /* Tab buttons (Podcast / Radio) above the podcast list */
+        g_btnTabPod = CreateWindowExW(0, L"BUTTON", L"Podcast",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0,0,0,0, hwnd, (HMENU)0, NULL, NULL);
+        g_btnTabRadio = CreateWindowExW(0, L"BUTTON", L"Radio",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0,0,0,0, hwnd, (HMENU)0, NULL, NULL);
         /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
         /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
@@ -15199,6 +15320,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_COMMAND:
+        /* Tab button clicks */
+        if (HIWORD(wParam) == BN_CLICKED) {
+            HWND src = (HWND)lParam;
+            if (src == g_btnTabPod)   { SwitchTab(0); return 0; }
+            if (src == g_btnTabRadio) { SwitchTab(1); return 0; }
+        }
         /* 任务栏缩略图工具栏按钮（THBN_CLICKED） */
         if (HIWORD(wParam) == THBN_CLICKED) {
             int tid = LOWORD(wParam);
@@ -15226,17 +15353,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (HIWORD(wParam) == LBN_SELCHANGE) {
             if (LOWORD(wParam) == IDC_LIST_POD) {
                 int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
-                /* 用户点选 = 已看：清掉该播客的新剧集角标
-                 *（程序式 LB_SETCURSEL 不触发 LBN_SELCHANGE，角标保留） */
-                if (sel >= 0 && sel < g_podCount && g_pods[sel].newCount > 0 &&
-                    g_pods[sel].feedUrl) {
-                    SeenSet(LastEpHash(g_pods[sel].feedUrl),
-                            PodMaxDateKey(&g_pods[sel]));
-                    g_pods[sel].newCount = 0;
-                    InvalidateRect(g_listPod, NULL, TRUE);
-                    UpdateTrayBadge();
+                if (g_activeTab == 1) {
+                    ShowRadioDetail(sel);
+                } else {
+                    /* 用户点选 = 已看：清掉该播客的新剧集角标
+                     *（程序式 LB_SETCURSEL 不触发 LBN_SELCHANGE，角标保留） */
+                    if (sel >= 0 && sel < g_podCount && g_pods[sel].newCount > 0 &&
+                        g_pods[sel].feedUrl) {
+                        SeenSet(LastEpHash(g_pods[sel].feedUrl),
+                                PodMaxDateKey(&g_pods[sel]));
+                        g_pods[sel].newCount = 0;
+                        InvalidateRect(g_listPod, NULL, TRUE);
+                        UpdateTrayBadge();
+                    }
+                    SelectPodcast(sel);
                 }
-                SelectPodcast(sel);
             } else if (LOWORD(wParam) == IDC_LIST_SUB) {
                 /* 点击字幕行跳转；程序式选行（g_subNoSeek）时跳过 */
                 if (!g_subNoSeek) {
@@ -15246,8 +15377,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } else if (HIWORD(wParam) == LBN_DBLCLK) {
             /* 双击播客：播橙色（上次听到）剧集，无记录则从第 1 集开始 */
-            if (LOWORD(wParam) == IDC_LIST_POD)
-                PlayPodcastDefault((int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0));
+            if (LOWORD(wParam) == IDC_LIST_POD) {
+                int sel = (int)SendMessageW(g_listPod, LB_GETCURSEL, 0, 0);
+                if (g_activeTab == 1) PlayRadioStation(sel);
+                else PlayPodcastDefault(sel);
+            }
         } else if (HIWORD(wParam) == BN_CLICKED) {
             int id = LOWORD(wParam);
             if (id == IDC_BTN_PLAY) PauseResume();
