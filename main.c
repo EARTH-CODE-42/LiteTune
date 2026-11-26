@@ -221,7 +221,8 @@ enum {
     IDC_SB_POD, IDC_SB_EP, IDC_SB_DESC, IDC_SB_EP_H,
     IDC_SB_SUB, IDC_SB_SUB_H,
     IDC_TAB_DESC,
-    IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_BTN_CHAPTERS, IDC_LIST_SUB
+    IDC_BTN_SUBVIEW, IDC_BTN_SUBTAB, IDC_BTN_SUBON, IDC_BTN_CHAPTERS, IDC_LIST_SUB,
+    IDC_BTN_TABPOD, IDC_BTN_TABRADIO
 };
 
 /* 添加订阅输入框（自建模态弹窗）控件 ID；模态循环 RunModalDlg 也用到 OK/CANCEL/LIST */
@@ -248,6 +249,7 @@ static int      g_cacheRowHere = 0;   /* 列表框里是否已追加“已缓存
 /* Radio tab: virtual podcast + hardcoded public Icecast/SHOUTcast MP3 streams */
 static int      g_activeTab = 0;       /* 0 = Podcast, 1 = Radio */
 static Podcast  g_radioPod;
+static int      g_radioPlayIdx = -1;   /* 正在播放的电台下标，-1 = 无 */
 static HWND     g_btnTabPod   = NULL;
 static HWND     g_btnTabRadio = NULL;
 
@@ -582,7 +584,7 @@ enum {
     TR_CLN_TITLE, TR_CLN_SCOPE_ORPHAN, TR_CLN_SCOPE_CUR, TR_CLN_SCOPE_ALL,
     TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META,
     TR_CLN_STAT_FMT, TR_CLN_NONE,
-    TR_RADIO, TR_RADIO_TAB, TR_PLAYING_LIVE_FMT,
+    TR_RADIO, TR_RADIO_TAB, TR_PLAYING_LIVE_FMT, TR_PODCAST_TAB,
     TR_N
 };
 
@@ -709,7 +711,7 @@ static const wchar_t *tr(int id)
         L"清理缓存", L"失效的播客（已删除订阅）", L"现有播客的缓存", L"全部缓存文件",
         L"音频", L"字幕", L"章节", L"封面", L"订阅信息",
         L"将删除 %d 个文件，共 %d.%d MB", L"没有可清理的文件",
-        L"网络电台", L"电台", L"正在收听：%s"
+        L"网络电台", L"电台", L"正在收听：%s", L"播客"
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -853,7 +855,7 @@ static const wchar_t *tr(int id)
         L"Clean cache", L"Invalid podcasts (unsubscribed)", L"Cache of current podcasts", L"All cache files",
         L"Audio", L"Subtitles", L"Chapters", L"Covers", L"Feed info",
         L"Will remove %d file(s), %d.%d MB", L"Nothing to clean",
-        L"Radio", L"Radio", L"Listening: %s"
+        L"Radio", L"Radio", L"Listening: %s", L"Podcasts"
     };
     return (g_lang ? en : zh)[id];
 }
@@ -8380,6 +8382,8 @@ static void PlayRadioStation(int idx)
     e = &g_radioPod.eps[idx];
     if (g_downloading) AbortDownloadConnection();
     PlayerStop();
+    g_radioPlayIdx = idx;
+    InvalidateRect(g_listPod, NULL, TRUE);
     swprintf(msg, 256, tr(TR_PLAYING_LIVE_FMT), e->title ? e->title : L"");
     SetStatus(msg);
     PlayerPlayFile(e->url, e->title);
@@ -8390,19 +8394,20 @@ static void SwitchTab(int tab)
     if (tab == g_activeTab) return;
     g_activeTab = tab;
     if (tab == 0) {
-        SendMessageW(g_btnTabPod,  WM_SETTEXT, 0, (LPARAM)L"Podcast");
-        SendMessageW(g_btnTabRadio, WM_SETTEXT, 0, (LPARAM)tr(TR_RADIO_TAB));
         FillPodcastsFromMemory();
         g_viewCached = 0;
     } else {
-        SendMessageW(g_btnTabPod,  WM_SETTEXT, 0, (LPARAM)L"Podcast");
-        SendMessageW(g_btnTabRadio, WM_SETTEXT, 0, (LPARAM)tr(TR_RADIO_TAB));
         g_cacheRowHere = 0;
         g_viewCached = 0;
         FillRadioList();
     }
     g_curPod = -1;
     g_curEp = -1;
+    /* 行高随 tab 变化（电台无封面，行更矮），并按新列宽重排 */
+    SendMessageW(g_listPod, LB_SETITEMHEIGHT, 0, (LPARAM)(tab == 1 ? 30 : 54));
+    LayoutControls(g_hwnd);
+    InvalidateRect(g_btnTabPod, NULL, TRUE);
+    InvalidateRect(g_btnTabRadio, NULL, TRUE);
 }
 
 static void SelectPodcast(int idx)
@@ -10690,14 +10695,20 @@ static void LayoutControls(HWND hwnd);   /* 前置声明 */
 /* 三面板像素宽度：简介隐藏时剧集吃掉简介那份宽度 */
 static void PanelWidthsPx(int totalW, int *w1, int *w2, int *w3)
 {
-    *w1 = totalW * g_w1perm / 1000;
+    int base1 = totalW * g_w1perm / 1000;
+    *w1 = base1;
+    if (g_activeTab == 1) {
+        /* 电台列表无封面，第一列收窄，多余宽度给中间播放列表 */
+        *w1 = base1 * 78 / 100;
+        if (*w1 < SPLIT_MINPX) *w1 = SPLIT_MINPX;
+    }
     if (g_descHidden) {
         /* 简介隐藏：剧集占据简介那份宽度，并连同原第二道缝隙一起占满，
          * 面板右缘与窗口右边距对齐（否则右侧会留下一条空白带） */
         *w2 = totalW - *w1 + GAP_W;
         *w3 = 0;
     } else {
-        *w2 = totalW * g_w2perm / 1000;
+        *w2 = totalW * g_w2perm / 1000 + (base1 - *w1);
         *w3 = totalW - *w1 - *w2;
     }
 }
@@ -10808,13 +10819,13 @@ static void LayoutControls(HWND hwnd)
     MoveWindow(g_btnDel, x + 27, by, 24, 24, TRUE);
     MoveWindow(g_btnDir, x + 54, by, 24, 24, TRUE);
     if (g_btnPhone) MoveWindow(g_btnPhone, x + 81, by, 24, 24, TRUE);
-    /* Podcast / Radio tab row — 28px below toolbar, ListBox below tab row */
+    /* 播客 / 电台 tab：与工具栏同一行，占据 4 个按钮之后的剩余宽度 */
     {
-        int tabY = by + 28;
-        int tabH = 26;
-        int tabW1 = 60, tabW2 = w1 - 4 - tabW1;
-        MoveWindow(g_btnTabPod,  x + 2,            tabY, tabW1, tabH, TRUE);
-        MoveWindow(g_btnTabRadio, x + 4 + tabW1,   tabY, tabW2, tabH, TRUE);
+        int tx = x + 108;                 /* 4 个 24px 按钮 + 间距之后 */
+        int tw = x + w1 - 2 - tx;
+        if (tw < 40) tw = 40;
+        MoveWindow(g_btnTabPod,   tx,                     by, tw / 2,      24, TRUE);
+        MoveWindow(g_btnTabRadio, tx + tw / 2,            by, tw - tw / 2, 24, TRUE);
     }
     /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
@@ -10822,10 +10833,10 @@ static void LayoutControls(HWND hwnd)
         int sbw = DSB_W, sbh = DSB_W;
         /* 面板边框由父窗口 WM_PAINT 统一绘制，控件一律在面板内缩 2px，
          * 滚条带收进边框内（亮/暗主题同一套边框，不再依赖控件自身样式） */
-        g_rcPanel[0].left = x;           g_rcPanel[0].top = by + 56;
+        g_rcPanel[0].left = x;           g_rcPanel[0].top = by + 28;
         g_rcPanel[0].right = x + w1;     g_rcPanel[0].bottom = by + bh;
-        MoveWindow(g_listPod, x + 2, by + 58, w1 - sbw - 4, bh - 60, TRUE);
-        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 58, sbw, bh - 60, TRUE);
+        MoveWindow(g_listPod, x + 2, by + 30, w1 - sbw - 4, bh - 32, TRUE);
+        if (g_vsPod) MoveWindow(g_vsPod, x + w1 - 2 - sbw, by + 30, sbw, bh - 32, TRUE);
         /* 剧集工具栏与播客工具栏同基线，放在面板边框之外：
          * 右侧是收藏/缓存开关，左侧过滤框自动填满剩余宽度 */
         {
@@ -14207,13 +14218,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_listPod = CreateWindowExW(0, L"LISTBOX", NULL,
             lbStyle | LBS_OWNERDRAWFIXED,
             0,0,0,0, hwnd, (HMENU)IDC_LIST_POD, NULL, NULL);
-        /* Tab buttons (Podcast / Radio) above the podcast list */
-        g_btnTabPod = CreateWindowExW(0, L"BUTTON", L"Podcast",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,0,0,0, hwnd, (HMENU)0, NULL, NULL);
-        g_btnTabRadio = CreateWindowExW(0, L"BUTTON", L"Radio",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            0,0,0,0, hwnd, (HMENU)0, NULL, NULL);
+        /* Tab 按钮：播客 / 电台（与工具栏同一行，自绘同右侧简介/章节 tab） */
+        g_btnTabPod = CreateWindowExW(0, L"BUTTON", tr(TR_PODCAST_TAB),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_TABPOD, NULL, NULL);
+        g_btnTabRadio = CreateWindowExW(0, L"BUTTON", tr(TR_RADIO_TAB),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0,0,0,0, hwnd, (HMENU)IDC_BTN_TABRADIO, NULL, NULL);
+        SubclassForFontWheel(g_btnTabPod);
+        SubclassForFontWheel(g_btnTabRadio);
         /* 行高 54px 由 WM_MEASUREITEM 统一设置 */
 
         /* 剧集：ListView 报表视图（标题/日期/时长，横向可滚动，列头可排序） */
@@ -14444,7 +14457,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (mi->CtlID == IDC_LIST_POD) {
-            mi->itemHeight = 54;
+            mi->itemHeight = (g_activeTab == 1) ? 30 : 54;
             return TRUE;
         }
         if (mi->CtlID == IDC_LIST_SUB) {
@@ -14472,16 +14485,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (di->CtlType == ODT_BUTTON) {
-            /* 三个切换 tab：简介 / 章节 / 字幕（自绘以适配暗色） */
+            /* 切换 tab：简介 / 章节 / 字幕 / 播客 / 电台（自绘以适配暗色） */
             if (di->CtlID == IDC_BTN_SUBVIEW || di->CtlID == IDC_BTN_SUBTAB ||
-                di->CtlID == IDC_BTN_CHAPTERS) {
+                di->CtlID == IDC_BTN_CHAPTERS ||
+                di->CtlID == IDC_BTN_TABPOD || di->CtlID == IDC_BTN_TABRADIO) {
                 RECT rc = di->rcItem;
                 wchar_t txt[32];
                 HFONT oldf;
                 int pressed = (di->itemState & ODS_SELECTED) != 0;
                 int on = (di->CtlID == IDC_BTN_SUBVIEW) ? (g_subInDesc == 0)
                        : (di->CtlID == IDC_BTN_SUBTAB)  ? (g_subInDesc == 1)
-                       : (g_subInDesc == 2);
+                       : (di->CtlID == IDC_BTN_CHAPTERS) ? (g_subInDesc == 2)
+                       : (di->CtlID == IDC_BTN_TABPOD) ? (g_activeTab == 0)
+                       : (g_activeTab == 1);
                 int active = pressed || on;   /* 鼠标按下 OR 逻辑激活 → sunken */
                 FillRectColor(di->hDC, &rc, active ? ThBtnPressed() : ThPanel());
                 DrawEdge(di->hDC, &rc, active ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
@@ -14614,6 +14630,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (di->CtlID != IDC_LIST_POD || di->itemID == (UINT)-1) break;
+        if (g_activeTab == 1) {
+            /* 电台 tab：无封面，只画标题；正在播放的加主色竖条与主色文字 */
+            int idx = (int)di->itemID;
+            int isSel = (di->itemState & ODS_SELECTED) != 0;
+            int isPlaying = (idx == g_radioPlayIdx);
+            RECT rc = di->rcItem;
+            const wchar_t *t = (idx >= 0 && idx < g_radioPod.epCount)
+                             ? g_radioPod.eps[idx].title : NULL;
+            HFONT oldf;
+            FillRectColor(di->hDC, &rc, isSel ? ThSel() : ThPanel());
+            if (isPlaying) {
+                RECT bar = { rc.left + 2, rc.top + 5, rc.left + 5, rc.bottom - 5 };
+                FillRectColor(di->hDC, &bar, ThAccent());
+            }
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, isPlaying ? ThAccent() : ThText());
+            rc.left += 10;
+            rc.right -= 6;
+            oldf = (HFONT)SelectObject(di->hDC, g_font);
+            DrawTextW(di->hDC, t ? t : L"?", -1, &rc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(di->hDC, oldf);
+            break;
+        }
         if ((int)di->itemID > g_podCount) break;
         {
             int isCache = ((int)di->itemID == g_podCount);
