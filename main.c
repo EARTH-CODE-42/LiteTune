@@ -253,6 +253,29 @@ static int      g_radioPlayIdx = -1;   /* 正在播放的电台下标，-1 = 无
 static HWND     g_btnTabPod   = NULL;
 static HWND     g_btnTabRadio = NULL;
 
+/* ICY 元数据线程：独立连接，不干扰 MF 播放 */
+static HANDLE   g_icyThread   = NULL;
+static volatile LONG g_icyStop = 0;
+static volatile HINTERNET g_icyReq = NULL; /* 给另一个线程强制 WinHttpCloseHandle 用 */
+static wchar_t *g_icyUrl      = NULL;  /* 线程启动时的 URL 副本，线程消费后 free */
+static int      g_icyCurEp    = -1;    /* 线程绑定的电台下标，UI 收到消息时校验一致性 */
+static wchar_t  g_icyCurTitle[512] = {0}; /* 最新一首（UI 线程写，用于状态栏/章节追加去重） */
+static int      g_icyCurTitleIdx  = -1;   /* 对应章节列表行号 */
+struct IcyHeaders {                     /* UI 线程消费 */
+    wchar_t name[128];      /* icy-name 或 audio-source-name */
+    wchar_t genre[128];     /* icy-genre */
+    wchar_t desc[256];      /* icy-description */
+    wchar_t home[256];      /* icy-url */
+    wchar_t pub[16];        /* icy-pub 0/1 */
+    wchar_t br[16];         /* icy-br（码率 kbps） */
+    wchar_t ctype[64];      /* content-type */
+    int     metaint;        /* icy-metaint，供 UI 层日志/调试 */
+};
+struct IcyMeta {                         /* UI 线程消费后 free */
+    wchar_t artist[256];   /* 从 StreamTitle 解析：Artist - Title，缺 Artist 时留空 */
+    wchar_t title[256];
+};
+
 static HWND     g_hwnd;   /* 主窗口句柄 */
 static HFONT    g_font;          /* 8pt+级别 常规 */
 static HFONT    g_fontBold;      /* 8pt+级别 加粗（播客标题） */
@@ -497,6 +520,9 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_BATCH_PROGRESS (WM_APP + 16) /* wParam=当前集百分比 0-100 */
 #define WM_APP_SEARCH_DONE    (WM_APP + 17) /* lParam=SearchResult* */
 #define WM_APP_CACHE_NOT_WRITABLE (WM_APP + 18)  /* 缓存目录不可写（UI 线程提示） */
+#define WM_APP_ICY_META     (WM_APP + 21) /* lParam=IcyMeta*（解析好的帧，UI 线程消费后 free） */
+#define WM_APP_ICY_HEADERS  (WM_APP + 22) /* lParam=IcyHeaders*（电台响应头信息） */
+#define WM_APP_ICY_STOP     (WM_APP + 23) /* wParam=0（被动停：切台/停止）, 1（主动关闭） */
 
 /* 拖放（OLE IDropTarget）：悬停行与拖放状态，实现见 WndProc 之前 */
 static IDropTarget *g_pDrop;             /* 全局拖放目标（进程内单例） */
@@ -7046,8 +7072,12 @@ static void PlayerPlayFile(const wchar_t *path, const wchar_t *title)
     UpdateWindowTitle();
 }
 
+static void IcyStop(void);
+static void IcyStart(int ep, const wchar_t *url);
+
 static void PlayerStop(void)
 {
+    IcyStop();
     if (g_player) g_player->lpVtbl->Stop(g_player);
     g_playState = 0;
     g_dur100ns = 0;
@@ -8378,6 +8408,60 @@ static void ShowRadioDetail(int idx)
     SetWindowTextW(g_editDesc, e->title ? e->title : L"");
 }
 
+/* ICY 线程回传的响应头 → 右侧简介文本（多行拼好） */
+static int ShowRadioDetailHeaders(const struct IcyHeaders *hd)
+{
+    if (!hd) return 0;
+    {
+        wchar_t buf[1024];
+        int off = 0;
+        buf[0] = 0;
+        if (hd->name[0])   off += swprintf(buf + off, 1024 - off, L"%ls\r\n", hd->name);
+        if (hd->desc[0])   off += swprintf(buf + off, 1024 - off, L"%ls\r\n\r\n", hd->desc);
+        if (hd->genre[0])  off += swprintf(buf + off, 1024 - off, L"类型: %ls\r\n", hd->genre);
+        if (hd->br[0])     off += swprintf(buf + off, 1024 - off, L"码率: %ls kbps\r\n", hd->br);
+        if (hd->ctype[0])  off += swprintf(buf + off, 1024 - off, L"格式: %ls\r\n", hd->ctype);
+        if (hd->home[0])   off += swprintf(buf + off, 1024 - off, L"主页: %ls\r\n", hd->home);
+        if (hd->pub[0])    off += swprintf(buf + off, 1024 - off, L"公开: %ls\r\n", hd->pub);
+        if (off > 0) SetWindowTextW(g_editDesc, buf);
+        return (off > 0);
+    }
+}
+
+/* 把当前播放曲目追加到中间剧集 ListView（当作"当天播放列表"）
+ * 时间戳用当前本地时间。 */
+static void RadioAppendCurrentTrack(const wchar_t *artist, const wchar_t *title)
+{
+    SYSTEMTIME st;
+    wchar_t ts[32];
+    LVITEMW li;
+    int idx;
+
+    GetLocalTime(&st);
+    swprintf(ts, 32, L"%02d:%02d", st.wHour, st.wMinute);
+
+    ZeroMemory(&li, sizeof(li));
+    li.mask = LVIF_TEXT;
+    li.iItem = INT_MAX;
+    li.iSubItem = 0;
+    wchar_t first[256];
+    if (artist && artist[0])
+        swprintf(first, 256, L"%s - %s", artist, title ? title : L"?");
+    else
+        wcscpy_s(first, 256, title ? title : L"?");
+    li.pszText = first;
+    idx = (int)SendMessageW(g_listEp, LVM_INSERTITEMW, 0, (LPARAM)&li);
+    if (idx >= 0) {
+        LVITEMW li2;
+        ZeroMemory(&li2, sizeof(li2));
+        li2.mask = LVIF_TEXT;
+        li2.iItem = idx;
+        li2.iSubItem = 1;
+        li2.pszText = ts;
+        SendMessageW(g_listEp, LVM_SETITEMW, 0, (LPARAM)&li2);
+    }
+}
+
 static void PlayRadioStation(int idx)
 {
     Episode *e;
@@ -8386,11 +8470,294 @@ static void PlayRadioStation(int idx)
     e = &g_radioPod.eps[idx];
     if (g_downloading) AbortDownloadConnection();
     PlayerStop();
+    IcyStart(idx, e->url);
     g_radioPlayIdx = idx;
     InvalidateRect(g_listPod, NULL, TRUE);
     swprintf(msg, 256, tr(TR_PLAYING_LIVE_FMT), e->title ? e->title : L"");
     SetStatus(msg);
     PlayerPlayFile(e->url, e->title);
+}
+
+
+/* ================= ICY 元数据线程 ================= */
+
+/* 解析 StreamTitle='Artist - Title'; 或 StreamTitle='Title';
+ * 输入是 UTF-8 帧内容（去掉帧长前缀后的原始字节，可能带多帧），
+ * 只取第一对 StreamTitle=...，返回 0=无有效标题，1=成功。
+ * Artist/Title 以 UTF-16 形式写入 IcyMeta 结构。 */
+static int IcyParseStreamTitle(const char *frame, int frameLen, struct IcyMeta *out)
+{
+    const char *p, *eq, *q;
+    int n;
+    ZeroMemory(out, sizeof(*out));
+    if (!frame || frameLen <= 0) return 0;
+    /* 不依赖 strcasestr（GNU 扩展），自己做不区分大小写搜索 */
+    {
+        const char *needle = "StreamTitle=";
+        int needleLen = (int)strlen(needle);
+        int remain = frameLen;
+        char f, nf;
+        p = NULL;
+        while (remain >= needleLen) {
+            int match = 1;
+            for (int i = 0; i < needleLen; i++) {
+                f = frame[i]; nf = needle[i];
+                if (f >= 'A' && f <= 'Z') f += 32;
+                if (nf >= 'A' && nf <= 'Z') nf += 32;
+                if (f != nf) { match = 0; break; }
+            }
+            if (match) { p = frame; break; }
+            frame++; remain--;
+        }
+    }
+    if (!p) return 0;
+    eq = p + 12;   /* strlen("StreamTitle=") */
+    if (*eq != '\'') return 0;
+    eq++;
+    q = memchr(eq, '\'', (size_t)(frameLen - (int)(eq - frame)));
+    if (!q) return 0;
+    n = (int)(q - eq);
+    if (n <= 0) return 0;
+    /* UTF-8 → UTF-16，然后按" - "拆 Artist/Title */
+    {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, eq, n, NULL, 0);
+        wchar_t *wbuf;
+        if (wn <= 0) return 0;
+        wbuf = (wchar_t*)malloc(wn * sizeof(wchar_t));
+        if (!wbuf) return 0;
+        MultiByteToWideChar(CP_UTF8, 0, eq, n, wbuf, wn);
+        /* 找 " - "（前后空格，中间短横）；找不到就整个当 Title */
+        {
+            wchar_t *sep = wcsstr(wbuf, L" - ");
+            if (sep) {
+                int an = (int)(sep - wbuf);
+                wcsncpy_s(out->artist, 256, wbuf, an);
+                wcscpy_s(out->title, 256, sep + 3);
+            } else {
+                out->artist[0] = 0;
+                wcsncpy_s(out->title, 256, wbuf, wn);
+            }
+        }
+        free(wbuf);
+    }
+    if (out->title[0] == 0 && out->artist[0] == 0) return 0;
+    return 1;
+}
+
+/* 从 WinHTTP 读一个响应头字段（值返回 UTF-16，调用方保证 dst 够大） */
+static int IcyQueryHeader(HINTERNET hReq, DWORD flag, wchar_t *dst, int dstN)
+{
+    DWORD sz = (DWORD)(dstN * sizeof(wchar_t));
+    DWORD idx = 0;
+    BOOL ok = WinHttpQueryHeaders(hReq, flag, NULL, dst, &sz, &idx);
+    if (!ok || sz == 0 || dst[0] == 0) { dst[0] = 0; return 0; }
+    return 1;
+}
+
+static DWORD WINAPI IcyThread(LPVOID param)
+{
+    HINTERNET hSes = NULL, hCon = NULL, hReq = NULL;
+    wchar_t *url = g_icyUrl;
+    struct IcyHeaders hdrs;
+    volatile LONG *stopFlag = &g_icyStop;
+    URL_COMPONENTS uc;
+    int metaint = 0;
+    BYTE audioBuf[8192];
+    int audioLeft = 0;          /* audioBuf 里还没吃掉的字节数 */
+    DWORD nRead;
+    (void)param;
+
+    g_icyUrl = NULL;
+    if (!url || !*url) return 0;
+
+    ZeroMemory(&uc, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.dwSchemeLength = (DWORD)-1;
+    uc.dwHostNameLength = (DWORD)-1;
+    uc.dwUrlPathLength = (DWORD)-1;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) goto done;
+
+    hSes = WinHttpOpen(L"LiteTune/1.0 +Icy-MetaData",
+                       WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSes) goto done;
+
+    hCon = WinHttpConnect(hSes, uc.lpszHostName,
+        uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
+                                            : INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!hCon) goto done;
+
+    hReq = WinHttpOpenRequest(hCon, L"GET", uc.lpszUrlPath, NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (!hReq) goto done;
+    /* 暴露给 UI 线程强制关闭，防止 IcyStop 时 WinHttpReadData 卡网络读 */
+    g_icyReq = hReq;
+
+    /* 禁用自动解压（元数据帧紧跟原始音频，解压后位置对不上） */
+    { DWORD zero = 0; WinHttpSetOption(hReq, WINHTTP_OPTION_DECOMPRESSION, &zero, sizeof(zero)); }
+    /* 让 WinHttpReadData 最多卡 3 秒，线程才能及时响应 stopFlag */
+    { DWORD t = 3000; WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t)); }
+
+    /* 请求 ICY 元数据 */
+    if (!WinHttpAddRequestHeaders(hReq, L"Icy-MetaData: 1\r\n", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD))
+        goto done;
+
+    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto done;
+    if (!WinHttpReceiveResponse(hReq, NULL)) goto done;
+
+    {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            NULL, &status, &sz, NULL);
+        if (status < 200 || status >= 300) goto done;
+    }
+
+    /* 回读响应头：icy-metaint 是关键，没有就说明服务器不支持元数据，直接退出线程
+     * （不影响 MF 播放，只是没曲目信息）。
+     * MSDN 要求 WINHTTP_QUERY_CUSTOM 配合的头名字串必须以双 \0 结尾
+     * （一个终止头名，一个终止整个数组）。 */
+    {
+        wchar_t hname[] = L"icy-metaint\0";   /* 编译时会得到 "icy-metaint" + \0 + \0 */
+        DWORD needed = 0;
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, hname, NULL, &needed, NULL);
+        if (needed > 0) {
+            DWORD got = needed;
+            wchar_t *val = (wchar_t*)malloc(needed);
+            if (val && WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, hname, val, &got, NULL))
+                metaint = _wtoi(val);
+            free(val);
+        }
+    }
+    /* 先拿电台信息头（即使服务器不支持元数据，headers 也能填简介） */
+    ZeroMemory(&hdrs, sizeof(hdrs));
+    {
+        struct { const wchar_t *name; int offset; } map[] = {
+            { L"icy-name\0",         offsetof(struct IcyHeaders, name)   },
+            { L"icy-genre\0",        offsetof(struct IcyHeaders, genre)  },
+            { L"icy-description\0",  offsetof(struct IcyHeaders, desc)   },
+            { L"icy-url\0",          offsetof(struct IcyHeaders, home)   },
+            { L"icy-pub\0",          offsetof(struct IcyHeaders, pub)    },
+            { L"icy-br\0",           offsetof(struct IcyHeaders, br)     },
+            { NULL, 0 }
+        };
+        int i;
+        for (i = 0; map[i].name; i++) {
+            wchar_t *val = NULL;
+            DWORD needed = 0;
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, map[i].name, NULL, &needed, NULL);
+            if (needed > 0) {
+                DWORD got = needed;
+                val = (wchar_t*)malloc(needed);
+                if (val && WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, map[i].name, val, &got, NULL)) {
+                    wchar_t *dst = (wchar_t*)((char*)&hdrs + map[i].offset);
+                    wcsncpy_s(dst, 128, val, _TRUNCATE);
+                }
+                free(val);
+            }
+        }
+    }
+    {
+        wchar_t ctype[64];
+        if (IcyQueryHeader(hReq, WINHTTP_QUERY_CONTENT_TYPE, ctype, 64))
+            wcsncpy_s(hdrs.ctype, 64, ctype, _TRUNCATE);
+    }
+    hdrs.metaint = metaint;
+
+    if (g_hwnd) {
+        struct IcyHeaders *out = (struct IcyHeaders*)malloc(sizeof(struct IcyHeaders));
+        if (out) { *out = hdrs; PostMessageW(g_hwnd, WM_APP_ICY_HEADERS, 0, (LPARAM)out); }
+    }
+
+    /* ---------- 主循环：按 metaint 分段读音频 + 元数据帧 ----------
+     * 流结构：每 metaint 字节原始音频 + 1 字节帧长 L + L*16 字节元数据帧 */
+    audioLeft = 0;
+
+    while (!InterlockedCompareExchange(stopFlag, 0, 0) && g_hwnd) {
+        /* 目标：从 socket 里读 metaint 字节音频（不够就分多次 WinHttpReadData 累计）
+         * 然后读 1 字节帧长 L，再读 L*16 字节帧 */
+        {
+            int need = metaint;
+            while (need > 0 && !InterlockedCompareExchange(stopFlag, 0, 0)) {
+                if (audioLeft == 0) {
+                    if (!WinHttpReadData(hReq, audioBuf, sizeof(audioBuf), &nRead) || nRead == 0)
+                        goto done;
+                    audioLeft = (int)nRead;
+                }
+                int take = (need > audioLeft) ? audioLeft : need;
+                /* 这里我们不真正"消费"音频，只是计数。元数据帧紧跟位置计算正确就行：
+                 * 读到 metaint 后停止，下一次读的前 1 字节就是帧长 */
+                audioLeft -= take;
+                need -= take;
+            }
+            if (InterlockedCompareExchange(stopFlag, 0, 0)) goto done;
+        }
+
+        /* 读帧长 1 字节 */
+        {
+            BYTE lb;
+            DWORD n = 0;
+            if (!WinHttpReadData(hReq, &lb, 1, &n) || n == 0) goto done;
+            if (lb == 0) { continue; }   /* 本帧无元数据，循环回去读下一段 */
+            {
+                int frameBytes = lb * 16;
+                char *frame = (char*)malloc(frameBytes);
+                if (!frame) goto done;
+                int got = 0;
+                while (got < frameBytes && !InterlockedCompareExchange(stopFlag, 0, 0)) {
+                    DWORD nr = 0;
+                    if (!WinHttpReadData(hReq, frame + got, frameBytes - got, &nr) || nr == 0) break;
+                    got += (int)nr;
+                }
+                if (got > 0) {
+                    struct IcyMeta meta;
+                    if (IcyParseStreamTitle(frame, got, &meta) && g_hwnd) {
+                        struct IcyMeta *out = (struct IcyMeta*)malloc(sizeof(struct IcyMeta));
+                        if (out) { *out = meta; PostMessageW(g_hwnd, WM_APP_ICY_META, 0, (LPARAM)out); }
+                    }
+                }
+                free(frame);
+                if (InterlockedCompareExchange(stopFlag, 0, 0)) goto done;
+            }
+        }
+    }
+
+done:
+    if (hReq)   WinHttpCloseHandle(hReq);
+    if (hCon)   WinHttpCloseHandle(hCon);
+    if (hSes)   WinHttpCloseHandle(hSes);
+    free(url);
+    return 0;
+}
+
+static void IcyStop(void)
+{
+    /* 不在 UI 线程 Wait！只设标志 + 强制关闭请求句柄（让 ICY 线程的 WinHttpReadData
+     * 立刻返回 FALSE），线程自己会走到 done 路径退出。 */
+    HINTERNET h;
+    InterlockedExchange(&g_icyStop, 1);
+    h = (HINTERNET)InterlockedExchangePointer((PVOID*)&g_icyReq, NULL);
+    if (h) WinHttpCloseHandle(h);
+}
+
+static void IcyStart(int ep, const wchar_t *url)
+{
+    /* 如果上一个线程还在跑（被强制关句柄后收尾），最多等一次让它干净退出 */
+    if (g_icyThread) {
+        InterlockedExchange(&g_icyStop, 1);
+        WaitForSingleObject(g_icyThread, 1500);   /* 这次 Wait 在 PlayRadioStation 之前，UI 还没被用户操作卡 */
+        CloseHandle(g_icyThread);
+        g_icyThread = NULL;
+    }
+    if (!url || !*url) return;
+    InterlockedExchange(&g_icyStop, 0);
+    g_icyReq = NULL;
+    g_icyUrl = _wcsdup(url);
+    g_icyCurEp = ep;
+    g_icyCurTitle[0] = 0;
+    g_icyCurTitleIdx = -1;
+    g_icyThread = CreateThread(NULL, 0, IcyThread, NULL, 0, NULL);
 }
 
 static void SwitchTab(int tab)
@@ -13581,7 +13948,7 @@ static void UpdatePodTipFromPoint(POINT pt)
     int idx;
     RECT irc;
     POINT screen;
-    if (g_podMode != 0) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    if (g_activeTab == 1 || g_podMode != 0) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
     idx = (int)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
     if (idx < 0 || idx >= g_podCount) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
     if (idx != g_tipPodIdx) {
@@ -16049,6 +16416,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             L"缓存目录不可写：\r\n%s\r\n\r\n已自动回退到默认目录。\r\n可在设置里重新选择缓存目录。", dir);
         SetStatus(L"缓存目录不可写，已回退默认");
         MessageBoxTh(g_hwnd, msg, L"LiteTune", MB_OK | MB_ICONWARNING);
+        return 0;
+    }
+
+    case WM_APP_ICY_HEADERS: {
+        /* ICY 线程回传电台响应头，填到右侧简介 */
+        struct IcyHeaders *hd = (struct IcyHeaders *)lParam;
+        if (!hd) return 0;
+        if (g_activeTab == 1 && g_radioPlayIdx >= 0 &&
+            ShowRadioDetailHeaders(hd)) {
+            /* ShowRadioDetailHeaders 内部拼好描述文本，SetWindowTextW(g_editDesc, ...) */
+        }
+        free(hd);
+        return 0;
+    }
+
+    case WM_APP_ICY_META: {
+        /* ICY 线程回传 StreamTitle，UI 线程追加到中间曲目历史 + 刷新状态栏 */
+        struct IcyMeta *m = (struct IcyMeta *)lParam;
+        wchar_t combined[512];
+        if (!m) return 0;
+        if (g_activeTab != 1 || g_radioPlayIdx < 0) { free(m); return 0; }
+
+        /* 去重：同一首不重复追加 */
+        if (m->artist[0])
+            swprintf(combined, 512, L"%s - %s", m->artist, m->title);
+        else
+            wcscpy_s(combined, 512, m->title);
+
+        if (wcscmp(g_icyCurTitle, combined) != 0) {
+            wcscpy_s(g_icyCurTitle, 512, combined);
+            /* 把当前曲目显示到状态栏 */
+            SetStatus(combined);
+            /* 追加到中间曲目列表（当作当天播放历史） */
+            RadioAppendCurrentTrack(m->artist, m->title);
+        }
+        free(m);
         return 0;
     }
 
