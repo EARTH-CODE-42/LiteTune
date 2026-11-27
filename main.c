@@ -8021,6 +8021,7 @@ static void SetEpisodeColumns(int cached)
 /* 当前剧集列表对应的播客（可能是“已缓存”虚拟播客） */
 static Podcast* ActivePodcast(void)
 {
+    if (g_activeTab == 1) return &g_radioPod;
     if (g_viewCached) return &g_cachePod;
     if (g_curPod >= 0 && g_curPod < g_podCount) return &g_pods[g_curPod];
     return NULL;
@@ -8371,6 +8372,9 @@ static void ShowRadioDetail(int idx)
     Episode *e;
     if (idx < 0 || idx >= g_radioPod.epCount) return;
     e = &g_radioPod.eps[idx];
+    /* 电台 tab 下中间剧集列还没有"曲目历史"数据源，先清空，避免 ActivePodcast
+     * 意外指向播客时被 FillEpisodeList 串味 */
+    SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     SetWindowTextW(g_editDesc, e->title ? e->title : L"");
 }
 
@@ -8403,9 +8407,11 @@ static void SwitchTab(int tab)
     }
     g_curPod = -1;
     g_curEp = -1;
-    /* 行高随 tab 变化（电台无封面，行更矮），并按新列宽重排 */
-    SendMessageW(g_listPod, LB_SETITEMHEIGHT, 0, (LPARAM)(tab == 1 ? 30 : 54));
-    LayoutControls(g_hwnd);
+    /* ListBox 行高随 tab 变化：WM_MEASUREITEM 只在创建时触发一次，
+     * 切 tab 时靠 LB_SETITEMHEIGHT 覆盖；这是改内部数据，不动 LayoutControls */
+    SendMessageW(g_listPod, LB_SETITEMHEIGHT, 0,
+                 (LPARAM)(g_activeTab == 1 ? 26 : 54));
+    InvalidateRect(g_listPod, NULL, TRUE);
     InvalidateRect(g_btnTabPod, NULL, TRUE);
     InvalidateRect(g_btnTabRadio, NULL, TRUE);
 }
@@ -10695,20 +10701,14 @@ static void LayoutControls(HWND hwnd);   /* 前置声明 */
 /* 三面板像素宽度：简介隐藏时剧集吃掉简介那份宽度 */
 static void PanelWidthsPx(int totalW, int *w1, int *w2, int *w3)
 {
-    int base1 = totalW * g_w1perm / 1000;
-    *w1 = base1;
-    if (g_activeTab == 1) {
-        /* 电台列表无封面，第一列收窄，多余宽度给中间播放列表 */
-        *w1 = base1 * 78 / 100;
-        if (*w1 < SPLIT_MINPX) *w1 = SPLIT_MINPX;
-    }
+    *w1 = totalW * g_w1perm / 1000;
     if (g_descHidden) {
         /* 简介隐藏：剧集占据简介那份宽度，并连同原第二道缝隙一起占满，
          * 面板右缘与窗口右边距对齐（否则右侧会留下一条空白带） */
         *w2 = totalW - *w1 + GAP_W;
         *w3 = 0;
     } else {
-        *w2 = totalW * g_w2perm / 1000 + (base1 - *w1);
+        *w2 = totalW * g_w2perm / 1000;
         *w3 = totalW - *w1 - *w2;
     }
 }
@@ -10813,19 +10813,19 @@ static void LayoutControls(HWND hwnd)
     totalW = W - 2*MARGIN - 2*GAP_W;
     PanelWidthsPx(totalW, &w1, &w2, &w3);
 
-    /* 播客列顶部工具栏（+/×/目录/手机） */
+    /* 播客 / 电台 tab 置于工具栏最左侧，随第一列缩放（同右侧简介/章节 tab 风格） */
     x = MARGIN;
-    MoveWindow(g_btnAdd, x,      by, 24, 24, TRUE);
-    MoveWindow(g_btnDel, x + 27, by, 24, 24, TRUE);
-    MoveWindow(g_btnDir, x + 54, by, 24, 24, TRUE);
-    if (g_btnPhone) MoveWindow(g_btnPhone, x + 81, by, 24, 24, TRUE);
-    /* 播客 / 电台 tab：与工具栏同一行，占据 4 个按钮之后的剩余宽度 */
     {
-        int tx = x + 108;                 /* 4 个 24px 按钮 + 间距之后 */
-        int tw = x + w1 - 2 - tx;
-        if (tw < 40) tw = 40;
-        MoveWindow(g_btnTabPod,   tx,                     by, tw / 2,      24, TRUE);
-        MoveWindow(g_btnTabRadio, tx + tw / 2,            by, tw - tw / 2, 24, TRUE);
+        int fixedBtns = 105;   /* +×目录手机 四个 24px + 间距，共 4*24+3*3 = 105 */
+        int avail = w1 - fixedBtns - 4;
+        if (avail < 40) avail = 40;
+        int tabW = avail / 2;
+        MoveWindow(g_btnTabPod,   x,               by, tabW,           24, TRUE);
+        MoveWindow(g_btnTabRadio, x + tabW + 2,    by, avail - tabW,   24, TRUE);
+        MoveWindow(g_btnAdd, x + avail + 4,         by, 24, 24, TRUE);
+        MoveWindow(g_btnDel, x + avail + 31,        by, 24, 24, TRUE);
+        MoveWindow(g_btnDir, x + avail + 58,        by, 24, 24, TRUE);
+        if (g_btnPhone) MoveWindow(g_btnPhone, x + avail + 85, by, 24, 24, TRUE);
     }
     /* 滚动条带预留：列表让出窄条宽度，自绘条放在旁边；
      * 内容不超范围时条会自动隐藏（SyncScrollBar），带子露出背景 */
@@ -14457,7 +14457,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
         if (mi->CtlID == IDC_LIST_POD) {
-            mi->itemHeight = (g_activeTab == 1) ? 30 : 54;
+            mi->itemHeight = (g_activeTab == 1) ? 26 : 54;
             return TRUE;
         }
         if (mi->CtlID == IDC_LIST_SUB) {
