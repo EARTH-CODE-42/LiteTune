@@ -250,17 +250,22 @@ static int      g_cacheRowHere = 0;   /* 列表框里是否已追加“已缓存
 static int      g_activeTab = 0;       /* 0 = Podcast, 1 = Radio */
 static Podcast  g_radioPod;
 static int      g_radioPlayIdx = -1;   /* 正在播放的电台下标，-1 = 无 */
+static int      g_radioProbeIdx = -1;  /* 正在探测连通性的电台下标 */
 static HWND     g_btnTabPod   = NULL;
 static HWND     g_btnTabRadio = NULL;
 
 /* ICY 元数据线程：独立连接，不干扰 MF 播放 */
 static HANDLE   g_icyThread   = NULL;
-static volatile LONG g_icyStop = 0;
-static volatile HINTERNET g_icyReq = NULL; /* 给另一个线程强制 WinHttpCloseHandle 用 */
-static wchar_t *g_icyUrl      = NULL;  /* 线程启动时的 URL 副本，线程消费后 free */
-static int      g_icyCurEp    = -1;    /* 线程绑定的电台下标，UI 收到消息时校验一致性 */
+static HANDLE   g_icyReap[4];          /* 已停但可能还没退干净的线程句柄，攒够就回收 */
+static int      g_icyReapN    = 0;
+struct IcyJob {                        /* 每次播放一个 job，自带停止标志，避免新旧线程共用标志 */
+    volatile LONG stop;
+    wchar_t      *url;
+    int           ep;
+};
+static struct IcyJob *g_icyJob = NULL;
 static wchar_t  g_icyCurTitle[512] = {0}; /* 最新一首（UI 线程写，用于状态栏/章节追加去重） */
-static int      g_icyCurTitleIdx  = -1;   /* 对应章节列表行号 */
+
 struct IcyHeaders {                     /* UI 线程消费 */
     wchar_t name[128];      /* icy-name 或 audio-source-name */
     wchar_t genre[128];     /* icy-genre */
@@ -349,6 +354,7 @@ static HWND     g_hwndPodTip = NULL;     /* 自定义 tooltip：播客封面+标
 static HWND     g_hwndEpTip = NULL;      /* 剧集列表 tracking tooltip（不依赖标题截断） */
 static HWND     g_hwndSubTip = NULL;     /* 字幕列表 tracking tooltip（悬停显示整条字幕） */
 static int      g_tipPodIdx = -1;        /* 当前播客提示对应的条目下标 */
+static int      g_tipIsRadio = 0;        /* 提示内容来自电台 tab 而不是播客 */
 
 /* 顶栏状态文本（自绘跑马灯） */
 static wchar_t  g_statusText[512] = L"就绪";   /* 当前显示内容 */
@@ -523,6 +529,7 @@ static unsigned short g_httpPort = 0;                 /* 实际绑定成功的�
 #define WM_APP_ICY_META     (WM_APP + 21) /* lParam=IcyMeta*（解析好的帧，UI 线程消费后 free） */
 #define WM_APP_ICY_HEADERS  (WM_APP + 22) /* lParam=IcyHeaders*（电台响应头信息） */
 #define WM_APP_ICY_STOP     (WM_APP + 23) /* wParam=0（被动停：切台/停止）, 1（主动关闭） */
+#define WM_APP_RADIO_PROBE  (WM_APP + 24) /* wParam=1 可连 / 0 不可连，lParam=电台下标 */
 
 /* 拖放（OLE IDropTarget）：悬停行与拖放状态，实现见 WndProc 之前 */
 static IDropTarget *g_pDrop;             /* 全局拖放目标（进程内单例） */
@@ -611,6 +618,7 @@ enum {
     TR_CLN_T_AUDIO, TR_CLN_T_SUB, TR_CLN_T_CHAP, TR_CLN_T_COVER, TR_CLN_T_META,
     TR_CLN_STAT_FMT, TR_CLN_NONE,
     TR_RADIO, TR_RADIO_TAB, TR_PLAYING_LIVE_FMT, TR_PODCAST_TAB,
+    TR_CONNECTING_FMT, TR_CANT_CONNECT_FMT, TR_NOW_PLAYING,
     TR_N
 };
 
@@ -737,7 +745,7 @@ static const wchar_t *tr(int id)
         L"清理缓存", L"失效的播客（已删除订阅）", L"现有播客的缓存", L"全部缓存文件",
         L"音频", L"字幕", L"章节", L"封面", L"订阅信息",
         L"将删除 %d 个文件，共 %d.%d MB", L"没有可清理的文件",
-        L"网络电台", L"电台", L"正在收听：%s", L"播客"
+        L"网络电台", L"电台", L"正在收听：%s", L"播客", L"正在连接：%s", L"无法连接：%s", L"正在播放："
     };
     static const wchar_t *const en[TR_N] = {
         L"Ready",
@@ -881,7 +889,7 @@ static const wchar_t *tr(int id)
         L"Clean cache", L"Invalid podcasts (unsubscribed)", L"Cache of current podcasts", L"All cache files",
         L"Audio", L"Subtitles", L"Chapters", L"Covers", L"Feed info",
         L"Will remove %d file(s), %d.%d MB", L"Nothing to clean",
-        L"Radio", L"Radio", L"Listening: %s", L"Podcasts"
+        L"Radio", L"Radio", L"Listening: %s", L"Podcasts", L"Connecting: %s", L"Cannot connect: %s", L"Now playing: "
     };
     return (g_lang ? en : zh)[id];
 }
@@ -7074,6 +7082,7 @@ static void PlayerPlayFile(const wchar_t *path, const wchar_t *title)
 
 static void IcyStop(void);
 static void IcyStart(int ep, const wchar_t *url);
+static DWORD WINAPI RadioProbeThread(LPVOID param);
 
 static void PlayerStop(void)
 {
@@ -8466,16 +8475,81 @@ static void PlayRadioStation(int idx)
 {
     Episode *e;
     wchar_t msg[256];
+    HANDLE th;
     if (idx < 0 || idx >= g_radioPod.epCount) return;
     e = &g_radioPod.eps[idx];
     if (g_downloading) AbortDownloadConnection();
     PlayerStop();
-    IcyStart(idx, e->url);
-    g_radioPlayIdx = idx;
+    IcyStop();
+    /* 先清掉上一台留下的曲目历史/章节，避免串播客或串台 */
+    g_radioPlayIdx = -1;
+    FreeSubCues();
+    SubRefreshUI();
+    SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
     InvalidateRect(g_listPod, NULL, TRUE);
-    swprintf(msg, 256, tr(TR_PLAYING_LIVE_FMT), e->title ? e->title : L"");
+    g_radioProbeIdx = idx;
+    swprintf(msg, 256, tr(TR_CONNECTING_FMT), e->title ? e->title : L"");
     SetStatus(msg);
-    PlayerPlayFile(e->url, e->title);
+    /* 连通性探测放到后台：连不上的台不再让 UI 线程干等 MFPlay 超时 */
+    th = CreateThread(NULL, 0, RadioProbeThread, (LPVOID)(INT_PTR)idx, 0, NULL);
+    if (th) CloseHandle(th);
+}
+
+/* 后台探测电台是否可连（只建连 + 收响应头，不读音频） */
+static DWORD WINAPI RadioProbeThread(LPVOID param)
+{
+    int idx = (int)(INT_PTR)param;
+    const wchar_t *url = (idx >= 0 && idx < g_radioPod.epCount) ? g_radioPod.eps[idx].url : NULL;
+    int ok = 0;
+    URL_COMPONENTS uc;
+    HINTERNET hSes = NULL, hCon = NULL, hReq = NULL;
+
+    if (url && *url) {
+        ZeroMemory(&uc, sizeof(uc));
+        uc.dwStructSize = sizeof(uc);
+        uc.dwSchemeLength = (DWORD)-1;
+        uc.dwHostNameLength = (DWORD)-1;
+        uc.dwUrlPathLength = (DWORD)-1;
+        if (WinHttpCrackUrl(url, 0, 0, &uc)) {
+            wchar_t host[256], path[1024];
+            if (uc.dwHostNameLength < 256 && uc.dwUrlPathLength < 1024) {
+                wcsncpy(host, uc.lpszHostName, uc.dwHostNameLength); host[uc.dwHostNameLength] = 0;
+                wcsncpy(path, uc.lpszUrlPath, uc.dwUrlPathLength);   path[uc.dwUrlPathLength] = 0;
+                hSes = WinHttpOpen(L"LiteTune/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                if (hSes) {
+                    DWORD t = 4000;
+                    WinHttpSetOption(hSes, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
+                    hCon = WinHttpConnect(hSes, host,
+                        uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
+                                                            : INTERNET_DEFAULT_HTTP_PORT, 0);
+                }
+                if (hCon) {
+                    hReq = WinHttpOpenRequest(hCon, L"GET", path, NULL,
+                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+                }
+                if (hReq) {
+                    DWORD t = 4000;
+                    WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
+                    if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                        WinHttpReceiveResponse(hReq, NULL)) {
+                        DWORD status = 0, sz = sizeof(status);
+                        WinHttpQueryHeaders(hReq,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            NULL, &status, &sz, NULL);
+                        ok = (status >= 200 && status < 400);
+                    }
+                }
+            }
+        }
+    }
+    if (hReq) WinHttpCloseHandle(hReq);
+    if (hCon) WinHttpCloseHandle(hCon);
+    if (hSes) WinHttpCloseHandle(hSes);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_RADIO_PROBE, (WPARAM)(ok ? 1 : 0), (LPARAM)idx);
+    return 0;
 }
 
 
@@ -8554,50 +8628,72 @@ static int IcyQueryHeader(HINTERNET hReq, DWORD flag, wchar_t *dst, int dstN)
     return 1;
 }
 
+/* 读满 n 字节；超时视为暂时没数据（直播流正常现象），继续等，直到 stop 或断开 */
+static int IcyReadFull(HINTERNET h, void *buf, int n, volatile LONG *stop)
+{
+    int got = 0;
+    while (got < n) {
+        DWORD rd = 0;
+        if (InterlockedCompareExchange(stop, 0, 0)) return got;
+        if (!WinHttpReadData(h, (BYTE*)buf + got, (DWORD)(n - got), &rd)) {
+            if (GetLastError() == ERROR_WINHTTP_TIMEOUT) continue;  /* 1 秒没数据，回去看 STOP */
+            return got;                                            /* 断线/句柄无效 */
+        }
+        if (rd == 0) return got;
+        got += (int)rd;
+    }
+    return got;
+}
+
 static DWORD WINAPI IcyThread(LPVOID param)
 {
+    struct IcyJob *job = (struct IcyJob*)param;
+    volatile LONG *stopFlag;
     HINTERNET hSes = NULL, hCon = NULL, hReq = NULL;
-    wchar_t *url = g_icyUrl;
     struct IcyHeaders hdrs;
-    volatile LONG *stopFlag = &g_icyStop;
     URL_COMPONENTS uc;
     int metaint = 0;
-    BYTE audioBuf[8192];
-    int audioLeft = 0;          /* audioBuf 里还没吃掉的字节数 */
-    DWORD nRead;
-    (void)param;
+    static const int CHUNK = 4096;
+    BYTE audioSkip[4096];   /* 音频只是跳过，但必须真读掉，否则位置对不上 */
 
-    g_icyUrl = NULL;
-    if (!url || !*url) return 0;
+    if (!job) return 0;
+    stopFlag = &job->stop;
+    if (!job->url || !job->url[0]) goto done;
 
     ZeroMemory(&uc, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = (DWORD)-1;
     uc.dwHostNameLength = (DWORD)-1;
     uc.dwUrlPathLength = (DWORD)-1;
-    if (!WinHttpCrackUrl(url, 0, 0, &uc)) goto done;
+    if (!WinHttpCrackUrl(job->url, 0, 0, &uc)) goto done;
 
-    hSes = WinHttpOpen(L"LiteTune/1.0 +Icy-MetaData",
-                       WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSes) goto done;
+    {
+        /* CrackUrl 返回的是原串里的片段，不以 \0 结尾，必须自己复制 */
+        wchar_t host[256], path[1024];
+        if (uc.dwHostNameLength >= 256 || uc.dwUrlPathLength >= 1024) goto done;
+        wcsncpy(host, uc.lpszHostName, uc.dwHostNameLength); host[uc.dwHostNameLength] = 0;
+        wcsncpy(path, uc.lpszUrlPath, uc.dwUrlPathLength);   path[uc.dwUrlPathLength] = 0;
 
-    hCon = WinHttpConnect(hSes, uc.lpszHostName,
-        uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
-                                            : INTERNET_DEFAULT_HTTP_PORT, 0);
-    if (!hCon) goto done;
+        hSes = WinHttpOpen(L"LiteTune/1.0 +Icy-MetaData",
+                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSes) goto done;
 
-    hReq = WinHttpOpenRequest(hCon, L"GET", uc.lpszUrlPath, NULL,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    if (!hReq) goto done;
-    /* 暴露给 UI 线程强制关闭，防止 IcyStop 时 WinHttpReadData 卡网络读 */
-    g_icyReq = hReq;
+        hCon = WinHttpConnect(hSes, host,
+            uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_DEFAULT_HTTPS_PORT
+                                                : INTERNET_DEFAULT_HTTP_PORT, 0);
+        if (!hCon) goto done;
+
+        hReq = WinHttpOpenRequest(hCon, L"GET", path, NULL,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!hReq) goto done;
+    }
 
     /* 禁用自动解压（元数据帧紧跟原始音频，解压后位置对不上） */
     { DWORD zero = 0; WinHttpSetOption(hReq, WINHTTP_OPTION_DECOMPRESSION, &zero, sizeof(zero)); }
-    /* 让 WinHttpReadData 最多卡 3 秒，线程才能及时响应 stopFlag */
-    { DWORD t = 3000; WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t)); }
+    /* 1 秒读超时：线程最多 1 秒就能响应停止请求，且不需要 UI 线程去关句柄 */
+    { DWORD t = 1000; WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t)); }
 
     /* 请求 ICY 元数据 */
     if (!WinHttpAddRequestHeaders(hReq, L"Icy-MetaData: 1\r\n", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD))
@@ -8614,12 +8710,10 @@ static DWORD WINAPI IcyThread(LPVOID param)
         if (status < 200 || status >= 300) goto done;
     }
 
-    /* 回读响应头：icy-metaint 是关键，没有就说明服务器不支持元数据，直接退出线程
-     * （不影响 MF 播放，只是没曲目信息）。
-     * MSDN 要求 WINHTTP_QUERY_CUSTOM 配合的头名字串必须以双 \0 结尾
-     * （一个终止头名，一个终止整个数组）。 */
+    /* 回读响应头：icy-metaint 是关键。MSDN 要求 WINHTTP_QUERY_CUSTOM 的头名字串
+     * 以双 \0 结尾；且取长度时返回 FALSE + ERROR_INSUFFICIENT_BUFFER 但会填 needed。 */
     {
-        wchar_t hname[] = L"icy-metaint\0";   /* 编译时会得到 "icy-metaint" + \0 + \0 */
+        wchar_t hname[] = L"icy-metaint\0";
         DWORD needed = 0;
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, hname, NULL, &needed, NULL);
         if (needed > 0) {
@@ -8667,58 +8761,33 @@ static DWORD WINAPI IcyThread(LPVOID param)
 
     if (g_hwnd) {
         struct IcyHeaders *out = (struct IcyHeaders*)malloc(sizeof(struct IcyHeaders));
-        if (out) { *out = hdrs; PostMessageW(g_hwnd, WM_APP_ICY_HEADERS, 0, (LPARAM)out); }
+        if (out) { *out = hdrs; PostMessageW(g_hwnd, WM_APP_ICY_HEADERS, (WPARAM)job, (LPARAM)out); }
     }
 
-    /* ---------- 主循环：按 metaint 分段读音频 + 元数据帧 ----------
-     * 流结构：每 metaint 字节原始音频 + 1 字节帧长 L + L*16 字节元数据帧 */
-    audioLeft = 0;
-
+    /* ---------- 主循环：每 metaint 字节音频 + 1 字节帧长 L + L*16 字节元数据帧 ---------- */
     while (!InterlockedCompareExchange(stopFlag, 0, 0) && g_hwnd) {
-        /* 目标：从 socket 里读 metaint 字节音频（不够就分多次 WinHttpReadData 累计）
-         * 然后读 1 字节帧长 L，再读 L*16 字节帧 */
-        {
-            int need = metaint;
-            while (need > 0 && !InterlockedCompareExchange(stopFlag, 0, 0)) {
-                if (audioLeft == 0) {
-                    if (!WinHttpReadData(hReq, audioBuf, sizeof(audioBuf), &nRead) || nRead == 0)
-                        goto done;
-                    audioLeft = (int)nRead;
-                }
-                int take = (need > audioLeft) ? audioLeft : need;
-                /* 这里我们不真正"消费"音频，只是计数。元数据帧紧跟位置计算正确就行：
-                 * 读到 metaint 后停止，下一次读的前 1 字节就是帧长 */
-                audioLeft -= take;
-                need -= take;
-            }
-            if (InterlockedCompareExchange(stopFlag, 0, 0)) goto done;
+        int need = metaint;
+        while (need > 0) {
+            int chunk = need < CHUNK ? need : CHUNK;
+            if (IcyReadFull(hReq, audioSkip, chunk, stopFlag) < chunk) goto done;
+            need -= chunk;
         }
-
-        /* 读帧长 1 字节 */
         {
-            BYTE lb;
-            DWORD n = 0;
-            if (!WinHttpReadData(hReq, &lb, 1, &n) || n == 0) goto done;
-            if (lb == 0) { continue; }   /* 本帧无元数据，循环回去读下一段 */
+            BYTE lb = 0;
+            if (IcyReadFull(hReq, &lb, 1, stopFlag) < 1) goto done;
+            if (lb == 0) continue;   /* 本帧无元数据 */
             {
                 int frameBytes = lb * 16;
                 char *frame = (char*)malloc(frameBytes);
                 if (!frame) goto done;
-                int got = 0;
-                while (got < frameBytes && !InterlockedCompareExchange(stopFlag, 0, 0)) {
-                    DWORD nr = 0;
-                    if (!WinHttpReadData(hReq, frame + got, frameBytes - got, &nr) || nr == 0) break;
-                    got += (int)nr;
-                }
-                if (got > 0) {
+                if (IcyReadFull(hReq, frame, frameBytes, stopFlag) == frameBytes) {
                     struct IcyMeta meta;
-                    if (IcyParseStreamTitle(frame, got, &meta) && g_hwnd) {
+                    if (IcyParseStreamTitle(frame, frameBytes, &meta) && g_hwnd) {
                         struct IcyMeta *out = (struct IcyMeta*)malloc(sizeof(struct IcyMeta));
-                        if (out) { *out = meta; PostMessageW(g_hwnd, WM_APP_ICY_META, 0, (LPARAM)out); }
+                        if (out) { *out = meta; PostMessageW(g_hwnd, WM_APP_ICY_META, (WPARAM)job, (LPARAM)out); }
                     }
                 }
                 free(frame);
-                if (InterlockedCompareExchange(stopFlag, 0, 0)) goto done;
             }
         }
     }
@@ -8727,37 +8796,52 @@ done:
     if (hReq)   WinHttpCloseHandle(hReq);
     if (hCon)   WinHttpCloseHandle(hCon);
     if (hSes)   WinHttpCloseHandle(hSes);
-    free(url);
+    free(job->url);
+    free(job);
     return 0;
+}
+
+/* 回收已退出的 ICY 线程句柄（UI 线程里调用，从不阻塞） */
+static void IcyReap(void)
+{
+    int i = 0;
+    while (i < g_icyReapN) {
+        if (WaitForSingleObject(g_icyReap[i], 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_icyReap[i]);
+            g_icyReap[i] = g_icyReap[--g_icyReapN];
+        } else i++;
+    }
 }
 
 static void IcyStop(void)
 {
-    /* 不在 UI 线程 Wait！只设标志 + 强制关闭请求句柄（让 ICY 线程的 WinHttpReadData
-     * 立刻返回 FALSE），线程自己会走到 done 路径退出。 */
-    HINTERNET h;
-    InterlockedExchange(&g_icyStop, 1);
-    h = (HINTERNET)InterlockedExchangePointer((PVOID*)&g_icyReq, NULL);
-    if (h) WinHttpCloseHandle(h);
+    /* 只置停止标志，绝不 Wait / 关句柄：线程读超时 1 秒内自己退出 */
+    if (g_icyJob) InterlockedExchange(&g_icyJob->stop, 1);
 }
 
 static void IcyStart(int ep, const wchar_t *url)
 {
-    /* 如果上一个线程还在跑（被强制关句柄后收尾），最多等一次让它干净退出 */
+    struct IcyJob *job;
+    IcyStop();
+    IcyReap();
     if (g_icyThread) {
-        InterlockedExchange(&g_icyStop, 1);
-        WaitForSingleObject(g_icyThread, 1500);   /* 这次 Wait 在 PlayRadioStation 之前，UI 还没被用户操作卡 */
-        CloseHandle(g_icyThread);
+        if (g_icyReapN < 4) {
+            g_icyReap[g_icyReapN++] = g_icyThread;
+        } else {
+            WaitForSingleObject(g_icyReap[0], 2000);
+            CloseHandle(g_icyReap[0]);
+            g_icyReap[0] = g_icyThread;
+        }
         g_icyThread = NULL;
     }
-    if (!url || !*url) return;
-    InterlockedExchange(&g_icyStop, 0);
-    g_icyReq = NULL;
-    g_icyUrl = _wcsdup(url);
-    g_icyCurEp = ep;
+    if (!url || !*url) { g_icyJob = NULL; return; }
+    job = (struct IcyJob*)calloc(1, sizeof(*job));
+    if (!job) { g_icyJob = NULL; return; }
+    job->url = _wcsdup(url);
+    job->ep = ep;
+    g_icyJob = job;
     g_icyCurTitle[0] = 0;
-    g_icyCurTitleIdx = -1;
-    g_icyThread = CreateThread(NULL, 0, IcyThread, NULL, 0, NULL);
+    g_icyThread = CreateThread(NULL, 0, IcyThread, job, 0, NULL);
 }
 
 static void SwitchTab(int tab)
@@ -8770,6 +8854,10 @@ static void SwitchTab(int tab)
     } else {
         g_cacheRowHere = 0;
         g_viewCached = 0;
+        /* 电台没有章节/字幕，清掉上一集播客残留，避免串味 */
+        FreeSubCues();
+        SubRefreshUI();
+        SendMessageW(g_listEp, LVM_DELETEALLITEMS, 0, 0);
         FillRadioList();
     }
     g_curPod = -1;
@@ -13889,7 +13977,30 @@ static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
             DeleteObject(bg); DeleteObject(bp);
         }
-        if (g_tipPodIdx >= 0 && g_tipPodIdx < g_podCount) {
+        if (g_tipIsRadio && g_tipPodIdx >= 0 && g_tipPodIdx < g_radioPod.epCount) {
+            /* 电台：无封面，只列台名 / 地址 / 当前曲目 */
+            Episode *e = &g_radioPod.eps[g_tipPodIdx];
+            int pad = 12;
+            RECT r1 = { pad, pad, rc.right - pad, pad + 26 };
+            RECT r2 = { pad, pad + 26, rc.right - pad, pad + 48 };
+            RECT r3 = { pad, pad + 50, rc.right - pad, pad + 72 };
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, ThText());
+            SelectObject(hdc, g_fontBold);
+            DrawTextW(hdc, e->title ? e->title : L"?", -1, &r1,
+                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SetTextColor(hdc, ThDim());
+            SelectObject(hdc, g_fontSmall);
+            DrawTextW(hdc, e->url ? e->url : L"", -1, &r2,
+                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (g_tipPodIdx == g_radioPlayIdx && g_icyCurTitle[0]) {
+                wchar_t now[600];
+                swprintf(now, 600, L"%s %s", tr(TR_NOW_PLAYING), g_icyCurTitle);
+                SetTextColor(hdc, ThAccent());
+                DrawTextW(hdc, now, -1, &r3,
+                    DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+        } else if (g_tipPodIdx >= 0 && g_tipPodIdx < g_podCount) {
             Podcast *p = &g_pods[g_tipPodIdx];
             int pad = 10;
             int coverH = coverW;
@@ -13945,14 +14056,17 @@ static LRESULT CALLBACK PodTipProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* 根据鼠标在播客列表中的位置，更新并显示自定义播客提示 */
 static void UpdatePodTipFromPoint(POINT pt)
 {
-    int idx;
+    int idx, cnt;
     RECT irc;
     POINT screen;
-    if (g_activeTab == 1 || g_podMode != 0) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    int isRadio = (g_activeTab == 1);
+    if (g_podMode != 0) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    cnt = isRadio ? g_radioPod.epCount : g_podCount;
     idx = (int)SendMessageW(g_listPod, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
-    if (idx < 0 || idx >= g_podCount) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
-    if (idx != g_tipPodIdx) {
+    if (idx < 0 || idx >= cnt) { ShowWindow(g_hwndPodTip, SW_HIDE); return; }
+    if (idx != g_tipPodIdx || isRadio != g_tipIsRadio) {
         g_tipPodIdx = idx;
+        g_tipIsRadio = isRadio;
         InvalidateRect(g_hwndPodTip, NULL, TRUE);
     }
     /* 定位到条目右下方，避免遮挡文字 */
@@ -16423,10 +16537,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         /* ICY 线程回传电台响应头，填到右侧简介 */
         struct IcyHeaders *hd = (struct IcyHeaders *)lParam;
         if (!hd) return 0;
-        if (g_activeTab == 1 && g_radioPlayIdx >= 0 &&
-            ShowRadioDetailHeaders(hd)) {
-            /* ShowRadioDetailHeaders 内部拼好描述文本，SetWindowTextW(g_editDesc, ...) */
-        }
+        if ((struct IcyJob *)wParam == g_icyJob && g_activeTab == 1)
+            ShowRadioDetailHeaders(hd);
         free(hd);
         return 0;
     }
@@ -16436,9 +16548,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         struct IcyMeta *m = (struct IcyMeta *)lParam;
         wchar_t combined[512];
         if (!m) return 0;
-        if (g_activeTab != 1 || g_radioPlayIdx < 0) { free(m); return 0; }
+        if ((struct IcyJob *)wParam != g_icyJob || g_activeTab != 1 || g_radioPlayIdx < 0) {
+            free(m);
+            return 0;
+        }
 
-        /* 去重：同一首不重复追加 */
         if (m->artist[0])
             swprintf(combined, 512, L"%s - %s", m->artist, m->title);
         else
@@ -16446,12 +16560,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (wcscmp(g_icyCurTitle, combined) != 0) {
             wcscpy_s(g_icyCurTitle, 512, combined);
-            /* 把当前曲目显示到状态栏 */
             SetStatus(combined);
-            /* 追加到中间曲目列表（当作当天播放历史） */
             RadioAppendCurrentTrack(m->artist, m->title);
         }
         free(m);
+        return 0;
+    }
+
+    case WM_APP_RADIO_PROBE: {
+        /* 后台探测结果：可连才真正起播放器 + ICY 线程 */
+        int idx = (int)lParam;
+        int ok = (int)wParam;
+        wchar_t msg[256];
+        if (idx != g_radioProbeIdx) return 0;   /* 用户已切到别的台，丢弃过期结果 */
+        if (idx < 0 || idx >= g_radioPod.epCount) return 0;
+        if (ok) {
+            Episode *e = &g_radioPod.eps[idx];
+            PlayerPlayFile(e->url, e->title);
+            IcyStart(idx, e->url);
+            g_radioPlayIdx = idx;
+            InvalidateRect(g_listPod, NULL, TRUE);
+            swprintf(msg, 256, tr(TR_PLAYING_LIVE_FMT), e->title ? e->title : L"");
+            SetStatus(msg);
+        } else {
+            swprintf(msg, 256, tr(TR_CANT_CONNECT_FMT),
+                     g_radioPod.eps[idx].title ? g_radioPod.eps[idx].title : L"");
+            SetStatus(msg);
+        }
         return 0;
     }
 
